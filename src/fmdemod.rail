@@ -1,0 +1,192 @@
+-- ledaticground v0.3: FM demodulation (pure Rail).
+-- Polar discriminator: inst. freq = angle(z[n] * conj(z[n-1])), then
+-- decimate-by-50 (2.4 MHz -> 48 kHz audio). Capture is centered on the
+-- station carrier, so the discriminator output IS the audio (minus a DC/carrier
+-- offset, removed by mean subtraction).
+--
+-- Self-validation: FFT the demodulated audio and look for the 19 kHz FM stereo
+-- pilot tone. Its presence is unambiguous proof of correct FM demod.
+--
+-- Outputs: "A <sample>" lines (48 kHz mono audio) + "INFO/PILOT" diagnostics.
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+-- NOTE: do NOT declare malloc/free as foreign-returning-int — that tags the
+-- 64-bit pointer as a 63-bit int and corrupts it. Use the builtins (harmless
+-- "not defined" typecheck warnings). This bug silently corrupted all byte reads.
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- ---- FFT (validated) ----
+brev_one i bits acc =
+  let bit = i % 2
+  brev_loop (i / 2) (bits - 1) (acc * 2 + bit)
+brev_loop i bits acc =
+  if bits == 0 then acc else brev_one i bits acc
+bitrev i bits = brev_loop i bits 0
+log2i n = if n <= 1 then 0 else 1 + log2i (n / 2)
+reorder re im n bits i =
+  if i >= n then 0
+  else
+    let r = bitrev i bits
+    let _ = if i < r then
+              let tr = float_arr_get re i
+              let ti = float_arr_get im i
+              let _ = float_arr_set re i (float_arr_get re r)
+              let _ = float_arr_set im i (float_arr_get im r)
+              let _ = float_arr_set re r tr
+              let _ = float_arr_set im r ti
+              0
+            else 0
+    reorder re im n bits (i + 1)
+bfly re im len half i j twopi =
+  if j >= half then 0
+  else
+    let ang = (0.0 - twopi) * (int_to_float j) / (int_to_float len)
+    let wr = cos ang
+    let wi = sin ang
+    let a = i + j
+    let b = i + j + half
+    let ur = float_arr_get re a
+    let ui = float_arr_get im a
+    let xr = float_arr_get re b
+    let xi = float_arr_get im b
+    let vr = xr * wr - xi * wi
+    let vi = xr * wi + xi * wr
+    let _ = float_arr_set re a (ur + vr)
+    let _ = float_arr_set im a (ui + vi)
+    let _ = float_arr_set re b (ur - vr)
+    let _ = float_arr_set im b (ui - vi)
+    bfly re im len half i (j + 1) twopi
+grp re im n len half i twopi =
+  if i >= n then 0
+  else
+    let _ = bfly re im len half i 0 twopi
+    grp re im n len half (i + len) twopi
+stage re im n len twopi =
+  if len > n then 0
+  else
+    let half = len / 2
+    let _ = grp re im n len half 0 twopi
+    stage re im n (len * 2) twopi
+fft re im n =
+  let bits = log2i n
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = reorder re im n bits 0
+  let _ = stage re im n 2 twopi
+  0
+
+-- ---- FM discriminator, summed over `cnt` input samples from n0 ----
+disc_sum bytes n0 cnt acc i =
+  if i >= cnt then acc
+  else
+    let n = n0 + i
+    let bi = n * 2
+    let pj = (n - 1) * 2
+    let in_ = (int_to_float (arr_get bytes bi)) - 127.5
+    let qn = (int_to_float (arr_get bytes (bi + 1))) - 127.5
+    let ip = (int_to_float (arr_get bytes pj)) - 127.5
+    let qp = (int_to_float (arr_get bytes (pj + 1))) - 127.5
+    let imv = qn * ip - in_ * qp
+    let rev = in_ * ip + qn * qp
+    let d = atan2 imv rev
+    disc_sum bytes n0 cnt (acc + d) (i + 1)
+
+-- decimate-by-D: one audio sample = mean discriminator output over D inputs
+demod_all bytes audio nout d o =
+  if o >= nout then 0
+  else
+    let n0 = o * d + 1
+    let s = disc_sum bytes n0 d 0.0 0
+    let _ = float_arr_set audio o (s / (int_to_float d))
+    demod_all bytes audio nout d (o + 1)
+
+sum_audio audio nout i acc =
+  if i >= nout then acc
+  else sum_audio audio nout (i + 1) (acc + (float_arr_get audio i))
+
+copy_audio audio re im mean nfft i =
+  if i >= nfft then 0
+  else
+    let _ = float_arr_set re i ((float_arr_get audio i) - mean)
+    let _ = float_arr_set im i 0.0
+    copy_audio audio re im mean nfft (i + 1)
+
+band_power re im lo hi acc =
+  if lo >= hi then acc
+  else
+    let mr = float_arr_get re lo
+    let mi = float_arr_get im lo
+    band_power re im (lo + 1) hi (acc + mr * mr + mi * mi)
+
+-- find strongest bin in [lo,hi)
+band_peak re im lo hi bestb bestp =
+  if lo >= hi then bestb
+  else
+    let mr = float_arr_get re lo
+    let mi = float_arr_get im lo
+    let p = mr * mr + mi * mi
+    let nb = if p > bestp then lo else bestb
+    let np = if p > bestp then p else bestp
+    band_peak re im (lo + 1) hi nb np
+
+print_audio audio nout mean i =
+  if i >= nout then 0
+  else
+    let _ = print (cat ["A ", show_float ((float_arr_get audio i) - mean)])
+    print_audio audio nout mean (i + 1)
+
+main =
+  let bytes = read_bytes "/Users/ledaticempire/projects/ledaticground/data/iq_fm.bin"
+  let total = arr_len bytes
+  let nsamp = total / 2
+  let d = 50
+  let nout = (nsamp - 2) / d
+  let audio = float_arr_new nout 0.0
+  let _ = demod_all bytes audio nout d 0
+  let sm = sum_audio audio nout 0 0.0
+  let mean = sm / (int_to_float nout)
+  let arate = 2400000.0 / (int_to_float d)
+  -- pilot detection via FFT of first 4096 audio samples
+  let nfft = 4096
+  let re = float_arr_new nfft 0.0
+  let im = float_arr_new nfft 0.0
+  let _ = copy_audio audio re im mean nfft 0
+  let _ = fft re im nfft
+  -- 19 kHz pilot bin: 19000 * nfft / arate
+  let pbin = float_to_int (19000.0 * (int_to_float nfft) / arate)
+  let pilot = band_power re im (pbin - 4) (pbin + 4) 0.0
+  let baseline = band_power re im 1000 1100 0.0
+  let pk = band_peak re im 300 2040 0 0.0
+  let pkhz = (int_to_float pk) * arate / (int_to_float nfft)
+  let _ = print (cat ["INFO audio_rate=", show_float arate, " nout=", show nout, " mean=", show_float mean])
+  let _ = print (cat ["INFO pilot_bin~", show pbin, " pilot_pow(8bins)=", show_float pilot, " baseline_pow(100bins)=", show_float baseline])
+  let _ = print (cat ["PILOT pilot/bin=", show_float (pilot / 8.0), " base/bin=", show_float (baseline / 100.0)])
+  let _ = print (cat ["PEAK strongest audio-FFT tone in 0.3-24kHz = ", show_float pkhz, " Hz (expect ~19000 = stereo pilot)"])
+  let _ = print_audio audio nout mean 0
+  0

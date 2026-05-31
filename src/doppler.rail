@@ -1,0 +1,141 @@
+-- ledaticground: Doppler carrier tracker (pure Rail) — proof-of-reception core.
+-- Reads uint8 IQ, FFTs each window, finds the peak bin -> carrier frequency.
+-- The freq-vs-time curve is the physical fingerprint: it must match the
+-- SGP4-predicted Doppler for the claimed orbit+station+time. Residual = the
+-- physical confidence baked into an attested receipt (V100_BLUEPRINT §2).
+-- Here the METHOD is validated on a synthetic known Doppler S-curve.
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+-- builtin malloc/free (do NOT declare foreign)
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+brev_one i bits acc =
+  let bit = i % 2
+  brev_loop (i / 2) (bits - 1) (acc * 2 + bit)
+brev_loop i bits acc =
+  if bits == 0 then acc else brev_one i bits acc
+bitrev i bits = brev_loop i bits 0
+log2i n = if n <= 1 then 0 else 1 + log2i (n / 2)
+reorder re im n bits i =
+  if i >= n then 0
+  else
+    let r = bitrev i bits
+    let _ = if i < r then
+              let tr = float_arr_get re i
+              let ti = float_arr_get im i
+              let _ = float_arr_set re i (float_arr_get re r)
+              let _ = float_arr_set im i (float_arr_get im r)
+              let _ = float_arr_set re r tr
+              let _ = float_arr_set im r ti
+              0
+            else 0
+    reorder re im n bits (i + 1)
+bfly re im len half i j twopi =
+  if j >= half then 0
+  else
+    let ang = (0.0 - twopi) * (int_to_float j) / (int_to_float len)
+    let wr = cos ang
+    let wi = sin ang
+    let a = i + j
+    let b = i + j + half
+    let ur = float_arr_get re a
+    let ui = float_arr_get im a
+    let xr = float_arr_get re b
+    let xi = float_arr_get im b
+    let vr = xr * wr - xi * wi
+    let vi = xr * wi + xi * wr
+    let _ = float_arr_set re a (ur + vr)
+    let _ = float_arr_set im a (ui + vi)
+    let _ = float_arr_set re b (ur - vr)
+    let _ = float_arr_set im b (ui - vi)
+    bfly re im len half i (j + 1) twopi
+grp re im n len half i twopi =
+  if i >= n then 0
+  else
+    let _ = bfly re im len half i 0 twopi
+    grp re im n len half (i + len) twopi
+stage re im n len twopi =
+  if len > n then 0
+  else
+    let half = len / 2
+    let _ = grp re im n len half 0 twopi
+    stage re im n (len * 2) twopi
+fft re im n =
+  let bits = log2i n
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = reorder re im n bits 0
+  let _ = stage re im n 2 twopi
+  0
+
+load_window bytes len re im base n j =
+  if j >= n then 0
+  else
+    let bi = (base + j) * 2
+    let iv = if (bi + 1) >= len then 0.0 else (int_to_float (arr_get bytes bi)) - 127.5
+    let qv = if (bi + 1) >= len then 0.0 else (int_to_float (arr_get bytes (bi + 1))) - 127.5
+    let _ = float_arr_set re j iv
+    let _ = float_arr_set im j qv
+    load_window bytes len re im base n (j + 1)
+
+peak_bin re im n k bestb bestm =
+  if k >= n then bestb
+  else
+    let mr = float_arr_get re k
+    let mi = float_arr_get im k
+    let m = mr * mr + mi * mi
+    let nb = if m > bestm then k else bestb
+    let nm = if m > bestm then m else bestm
+    peak_bin re im n (k + 1) nb nm
+
+do_windows bytes len re im n nw fs w =
+  if w >= nw then 0
+  else
+    let base = w * n
+    let _ = load_window bytes len re im base n 0
+    let _ = fft re im n
+    let b = peak_bin re im n 0 0 (0.0 - 1.0)
+    let half = n / 2
+    let off = if b < half then b else b - n
+    let freq = (int_to_float off) * fs / (int_to_float n)
+    let _ = print (cat ["DOP ", show w, " ", show_float freq])
+    do_windows bytes len re im n nw fs (w + 1)
+
+main =
+  let bytes = read_bytes "/tmp/dop_test.iq"
+  let len = arr_len bytes
+  let nsamp = len / 2
+  let n = 4096
+  let nw = nsamp / n
+  let fs = 48000.0
+  let re = float_arr_new n 0.0
+  let im = float_arr_new n 0.0
+  let _ = print (cat ["INFO nsamp=", show nsamp, " windows=", show nw, " binHz=", show_float (fs / (int_to_float n))])
+  let _ = do_windows bytes len re im n nw fs 0
+  0

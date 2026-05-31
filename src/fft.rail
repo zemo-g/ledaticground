@@ -1,0 +1,113 @@
+-- ledaticground: pure-Rail radix-2 Cooley-Tukey FFT (in-place, DIT).
+-- re[]/im[] are float arrays of length n (n a power of 2).
+-- Forward: X[k] = sum_j x[j] e^{-i 2pi j k / n}.  DSP cornerstone.
+--
+-- NOTE (Rail trap, found 2026-05-31): a direct tail-self-recursive function
+-- whose recursive arg depends on ANOTHER arg updated in the same call (e.g.
+-- acc' = acc*2 + i%2 while i' = i/2) is MISCOMPILED by the self-loop optimizer
+-- (the register holding `i` is clobbered before the acc arg reads it) and
+-- infinite-loops. Workaround: split into MUTUAL recursion (brev_one/brev_loop)
+-- so the self-loop opt never triggers. See bitrev below.
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+
+brev_one i bits acc =
+  let bit = i % 2
+  brev_loop (i / 2) (bits - 1) (acc * 2 + bit)
+
+brev_loop i bits acc =
+  if bits == 0 then acc
+  else brev_one i bits acc
+
+bitrev i bits = brev_loop i bits 0
+
+log2i n = if n <= 1 then 0 else 1 + log2i (n / 2)
+
+-- bit-reversal permutation (swap re/im[i] with [bitrev i])
+reorder re im n bits i =
+  if i >= n then 0
+  else
+    let r = bitrev i bits
+    let _ = if i < r then
+              let tr = float_arr_get re i
+              let ti = float_arr_get im i
+              let _ = float_arr_set re i (float_arr_get re r)
+              let _ = float_arr_set im i (float_arr_get im r)
+              let _ = float_arr_set re r tr
+              let _ = float_arr_set im r ti
+              0
+            else 0
+    reorder re im n bits (i + 1)
+
+-- butterflies j in [0,half) within block at i
+bfly re im len half i j twopi =
+  if j >= half then 0
+  else
+    let ang = (0.0 - twopi) * (int_to_float j) / (int_to_float len)
+    let wr = cos ang
+    let wi = sin ang
+    let a = i + j
+    let b = i + j + half
+    let ur = float_arr_get re a
+    let ui = float_arr_get im a
+    let xr = float_arr_get re b
+    let xi = float_arr_get im b
+    let vr = xr * wr - xi * wi
+    let vi = xr * wi + xi * wr
+    let _ = float_arr_set re a (ur + vr)
+    let _ = float_arr_set im a (ui + vi)
+    let _ = float_arr_set re b (ur - vr)
+    let _ = float_arr_set im b (ui - vi)
+    bfly re im len half i (j + 1) twopi
+
+grp re im n len half i twopi =
+  if i >= n then 0
+  else
+    let _ = bfly re im len half i 0 twopi
+    grp re im n len half (i + len) twopi
+
+stage re im n len twopi =
+  if len > n then 0
+  else
+    let half = len / 2
+    let _ = grp re im n len half 0 twopi
+    stage re im n (len * 2) twopi
+
+fft re im n =
+  let bits = log2i n
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = reorder re im n bits 0
+  let _ = stage re im n 2 twopi
+  0
+
+-- ---- self-test ----
+fill_cos re im n k i =
+  if i >= n then 0
+  else
+    let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+    let ang = twopi * (int_to_float k) * (int_to_float i) / (int_to_float n)
+    let _ = float_arr_set re i (cos ang)
+    let _ = float_arr_set im i 0.0
+    fill_cos re im n k (i + 1)
+
+show_mags re im n i =
+  if i >= n then 0
+  else
+    let mr = float_arr_get re i
+    let mi = float_arr_get im i
+    let mag = sqrt (mr * mr + mi * mi)
+    let _ = print (cat ["bin ", show i, ": ", show_float mag])
+    show_mags re im n (i + 1)
+
+main =
+  let n = 8
+  let re = float_arr_new n 0.0
+  let im = float_arr_new n 0.0
+  let _ = fill_cos re im n 1 0
+  let _ = fft re im n
+  let _ = print "FFT of cos(2pi*1*k/8) -- expect mag 4 at bins 1 and 7, ~0 else:"
+  let _ = show_mags re im n 0
+  0

@@ -1,0 +1,58 @@
+-- ledaticground: attested reception receipt (pure Rail) — the v100 soul.
+-- Signs a proof-of-reception bundle with Ed25519, hash-chains it, and self-checks
+-- (round-trip verify + tamper detection). Run from the rail repo dir so the
+-- stdlib crypto's nested relative imports resolve:
+--   cd ~/projects/rail && ./rail_native run <ledaticground>/src/attest.rail
+--
+-- A receipt binds: satellite + pass time (pulse_id) + station coords + the
+-- sha256 of the decoded product + the previous chain hash, under a signature.
+-- The Doppler-fit residual (the physical fingerprint, the real moat) is left as
+-- a labeled PENDING field until we record IQ — see V100_BLUEPRINT.md.
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+main =
+  -- DEV signing key (NOT a production attestation authority — clearly labeled).
+  let seed = hex_to_bytes "1ed11c0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- product = the decoded APT image (text rows); hash its content
+  let product = read_file "/tmp/apt_rail.out"
+  let product_hash = sha256_hex product
+
+  -- pass metadata (pulse_id stand-in = capture unix time; should anchor to the
+  -- ledatic.org/entropy beacon pulse in production)
+  let pulse = str_replace "\n" "" (read_file "/Users/ledaticempire/projects/ledaticground/data/now_unix.txt")
+  let prev = "GENESIS"
+
+  let receipt = join "|" ["RECEIPT", "sat=NOAA-15-synthetic", cat ["pulse=", pulse], "station=regional_MI", "lat=0.0", "lon=-0.0", cat ["product_sha256=", product_hash], "doppler_residual_hz=PENDING_needs_IQ", cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sig = ed25519_sign seed msg mlen
+  let sig_hex = bytes_to_hex sig 64
+
+  -- verifications
+  let verify_ok = ed25519_verify pk msg mlen sig
+  let tstr = cat [receipt, "X"]
+  let tmsg = string_to_bytes tstr
+  let tlen = string_length_bytes tstr
+  let tamper_ok = ed25519_verify pk tmsg tlen sig
+  let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+  let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["SIG      ", sig_hex])
+  let _ = print (cat ["CHAIN    ", chain_hash])
+  let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+  let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+  -- emit receipt.json + append chain log
+  let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/receipt.json" jrec
+  let _ = print "WROTE data/receipt.json"
+  0

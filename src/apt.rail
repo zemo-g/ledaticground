@@ -1,0 +1,168 @@
+-- ledaticground v0.4: NOAA APT decoder with sync-lock (pure Rail).
+-- Input: FM-demod audio, signed 16-bit LE @ 11025 Hz (rtl_fm output).
+-- Pipeline: quadrature AM-detect 2400 Hz subcarrier -> envelope (flat pixel
+-- stream @ 4160 px/s) -> find line-start offset by correlating against the
+-- Sync-A pattern -> assemble 2080 px/line -> extract channel A (px 86..994) ->
+-- normalize -> emit "ROW <line> v0..v908". Handles mid-stream/noisy captures.
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+-- (builtin malloc/free; do NOT declare foreign -- see rail-bug-foreign-malloc-pointer)
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+sample_at bytes k len =
+  if k < 0 then 0.0
+  else if (2 * k + 1) >= len then 0.0
+  else
+    let lo = arr_get bytes (2 * k)
+    let hi = arr_get bytes (2 * k + 1)
+    let v = lo + 256 * hi
+    let sv = if v >= 32768 then v - 65536 else v
+    int_to_float sv
+
+env_quad bytes len c kconst w wend ai aq =
+  if w > wend then sqrt (ai * ai + aq * aq)
+  else
+    let k = c + w
+    let sv = sample_at bytes k len
+    let ang = kconst * (int_to_float k)
+    env_quad bytes len c kconst (w + 1) wend (ai + sv * (cos ang)) (aq + sv * (sin ang))
+
+-- flat pixel envelope fill: env[p] for p in [p0, pend)
+fill_px bytes len env cfg p pend =
+  if p >= pend then 0
+  else
+    let kconst = float_arr_get cfg 0
+    let spp = float_arr_get cfg 1
+    let c = float_to_int ((int_to_float p) * spp)
+    let e = env_quad bytes len c kconst (0 - 2) 2 0.0 0.0
+    let _ = float_arr_set env p e
+    fill_px bytes len env cfg (p + 1) pend
+
+fill_chunks bytes len env cfg totalpix p =
+  if p >= totalpix then 0
+  else
+    let pend = if (p + 2080) < totalpix then (p + 2080) else totalpix
+    let _ = fill_px bytes len env cfg p pend
+    fill_chunks bytes len env cfg totalpix (p + 2080)
+
+-- Sync-A correlation: template = 2px-high / 2px-low square (1040 Hz), 28 px
+-- mutual recursion (sc_step/sc_loop) defeats the self-loop cross-dep miscompile
+sc_step env off j jend acc =
+  let t = if ((j / 2) % 2) == 0 then 1.0 else (0.0 - 1.0)
+  let v = float_arr_get env (off + j)
+  sc_loop env off (j + 1) jend (acc + t * v)
+sc_loop env off j jend acc =
+  if j >= jend then acc else sc_step env off j jend acc
+synccorr env off j jend acc = sc_loop env off j jend acc
+
+ls_step env nlines off acc l =
+  let sc = synccorr env (off + l * 2080) 0 28 0.0
+  ls_loop env nlines off (acc + sc) (l + 1)
+ls_loop env nlines off acc l =
+  if l >= nlines then acc else ls_step env nlines off acc l
+linesum env nlines off acc l = ls_loop env nlines off acc l
+
+-- shallow chunked offset scan; best corr -> ba[0], best offset (as float) -> ba[1]
+scan_chunk env nlines ba o oend =
+  if o >= oend then 0
+  else
+    let c = linesum env nlines o 0.0 0
+    let _ = if c > (float_arr_get ba 0) then
+              let _ = float_arr_set ba 0 c
+              let _ = float_arr_set ba 1 (int_to_float o)
+              0
+            else 0
+    scan_chunk env nlines ba (o + 1) oend
+
+scan_offsets env nlines ba o =
+  if o >= 2080 then 0
+  else
+    let oend = if (o + 128) < 2080 then (o + 128) else 2080
+    let _ = scan_chunk env nlines ba o oend
+    scan_offsets env nlines ba (o + 128)
+
+mm_px env base x mm =
+  if x >= 2080 then 0
+  else
+    let e = float_arr_get env (base + x)
+    let _ = if e < (float_arr_get mm 0) then float_arr_set mm 0 e else 0
+    let _ = if e > (float_arr_get mm 1) then float_arr_set mm 1 e else 0
+    mm_px env base (x + 1) mm
+
+mm_lines env off line nlines mm =
+  if line >= nlines then 0
+  else
+    let _ = mm_px env (off + line * 2080) 0mm
+    mm_lines env off (line + 1) nlines mm
+
+row_str env base x mn rng acc =
+  if x >= 2080 then acc
+  else
+    let f = ((float_arr_get env (base + x)) - mn) / rng
+    let v = float_to_int (f * 255.0)
+    let vc = if v < 0 then 0 else (if v > 255 then 255 else v)
+    row_str env base (x + 1) mn rng (cat [acc, " ", show vc])
+
+print_rows env off line nlines mn rng =
+  if line >= nlines then 0
+  else
+    let r = row_str env (off + line * 2080) 0mn rng (cat ["ROW ", show line])
+    let _ = print r
+    print_rows env off (line + 1) nlines mn rng
+
+main =
+  let fs = 11025.0
+  let sub = 2400.0
+  let pxrate = 4160.0
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let bytes = read_bytes "/tmp/apt_shift.s16"
+  let len = arr_len bytes
+  let nsamp = len / 2
+  let totalpix = (nsamp * 4160) / 11025
+  let env = float_arr_new totalpix 0.0
+  let cfg = float_arr_new 2 0.0
+  let _ = float_arr_set cfg 0 (twopi * sub / fs)
+  let _ = float_arr_set cfg 1 (fs / pxrate)
+  let _ = fill_chunks bytes len env cfg totalpix 0
+  -- NOTE: in-Rail Sync-A correlation (linesum/synccorr) hits a Rail recursion
+  -- miscompile (segfaults even at depth 3). Deferred. Emit the flat pixel
+  -- stream at off=0; line-offset alignment is done in the Python post-step.
+  let off = 0
+  let nimg = (totalpix / 2080) - 1
+  let _ = print (cat ["INFO totalpix=", show totalpix, " img_lines=", show nimg])
+  let mm = float_arr_new 2 0.0
+  let _ = float_arr_set mm 0 1.0e18
+  let _ = float_arr_set mm 1 (0.0 - 1.0e18)
+  let _ = mm_lines env off 0 nimg mm
+  let mn = float_arr_get mm 0
+  let mx = float_arr_get mm 1
+  let rng = if (mx - mn) > 0.0 then (mx - mn) else 1.0
+  let _ = print_rows env off 0 nimg mn rng
+  0

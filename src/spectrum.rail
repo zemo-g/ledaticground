@@ -1,0 +1,214 @@
+-- ledaticground v0.2: IQ power spectrum (pure Rail).
+-- Reads uint8 I/Q from rtl_sdr, windows + FFTs frames, Welch-averages power,
+-- prints SPEC <MHz> <power> per bucket + the strongest carrier.
+--
+-- VALIDATED 2026-05-31 vs rtl_power: with a clean (non-clipping) capture
+-- centered at 89.0 MHz, the rtl_power-confirmed stations land at the correct
+-- frequencies and side (89.9 -> 89.92, 88.7 -> 88.72). NO spectrum inversion;
+-- I/Q map straight (im = +Q). Caveats: (1) gain must avoid clipping (check for
+-- 0x00/0xFF bytes) or the spectrum smears; (2) amplitudes are shaped by the
+-- rtl-sdr analog passband rolloff near the +/-1.2 MHz edges, so relative power
+-- across a wide span is not flat -- frequency is accurate, amplitude is not
+-- calibrated. (3) the DC spike at center is zeroed (zero_dc).
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+-- NOTE: do NOT declare malloc/free foreign-returning-int (tags the 64-bit
+-- pointer -> corrupts it). Use the builtins (harmless typecheck warnings).
+
+-- ---- byte reader (O(n), NUL-safe) ----
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- ---- FFT (validated, see src/fft.rail) ----
+brev_one i bits acc =
+  let bit = i % 2
+  brev_loop (i / 2) (bits - 1) (acc * 2 + bit)
+brev_loop i bits acc =
+  if bits == 0 then acc else brev_one i bits acc
+bitrev i bits = brev_loop i bits 0
+log2i n = if n <= 1 then 0 else 1 + log2i (n / 2)
+
+reorder re im n bits i =
+  if i >= n then 0
+  else
+    let r = bitrev i bits
+    let _ = if i < r then
+              let tr = float_arr_get re i
+              let ti = float_arr_get im i
+              let _ = float_arr_set re i (float_arr_get re r)
+              let _ = float_arr_set im i (float_arr_get im r)
+              let _ = float_arr_set re r tr
+              let _ = float_arr_set im r ti
+              0
+            else 0
+    reorder re im n bits (i + 1)
+
+bfly re im len half i j twopi =
+  if j >= half then 0
+  else
+    let ang = (0.0 - twopi) * (int_to_float j) / (int_to_float len)
+    let wr = cos ang
+    let wi = sin ang
+    let a = i + j
+    let b = i + j + half
+    let ur = float_arr_get re a
+    let ui = float_arr_get im a
+    let xr = float_arr_get re b
+    let xi = float_arr_get im b
+    let vr = xr * wr - xi * wi
+    let vi = xr * wi + xi * wr
+    let _ = float_arr_set re a (ur + vr)
+    let _ = float_arr_set im a (ui + vi)
+    let _ = float_arr_set re b (ur - vr)
+    let _ = float_arr_set im b (ui - vi)
+    bfly re im len half i (j + 1) twopi
+
+grp re im n len half i twopi =
+  if i >= n then 0
+  else
+    let _ = bfly re im len half i 0 twopi
+    grp re im n len half (i + len) twopi
+
+stage re im n len twopi =
+  if len > n then 0
+  else
+    let half = len / 2
+    let _ = grp re im n len half 0 twopi
+    stage re im n (len * 2) twopi
+
+fft re im n =
+  let bits = log2i n
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = reorder re im n bits 0
+  let _ = stage re im n 2 twopi
+  0
+
+-- ---- frame loading: Hann window, DC-center the uint8 samples ----
+load_frame bytes re im base n j twopi =
+  if j >= n then 0
+  else
+    let bi = base + 2 * j
+    let iv = (int_to_float (arr_get bytes bi)) - 127.5
+    let qv = (int_to_float (arr_get bytes (bi + 1))) - 127.5
+    let w = 0.5 - 0.5 * (cos (twopi * (int_to_float j) / (int_to_float (n - 1))))
+    let _ = float_arr_set re j (iv * w)
+    let _ = float_arr_set im j (qv * w)
+    load_frame bytes re im base n (j + 1) twopi
+
+accum_power acc re im n k =
+  if k >= n then 0
+  else
+    let mr = float_arr_get re k
+    let mi = float_arr_get im k
+    let _ = float_arr_set acc k ((float_arr_get acc k) + (mr * mr + mi * mi))
+    accum_power acc re im n (k + 1)
+
+-- process all frames into acc[]
+do_frames bytes re im acc n nf twopi f =
+  if f >= nf then 0
+  else
+    let base = f * n * 2
+    let _ = load_frame bytes re im base n 0 twopi
+    let _ = fft re im n
+    let _ = accum_power acc re im n 0
+    do_frames bytes re im acc n nf twopi (f + 1)
+
+-- natural-order power: index m=0..n-1 -> fft bin (m + n/2) mod n
+natpow acc n m =
+  let half = n / 2
+  let b = if m < half then m + half else m - half
+  float_arr_get acc b
+
+-- find strongest natural bin, skipping a guard window [glo, ghi]
+peak_scan acc n m bestm bestp glo ghi =
+  if m >= n then bestm
+  else
+    let edge = if m < 40 then 1 else (if m >= n - 40 then 1 else 0)
+    let inguard = if m >= glo then (if m <= ghi then 1 else 0) else 0
+    let skip = if edge == 1 then 1 else inguard
+    let p = natpow acc n m
+    let better = if skip == 0 then (if p > bestp then 1 else 0) else 0
+    let nm = if better == 1 then m else bestm
+    let np = if better == 1 then p else bestp
+    peak_scan acc n (m + 1) nm np glo ghi
+
+-- bucketed display: B buckets across the band, bar scaled to max
+maxpow acc n m best =
+  if m >= n then best
+  else
+    let p = float_arr_get acc m
+    let nb = if p > best then p else best
+    maxpow acc n (m + 1) nb
+
+-- zero fft bins 0..k and (n-k)..(n-1) to remove the rtl-sdr DC spike
+zero_dc acc n k b =
+  if b > k then 0
+  else
+    let _ = float_arr_set acc b 0.0
+    let _ = float_arr_set acc (n - 1 - b) 0.0
+    zero_dc acc n k (b + 1)
+
+bar_str count = if count <= 0 then "" else cat ["#", bar_str (count - 1)]
+
+bucket_sum acc n lo hi s =
+  if lo >= hi then s
+  else bucket_sum acc n (lo + 1) hi (s + (natpow acc n lo))
+
+show_buckets acc n fc fs nb b =
+  if b >= nb then 0
+  else
+    let lo = b * n / nb
+    let hi = (b + 1) * n / nb
+    let s = bucket_sum acc n lo hi 0.0
+    let midm = (lo + hi) / 2
+    let off = (int_to_float (midm - n / 2)) * fs / (int_to_float n)
+    let fmhz = (fc + off) / 1000000.0
+    let _ = print (cat ["SPEC ", show_float fmhz, " ", show_float s])
+    show_buckets acc n fc fs nb (b + 1)
+
+main =
+  let n = 4096
+  let fs = 2400000.0
+  let fc = 89000000.0
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let bytes = read_bytes "/Users/ledaticempire/projects/ledaticground/data/iq_small.bin"
+  let total = arr_len bytes
+  let nf = total / (n * 2)
+  let re = float_arr_new n 0.0
+  let im = float_arr_new n 0.0
+  let acc = float_arr_new n 0.0
+  let _ = print (cat ["IQ bytes=", show total, " frames=", show nf, " N=", show n, " bin=", show_float (fs / (int_to_float n)), " Hz"])
+  let _ = do_frames bytes re im acc n nf twopi 0
+  let _ = zero_dc acc n 24 0
+  let _ = show_buckets acc n fc fs 64 0
+  let half = n / 2
+  let p1 = peak_scan acc n 0 0 0.0 (half - 24) (half + 24)
+  let off1 = (int_to_float (p1 - half)) * fs / (int_to_float n)
+  let _ = print (cat ["CARRIER ", show_float ((fc + off1) / 1000000.0)])
+  0
