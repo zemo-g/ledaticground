@@ -20,4 +20,9 @@ $PY scripts/gen_doppler_fm.py >/dev/null 2>&1; $RN src/doppler_real.rail >/dev/n
 perl -e 'alarm 300;exec @ARGV' /tmp/rail_out > /tmp/dop_meas.out 2>/dev/null
 o=$($PY scripts/doppler_fit.py /tmp/dop_meas.out --synth 2>/dev/null)
 ck "doppler_real FM centroid corr>=0.99" "$o" "centroid : corr=0.99\|centroid : corr=1.0"
+# multi-station TDOA: recover a known time-varying differential delay by xcorr
+$PY scripts/gen_tdoa.py >/dev/null 2>&1; $RN src/tdoa.rail >/dev/null 2>&1
+perl -e 'alarm 200;exec @ARGV' /tmp/rail_out > /tmp/tdoa_meas.out 2>/dev/null
+o=$($PY scripts/tdoa_fit.py /tmp/tdoa_meas.out 2>/dev/null)
+ck "tdoa lag recovery corr=1.0" "$o" "corr 1.0000"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

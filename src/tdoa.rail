@@ -1,0 +1,93 @@
+-- ledaticground v30 prototype: TDOA estimator (pure Rail) — the multi-station
+-- GEOMETRIC proof, strictly stronger than co-attestation (V100_BLUEPRINT §7).
+-- Two stations record the SAME satellite pass. The signal arrives at each with a
+-- time difference tau(t) = (range_A(t) - range_B(t)) / c set purely by the orbit
+-- and the two station positions. Cross-correlating the two recordings recovers
+-- tau(t); if it matches the SGP4-predicted differential range, the two stations'
+-- relative timing could only have come from THIS orbit over THESE coordinates —
+-- forging it requires faking a consistent geometry at two places at once.
+--
+-- Here the METHOD is validated on synthetic two-station recordings with a known
+-- time-varying differential delay. Reads I-channel of two uint8 IQ files; emits
+-- "TDOA <window> <lag_samples>" per window (peak of the windowed cross-correlation
+-- over lag in [-L, L]). Sample-synchronous clocks are assumed (the real mesh needs
+-- GPS-PPS discipline — honest limitation, not solved here).
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+-- builtin malloc/free
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- I-channel sample (uint8 IQ -> centered float); guard out-of-range -> 0.0
+ich bytes len k =
+  let bi = k * 2
+  if bi >= len then 0.0 else (int_to_float (arr_get bytes bi)) - 127.5
+
+-- cross-correlation at a given lag over a window: sum a[base+i] * b[base+i+lag].
+-- Accumulate into acc[0] (mutable float array) so the recursion carries only int
+-- indices — a float accumulator whose update depends on the loop index trips a
+-- Rail self-loop miscompile (segfaults; same class as apt.rail synccorr).
+xc_accum a b la lb base n lag i acc =
+  if i >= n then 0
+  else
+    let va = ich a la (base + i)
+    let vb = ich b lb (base + i + lag)
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + va * vb)
+    xc_accum a b la lb base n lag (i + 1) acc
+
+-- scan lag in [-L, L], track the lag of maximum correlation
+scan_lag a b la lb base n lmax lag bestlag bestval acc =
+  if lag > lmax then bestlag
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = xc_accum a b la lb base n lag 0 acc
+    let c = float_arr_get acc 0
+    let better = if c > bestval then 1 else 0
+    let nl = if better == 1 then lag else bestlag
+    let nv = if better == 1 then c else bestval
+    scan_lag a b la lb base n lmax (lag + 1) nl nv acc
+
+do_windows a b la lb n nw lmax w acc =
+  if w >= nw then 0
+  else
+    let base = w * n + lmax
+    let lag = scan_lag a b la lb base n lmax (0 - lmax) 0 (0.0 - 1.0e18) acc
+    let _ = print (cat ["TDOA ", show w, " ", show lag])
+    do_windows a b la lb n nw lmax (w + 1) acc
+
+main =
+  let a = read_bytes "/tmp/tdoa_a.iq"
+  let b = read_bytes "/tmp/tdoa_b.iq"
+  let la = arr_len a
+  let lb = arr_len b
+  let nsamp = la / 2
+  let n = 8192            -- window length (samples)
+  let lmax = 64           -- max |lag| searched
+  -- leave lmax-sample margins at both ends so b[base+i+lag] stays in range
+  let nw = (nsamp - 2 * lmax) / n
+  let acc = float_arr_new 1 0.0
+  let _ = print (cat ["INFO nsamp=", show nsamp, " windows=", show nw, " lmax=", show lmax])
+  let _ = do_windows a b la lb n nw lmax 0 acc
+  0

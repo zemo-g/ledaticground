@@ -142,6 +142,23 @@ out a constant frequency offset and (real mode) a best time-shift via grid searc
 `doppler_real.rail` → predicted curve (`doppler_predict.rail`) → fit → attest.
 Selftest now 8/8 (added the FM-centroid gate). Armed for the 03:02 UTC NOAA-19 pass.
 
+### TDOA — multi-station geometric proof ✅ (validated on synthetic) — the v30 rung
+`src/tdoa.rail` — two stations record the SAME pass; the signal reaches each with a
+time difference tau(t) = (range_A(t) - range_B(t))/c set purely by the orbit and the
+two station coordinates. A windowed cross-correlation of the two recordings recovers
+tau(t); matching it to the SGP4-predicted differential range is a STRICTLY STRONGER
+proof than co-attestation — forging it means faking a consistent geometry at two
+places at once. On synthetic two-station recordings with a known +/-50-sample
+time-varying differential delay (a ~300 km baseline shape): lag recovery
+**corr 1.0000, 20/20 windows exact, RMS 0.00 samples**.
+> **3rd-instance fix of the float-accumulator self-loop miscompile.** The
+> cross-correlation sum first segfaulted (exit 139) because it carried a float
+> accumulator whose per-step update depends on the loop index (`acc + a[i]*b[i+lag]`)
+> — same class as apt.rail's synccorr. Fix: accumulate into a 1-element mutable
+> float array so the tail recursion carries only int indices. Clean, reusable.
+Honest limitation: sample-synchronous clocks are assumed; the real mesh needs
+GPS-PPS timing discipline (roadmap, not solved here). Selftest now 9/9.
+
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →
 decode → attest) is built and falsified. v10+ (multi-station mesh,
