@@ -10,8 +10,14 @@ o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rai
 ck "attest verify=1"   "$o" "own-sig accepted = 1"; ck "attest tamper=0" "$o" "modified-msg accepted = 0"
 o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/coattest.rail 2>/dev/null)
 ck "coattest co-attested=1" "$o" "CO-ATTESTED (2 stations) = 1"; ck "coattest forgery rejected" "$o" "co-attest = 0  (want 0)"
+o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/verify.rail 2>/dev/null); ck "verify receipt VALID" "$o" "RECEIPT VALID"
 $PY scripts/gen_doppler.py >/dev/null 2>&1; $RN src/doppler.rail >/dev/null 2>&1
 perl -e 'alarm 90;exec @ARGV' /tmp/rail_out > /tmp/dop_rail.out 2>&1
 o=$($PY -c "import numpy as np;t=np.load('/tmp/dop_truth.npy');d={};[d.update({int(l.split()[1]):float(l.split()[2])}) for l in open('/tmp/dop_rail.out') if l.startswith('DOP')];nw=min(len(d),len(t));r=np.array([d[i] for i in range(nw)]);print('dopcorr',round(float(np.corrcoef(r,t[:nw])[0,1]),3))")
 ck "doppler measure corr>=0.99" "$o" "dopcorr 0.99\|dopcorr 1.0"
+# real-capture centroid tracker on a realistic FM (APT-like) Doppler S-curve
+$PY scripts/gen_doppler_fm.py >/dev/null 2>&1; $RN src/doppler_real.rail >/dev/null 2>&1
+perl -e 'alarm 300;exec @ARGV' /tmp/rail_out > /tmp/dop_meas.out 2>/dev/null
+o=$($PY scripts/doppler_fit.py /tmp/dop_meas.out --synth 2>/dev/null)
+ck "doppler_real FM centroid corr>=0.99" "$o" "centroid : corr=0.99\|centroid : corr=1.0"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

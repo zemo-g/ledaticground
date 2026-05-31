@@ -118,6 +118,30 @@ single-station v100 *machinery*. 3 Rail compiler-bug instances found + documente
 (self-loop cross-dep family). Remaining road to v100 is live data + multi-station
 infrastructure, not new single-node capability.
 
+### Real-Doppler processor ✅ (validated on a realistic FM synthetic) — pre-flight for the live pass
+`src/doppler_real.rail` — the live-capture tracker, tuned for the NOAA-19 IQ
+snapshots (uint8, 60 kHz, 16384 samples/snapshot concatenated in time order).
+Two changes a REAL signal forces over the clean-tone tracker, both validated:
+- **DC-skip** — rtl_sdr leaves a DC spike at tune center; bins <2 / >n-2 are
+  excluded so the tracker can't lock onto 0 Hz every window.
+- **Spectral centroid, not peak bin** — NOAA APT is a ~34 kHz-wide FM signal, so
+  the peak bin jitters. The power-weighted centroid of the signal energy tracks
+  the Doppler-shifted center.
+> **This caught a real trap.** `scripts/gen_doppler_fm.py` synthesizes the live
+> format exactly (17 kHz-deviation FM, 2400 Hz subcarrier + video tones, a
+> constant offset = SDR ppm/carrier error, a DC spike, noise) on a known Doppler
+> S-curve. On it: **centroid corr 0.9986 / residual 102 Hz** and recovers the
+> injected 1850 Hz offset (got 1864). **Peak bin: corr 0.27.** The clean-tone
+> tracker (corr 0.9999 on a pure carrier) would have *falsely failed* the
+> proof-of-reception on the real FM signal — the realistic synthetic surfaced
+> that before the pass, not after.
+`scripts/doppler_fit.py` fits a measured track against a reference curve, solving
+out a constant frequency offset and (real mode) a best time-shift via grid search
+(AOS uncertainty); validated to recover shift=0 / corr 0.9986 on synthetic.
+`scripts/process_real_doppler.sh` is the one-command live pipeline: concat snaps →
+`doppler_real.rail` → predicted curve (`doppler_predict.rail`) → fit → attest.
+Selftest now 8/8 (added the FM-centroid gate). Armed for the 03:02 UTC NOAA-19 pass.
+
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →
 decode → attest) is built and falsified. v10+ (multi-station mesh,
