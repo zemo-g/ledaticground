@@ -86,6 +86,21 @@ carrier — next pass).
 - v10+ (multi-station mesh, cross-attestation, TDOA, PAOS corpus): out of
   single-session scope — that's the actual road to v100.
 
+### v10 cross-attestation prototype ✅ (synthetic) — the network rung
+`src/coattest.rail` — two independent stations (different coords + Doppler fits)
+each Ed25519-sign a receipt of the SAME pass. Co-attestation is valid ONLY if
+both sigs verify AND corroborate (same sat+pulse+product hash). Result:
+both verify 1/1, corroborate 1, **CO-ATTESTED = 1**; a forgery (attacker with
+only station A's key signing as B) is **rejected (co-attest = 0)**. This is the
+v100 multi-station strength: forging N independent stations is exponentially
+harder than one.
+
+### Real-Doppler capture armed (toward a real attested reception)
+Fire-and-forget recorder for the NOAA 19 APT pass (137.1 MHz, 83 deg, 03:02 UTC):
+~105 narrowband IQ snapshots (16384 @ 60 kHz) logged with unix time → a REAL
+Doppler curve to run through `doppler.rail` and bind into an attested receipt.
+The first proof-of-reception on live data (vs the synthetic-validated method).
+
 ### Session tally
 Built + falsified in one climb: pass-predict, FFT, spectrum, FM-demod,
 APT-decode+sync, Ed25519 attestation, Doppler proof-of-reception. The complete

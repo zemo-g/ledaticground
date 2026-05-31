@@ -1,0 +1,74 @@
+-- ledaticground v10 prototype: CROSS-ATTESTATION (pure Rail).
+-- Two independent stations receive the same satellite pass and each sign a
+-- proof-of-reception receipt. A co-attestation is valid ONLY if BOTH Ed25519
+-- signatures verify AND the receipts corroborate (same sat + pulse_id + product
+-- hash). Two stations agreeing on the same decoded product, from different
+-- coords + distinct Doppler fits, is far harder to forge than one — the v100
+-- network strength (V100_BLUEPRINT §7). Run from the rail repo dir.
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- build a station receipt string for a shared pass
+mk_receipt sat pulse station lat lon prod dopres signer =
+  join "|" ["RECEIPT", cat ["sat=", sat], cat ["pulse=", pulse], cat ["station=", station], cat ["lat=", lat], cat ["lon=", lon], cat ["product_sha256=", prod], cat ["doppler_residual_hz=", dopres], cat ["signer=", signer]]
+
+-- sign a receipt string with a seed -> hex sig
+sign_receipt seed r =
+  let msg = string_to_bytes r
+  let mlen = string_length_bytes r
+  bytes_to_hex (ed25519_sign seed msg mlen) 64
+
+-- verify a receipt string against a pubkey + hex sig -> 1/0
+verify_receipt pk r sighex =
+  let msg = string_to_bytes r
+  let mlen = string_length_bytes r
+  let sig = hex_to_bytes sighex
+  ed25519_verify pk msg mlen sig
+
+main =
+  -- two DEV station keys (NOT production authorities)
+  let seedA = hex_to_bytes "a11ce0000000000000000000000000000000000000000000000000000000ab01"
+  let seedB = hex_to_bytes "b0b1e0000000000000000000000000000000000000000000000000000000cd02"
+  let pkA = ed25519_pk_from_sk seedA
+  let pkB = ed25519_pk_from_sk seedB
+  let pkAh = bytes_to_hex pkA 32
+  let pkBh = bytes_to_hex pkB 32
+
+  -- shared pass: same satellite, same pulse, SAME decoded product (both
+  -- stations recovered the same image -> identical product hash = corroboration)
+  let sat = "NOAA-15"
+  let pulse = "1780265757"
+  let prod = sha256_hex (read_file "/tmp/apt_rail.out")
+
+  -- station A (regional) and B (300 km away) — distinct coords + Doppler fits
+  let rA = mk_receipt sat pulse "regional_MI" "0.0" "-0.0" prod "31.4" pkAh
+  let rB = mk_receipt sat pulse "Columbus_OH" "39.96" "-83.00" prod "27.9" pkBh
+  let sigA = sign_receipt seedA rA
+  let sigB = sign_receipt seedB rB
+
+  let vA = verify_receipt pkA rA sigA
+  let vB = verify_receipt pkB rB sigB
+  -- corroboration: same product hash in both receipts
+  let prodA = str_sub rA (str_find "product_sha256=" rA) 79
+  let prodB = str_sub rB (str_find "product_sha256=" rB) 79
+  let corrob = if prodA == prodB then 1 else 0
+  let coattested = if vA == 1 then (if vB == 1 then corrob else 0) else 0
+  let merged = sha256_hex (cat [rA, "|", sigA, "||", rB, "|", sigB])
+
+  let _ = print (cat ["station A verify = ", show vA, "  station B verify = ", show vB])
+  let _ = print (cat ["corroborate (same product) = ", show corrob])
+  let _ = print (cat ["==> CO-ATTESTED (2 stations) = ", show coattested, "  (want 1)"])
+  let _ = print (cat ["co-attestation hash = ", merged])
+
+  -- forgery attempt: attacker has only A's key, fakes B's receipt + signs with A
+  let rBfake = mk_receipt sat pulse "Columbus_OH" "39.96" "-83.00" prod "27.9" pkBh
+  let sigBforged = sign_receipt seedA rBfake
+  let vBforged = verify_receipt pkB rBfake sigBforged
+  let forged_coattest = if vA == 1 then (if vBforged == 1 then 1 else 0) else 0
+  let _ = print (cat ["FORGERY (A signs as B) station B verify = ", show vBforged, "  -> co-attest = ", show forged_coattest, "  (want 0)"])
+  0
