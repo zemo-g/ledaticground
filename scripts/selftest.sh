@@ -25,4 +25,9 @@ $PY scripts/gen_tdoa.py >/dev/null 2>&1; $RN src/tdoa.rail >/dev/null 2>&1
 perl -e 'alarm 200;exec @ARGV' /tmp/rail_out > /tmp/tdoa_meas.out 2>/dev/null
 o=$($PY scripts/tdoa_fit.py /tmp/tdoa_meas.out 2>/dev/null)
 ck "tdoa lag recovery corr=1.0" "$o" "corr 1.0000"
+# v40 capstone: unified multi-physics bundle (co-sig + Doppler + TDOA) valid; forgery rejected
+echo "selftest-bundle-product" > /tmp/apt_rail.out
+o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/bundle.rail 2>/dev/null)
+ck "bundle multi-physics valid=1" "$o" "BUNDLE VALID (multi-physics, 2 stations) = 1"
+ck "bundle forgery rejected" "$o" "bundle valid = 0  (want 0)"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

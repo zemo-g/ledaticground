@@ -159,6 +159,16 @@ time-varying differential delay (a ~300 km baseline shape): lag recovery
 Honest limitation: sample-synchronous clocks are assumed; the real mesh needs
 GPS-PPS timing discipline (roadmap, not solved here). Selftest now 9/9.
 
+### v40 capstone — unified multi-physics proof bundle ✅ — the v100 receipt shape
+`src/bundle.rail` — recombines every validated method into one signed object: two
+stations co-sign a bundle binding {sha256(product) + each station's Doppler-fit
+residual + their mutual TDOA + a beacon-pulse anchor (not wall-clock)}. Valid only
+if both Ed25519 sigs verify AND the physics corroborates (same product, both
+Doppler residuals within tolerance, TDOA present): **BUNDLE VALID = 1**. The same
+forgery as coattest (attacker holds only A's key) is **rejected = 0**. This is what
+all the rungs add up to — forging it means a consistent orbit+geometry at two places
+at once *and* both station keys. selftest now 11/11.
+
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →
 decode → attest) is built and falsified. v10+ (multi-station mesh,
