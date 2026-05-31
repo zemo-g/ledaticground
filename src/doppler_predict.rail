@@ -1,0 +1,296 @@
+-- ledaticground v0.1 - satellite pass predictor (pure Rail)
+-- Simplified SGP4: two-body Kepler + J2 secular drift on RAAN/argp/M.
+-- Good for "when do I point the antenna up" planning (AOS/LOS to ~1 min).
+-- NOT full SGP4 - no drag, no short-period terms. Verify precise tracking elsewhere.
+--
+-- Build:  ~/projects/rail/rail_native run src/passes.rail
+-- Needs:  data/tle_weather.txt + data/now_unix.txt  (run scripts/fetch_tle.sh first)
+--
+-- Observer hardcoded to regional, Metro Detroit (0.0 N, 0.0 W).
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign pow x y -> float
+foreign atan2 y x -> float
+foreign floor x -> float
+
+asin_ x = atan2 x (sqrt (1.0 - x * x))
+fmod_ a b = a - (floor (a / b)) * b
+
+pad2 n = if n < 10 then cat ["0", show n] else show n
+
+-- Kepler equation: solve M = E - e sin E for E (Newton, fixed iters)
+kepler_iter e m ecur k =
+  if k == 0 then ecur
+  else
+    let f = ecur - e * (sin ecur) - m
+    let fp = 1.0 - e * (cos ecur)
+    let enext = ecur - f / fp
+    kepler_iter e m enext (k - 1)
+
+solve_kepler e m = kepler_iter e m m 8
+
+-- Greenwich Mean Sidereal Time (radians) at a given Julian Date
+gmst_rad jd d2r =
+  let d = jd - 2451545.0
+  let t = d / 36525.0
+  let g = 280.46061837 + 360.98564736629 * d + 0.000387933 * t * t - (t * t * t) / 38710000.0
+  let gm = fmod_ g 360.0
+  let gpos = if gm < 0.0 then gm + 360.0 else gm
+  gpos * d2r
+
+-- Compute topocentric elevation/azimuth (degrees) of sat at time t (s since epoch).
+-- Writes el -> o[0], az -> o[1].
+compute_elaz e t o =
+  let a = float_arr_get e 0
+  let ecc = float_arr_get e 1
+  let incl = float_arr_get e 2
+  let raan0 = float_arr_get e 3
+  let argp0 = float_arr_get e 4
+  let m0 = float_arr_get e 5
+  let raandot = float_arr_get e 6
+  let argpdot = float_arr_get e 7
+  let mdot = float_arr_get e 8
+  let jde = float_arr_get e 9
+  let ox = float_arr_get e 10
+  let oy = float_arr_get e 11
+  let oz = float_arr_get e 12
+  let ophi = float_arr_get e 13
+  let olam = float_arr_get e 14
+  let d2r = float_arr_get e 15
+  let mm = m0 + mdot * t
+  let raan = raan0 + raandot * t
+  let argp = argp0 + argpdot * t
+  let ea = solve_kepler ecc mm
+  let r = a * (1.0 - ecc * (cos ea))
+  let nu = atan2 ((sqrt (1.0 + ecc)) * (sin (ea / 2.0))) ((sqrt (1.0 - ecc)) * (cos (ea / 2.0)))
+  let nu2 = nu * 2.0
+  let xo = r * (cos nu2)
+  let yo = r * (sin nu2)
+  let cosO = cos raan
+  let sinO = sin raan
+  let cosw = cos argp
+  let sinw = sin argp
+  let cosi = cos incl
+  let sini = sin incl
+  let xeci = xo * ((cosO * cosw) - (sinO * sinw * cosi)) - yo * ((cosO * sinw) + (sinO * cosw * cosi))
+  let yeci = xo * ((sinO * cosw) + (cosO * sinw * cosi)) - yo * ((sinO * sinw) - (cosO * cosw * cosi))
+  let zeci = xo * (sinw * sini) + yo * (cosw * sini)
+  let jd_obs = jde + t / 86400.0
+  let g = gmst_rad jd_obs d2r
+  let cg = cos g
+  let sg = sin g
+  let xe = xeci * cg + yeci * sg
+  let ye = (0.0 - xeci) * sg + yeci * cg
+  let ze = zeci
+  let rx = xe - ox
+  let ry = ye - oy
+  let rz = ze - oz
+  let slat = sin ophi
+  let clat = cos ophi
+  let slon = sin olam
+  let clon = cos olam
+  let east = (0.0 - slon) * rx + clon * ry
+  let north = (0.0 - slat) * clon * rx - slat * slon * ry + clat * rz
+  let up = clat * clon * rx + clat * slon * ry + slat * rz
+  let rng = sqrt (rx * rx + ry * ry + rz * rz)
+  let elr = asin_ (up / rng)
+  let azr = atan2 east north
+  let eldeg = elr / d2r
+  let azd = azr / d2r
+  let azpos = if azd < 0.0 then azd + 360.0 else azd
+  let _ = float_arr_set o 0 eldeg
+  let _ = float_arr_set o 1 azpos
+  let _ = float_arr_set o 2 rng
+  0
+
+upd_max s el az =
+  let _ = float_arr_set s 3 el
+  let _ = float_arr_set s 4 az
+  0
+
+print_pass name e s t =
+  let t0 = float_arr_get e 17
+  let aos_t = float_arr_get s 2
+  let maxel = float_arr_get s 3
+  let aosaz = float_arr_get s 5
+  let nowu = float_arr_get e 19
+  let mins = (aos_t - t0) / 60.0
+  let dur = (t - aos_t) / 60.0
+  let unix_aos = float_to_int (nowu + (aos_t - t0))
+  let secday = unix_aos % 86400
+  let uhh = secday / 3600
+  let umm = (secday % 3600) / 60
+  let lhh = (uhh + 20) % 24
+  let mI = float_to_int mins
+  let dI = float_to_int dur
+  let elI = float_to_int maxel
+  let azI = float_to_int aosaz
+  let line = cat [name, "  in ", show mI, " min | ", pad2 lhh, ":", pad2 umm, " EDT (", pad2 uhh, ":", pad2 umm, " UTC) | ", show dI, " min | max El ", show elI, " deg | rises az ", show azI, " deg"]
+  let _ = print line
+  0
+
+-- step loop: i in [0,n). t = t0 + i*dt seconds since epoch.
+scan name e s o i n =
+  if i >= n then 0
+  else
+    let dt = float_arr_get e 16
+    let t0 = float_arr_get e 17
+    let t = t0 + (int_to_float i) * dt
+    let _ = compute_elaz e t o
+    let el = float_arr_get o 0
+    let az = float_arr_get o 1
+    let inpass = float_arr_get s 1
+    let _ = if inpass > 0.5 then
+              if el >= 0.0 then
+                let curmax = float_arr_get s 3
+                let _ = if el > curmax then upd_max s el az else 0
+                0
+              else
+                let maxel = float_arr_get s 3
+                let _ = if maxel >= float_arr_get e 18 then print_pass name e s t else 0
+                let _ = float_arr_set s 1 0.0
+                0
+            else
+              if el >= 0.0 then
+                let _ = float_arr_set s 1 1.0
+                let _ = float_arr_set s 2 t
+                let _ = float_arr_set s 5 az
+                let _ = float_arr_set s 3 el
+                let _ = float_arr_set s 4 az
+                0
+              else 0
+    scan name e s o (i + 1) n
+
+do_sat name l1 l2 e s o n =
+  let incd = parse_float (str_sub l2 8 8)
+  let raand = parse_float (str_sub l2 17 8)
+  let ecc = parse_float (cat ["0.", str_sub l2 26 7])
+  let argpd = parse_float (str_sub l2 34 8)
+  let mad = parse_float (str_sub l2 43 8)
+  let mmd = parse_float (str_sub l2 52 11)
+  let yy = parse_int (str_sub l1 18 2)
+  let year = 2000 + yy
+  let ddf = parse_float (str_sub l1 20 12)
+  let jd_jan1 = int_to_float (367 * year - 7 * year / 4) + 1721044.5
+  let jd_epoch = jd_jan1 + (ddf - 1.0)
+  let d2r = float_arr_get e 15
+  let twopi = float_arr_get e 24
+  let mu = float_arr_get e 21
+  let re = float_arr_get e 22
+  let j2 = float_arr_get e 23
+  let jd_now = float_arr_get e 20
+  let n0 = mmd * twopi / 86400.0
+  let a = pow (mu / (n0 * n0)) (1.0 / 3.0)
+  let incl = incd * d2r
+  let p = a * (1.0 - ecc * ecc)
+  let rp = re / p
+  let factor = 1.5 * j2 * rp * rp
+  let cosi = cos incl
+  let sini = sin incl
+  let raandot = (0.0 - n0) * factor * cosi
+  let argpdot = n0 * factor * (2.0 - 2.5 * sini * sini)
+  let mdot = n0 * (1.0 + factor * (sqrt (1.0 - ecc * ecc)) * (1.0 - 1.5 * sini * sini))
+  let t0 = (jd_now - jd_epoch) * 86400.0
+  let _ = float_arr_set e 0 a
+  let _ = float_arr_set e 1 ecc
+  let _ = float_arr_set e 2 incl
+  let _ = float_arr_set e 3 (raand * d2r)
+  let _ = float_arr_set e 4 (argpd * d2r)
+  let _ = float_arr_set e 5 (mad * d2r)
+  let _ = float_arr_set e 6 raandot
+  let _ = float_arr_set e 7 argpdot
+  let _ = float_arr_set e 8 mdot
+  let _ = float_arr_set e 9 jd_epoch
+  let _ = float_arr_set e 17 t0
+  let _ = float_arr_set s 1 0.0
+  let _ = float_arr_set s 3 0.0
+  let _ = dscan name e s o 0 n
+  0
+
+-- predicted Doppler over the pass: dop(t) = (range(t)-range(t+1s))*fc/c
+dscan name e s o i n =
+  if i >= n then 0
+  else
+    let dt = float_arr_get e 16
+    let t0 = float_arr_get e 17
+    let t = t0 + (int_to_float i) * dt
+    let _ = compute_elaz e t o
+    let el = float_arr_get o 0
+    let _ = if el > 5.0 then
+              let r1 = float_arr_get o 2
+              let _ = compute_elaz e (t + 1.0) o
+              let r2 = float_arr_get o 2
+              let fc = float_arr_get e 25
+              let dop = (r1 - r2) * fc / 299792.458
+              let mins = (t - t0) / 60.0
+              let _ = print (cat ["DOPPLER ", show_float mins, " ", show_float el, " ", show_float dop])
+              0
+            else 0
+    dscan name e s o (i + 1) n
+
+is_target name =
+  if str_contains "NOAA 19" name then 1 else 0
+
+process lines e s o n =
+  if lines == [] then 0
+  else
+    let name = head lines
+    let r1 = tail lines
+    if r1 == [] then 0
+    else
+      let l1 = head r1
+      let r2 = tail r1
+      if r2 == [] then 0
+      else
+        let l2 = head r2
+        let r3 = tail r2
+        let _ = if is_target name > 0 then do_sat name l1 l2 e s o n else 0
+        process r3 e s o n
+
+main =
+  let pi = atan2 0.0 (0.0 - 1.0)
+  let twopi = pi * 2.0
+  let d2r = pi / 180.0
+  let lat = 0.0
+  let lon = 0.0 - 0.0
+  let alt = 0.18
+  let phi = lat * d2r
+  let lam = lon * d2r
+  let sphi = sin phi
+  let cphi = cos phi
+  let ae = 6378.137
+  let f = 1.0 / 298.257223563
+  let e2 = f * (2.0 - f)
+  let nlat = ae / (sqrt (1.0 - e2 * sphi * sphi))
+  let ox = (nlat + alt) * cphi * (cos lam)
+  let oy = (nlat + alt) * cphi * (sin lam)
+  let oz = (nlat * (1.0 - e2) + alt) * sphi
+  let now_unix = parse_int (read_file "data/now_unix.txt")
+  let jd_now = (int_to_float now_unix) / 86400.0 + 2440587.5
+  let dt = 30.0
+  let n = 2880
+  let e = float_arr_new 26 0.0
+  let s = float_arr_new 6 0.0
+  let o = float_arr_new 3 0.0
+  let _ = float_arr_set e 25 137100000.0
+  let _ = float_arr_set e 10 ox
+  let _ = float_arr_set e 11 oy
+  let _ = float_arr_set e 12 oz
+  let _ = float_arr_set e 13 phi
+  let _ = float_arr_set e 14 lam
+  let _ = float_arr_set e 15 d2r
+  let _ = float_arr_set e 16 dt
+  let _ = float_arr_set e 18 10.0
+  let _ = float_arr_set e 19 (int_to_float now_unix)
+  let _ = float_arr_set e 20 jd_now
+  let _ = float_arr_set e 21 398600.4418
+  let _ = float_arr_set e 22 6378.137
+  let _ = float_arr_set e 23 0.0010826267
+  let _ = float_arr_set e 24 twopi
+  let content = read_file "data/tle_weather.txt"
+  let lines = split "\n" content
+  let _ = print "# predicted NOAA-19 Doppler (137.1 MHz) over regional: DOPPLER <min_from_now> <el_deg> <doppler_hz>"
+  let _ = process lines e s o n
+  0

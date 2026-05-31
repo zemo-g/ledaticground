@@ -101,6 +101,16 @@ Fire-and-forget recorder for the NOAA 19 APT pass (137.1 MHz, 83 deg, 03:02 UTC)
 Doppler curve to run through `doppler.rail` and bind into an attested receipt.
 The first proof-of-reception on live data (vs the synthetic-validated method).
 
+### Doppler PREDICT half ✅ — proof-of-reception pipeline now complete
+`src/doppler_predict.rail` (extends `passes.rail` geometry with range-rate →
+Doppler = (range(t)-range(t+1s))·fc/c). Predicted NOAA-19 (137.1 MHz) curve over
+its 03:02 UTC pass is a textbook S-curve: **+3020 Hz** at approach (el 5.6°) →
+**~0 at peak** (el 83°, closest approach) → **−1594 Hz** receding. Magnitude
+±3 kHz and the zero-crossing-at-peak both match theory — validated by shape.
+Proof-of-reception is now end-to-end: **measure** (`doppler.rail`) + **predict**
+(`doppler_predict.rail`) + fit→residual. Awaiting the real NOAA-19 IQ capture
+(armed, 03:02 UTC) to bind a live reception.
+
 ### Session tally
 Built + falsified in one climb: pass-predict, FFT, spectrum, FM-demod,
 APT-decode+sync, Ed25519 attestation, Doppler proof-of-reception. The complete
