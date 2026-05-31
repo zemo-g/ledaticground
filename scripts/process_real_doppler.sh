@@ -32,8 +32,13 @@ echo "predicted points: $(grep -c '^DOPPLER' /tmp/dop_pred.out)"
 
 echo "=== fit measured vs predicted ==="
 $PY scripts/doppler_fit.py /tmp/dop_meas_real.out --predict /tmp/dop_pred.out --times "$D/times.txt" | tee /tmp/dop_fit.out
+# pull the centroid residual_rms into the receipt (the physical-confidence field)
+RES=$(grep 'centroid' /tmp/dop_fit.out | sed -n 's/.*residual_rms= *\([0-9.]*\).*/\1/p' | head -1)
+[ -n "$RES" ] || RES="UNRESOLVED"
 
 echo "=== attest the real Doppler-bound reception ==="
 cp /tmp/dop_meas_real.out /tmp/apt_rail.out      # product = the measured track
+printf 'NOAA-19\n' > "$GD/data/sat_label.txt"            # honest real label
+printf '%s\n' "$RES" > "$GD/data/doppler_residual.txt"   # REAL measured residual (Hz)
 ( cd "$RAIL" && perl -e 'alarm 120; exec @ARGV' "$RN" run "$GD/src/attest.rail" )
 echo "=== receipt ==="; cat "$GD/data/receipt.json"

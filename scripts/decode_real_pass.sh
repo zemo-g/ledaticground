@@ -35,6 +35,8 @@ $PY "$GD/scripts/apt_sync.py" /tmp/apt_rail_real.out "$GD/data/noaa15_real.png"
 
 echo "=== attest the real reception ==="
 cp /tmp/apt_rail_real.out /tmp/apt_rail.out   # attest.rail hashes this product
+printf 'NOAA-15\n' > "$GD/data/sat_label.txt"             # honest real label
+printf 'PENDING_needs_IQ\n' > "$GD/data/doppler_residual.txt"  # image pass, no IQ
 ( cd "$RAIL" && perl -e 'alarm 120; exec @ARGV' "$RN" run "$GD/src/attest.rail" )
 echo "=== receipt ==="; cat "$GD/data/receipt.json"
 echo; echo "image -> $GD/data/noaa15_real.png"

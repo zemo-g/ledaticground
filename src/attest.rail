@@ -16,6 +16,13 @@ import "stdlib/ed25519.rail"
 import "stdlib/ed25519_scalar.rail"
 import "stdlib/ed25519_sign.rail"
 
+-- read a one-line config file, strip newline; fall back to a SAFE default if the
+-- file is missing/empty. Defaults are the synthetic/pending values so an absent
+-- file can never mislabel a synthetic reception as a real one.
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
 main =
   -- DEV signing key (NOT a production attestation authority — clearly labeled).
   let seed = hex_to_bytes "1ed11c0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
@@ -31,7 +38,12 @@ main =
   let pulse = str_replace "\n" "" (read_file "/Users/ledaticempire/projects/ledaticground/data/now_unix.txt")
   let prev = "GENESIS"
 
-  let receipt = join "|" ["RECEIPT", "sat=NOAA-15-synthetic", cat ["pulse=", pulse], "station=regional_MI", "lat=0.0", "lon=-0.0", cat ["product_sha256=", product_hash], "doppler_residual_hz=PENDING_needs_IQ", cat ["prev=", prev], cat ["signer=", pk_hex]]
+  -- sat label + Doppler residual are file-driven (safe synthetic/pending defaults);
+  -- the real-decode scripts write the honest values before signing.
+  let sat = field_or "/Users/ledaticempire/projects/ledaticground/data/sat_label.txt" "NOAA-15-synthetic"
+  let dres = field_or "/Users/ledaticempire/projects/ledaticground/data/doppler_residual.txt" "PENDING_needs_IQ"
+
+  let receipt = join "|" ["RECEIPT", cat ["sat=", sat], cat ["pulse=", pulse], "station=regional_MI", "lat=0.0", "lon=-0.0", cat ["product_sha256=", product_hash], cat ["doppler_residual_hz=", dres], cat ["prev=", prev], cat ["signer=", pk_hex]]
   let msg = string_to_bytes receipt
   let mlen = string_length_bytes receipt
   let sig = ed25519_sign seed msg mlen
