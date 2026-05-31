@@ -30,4 +30,9 @@ echo "selftest-bundle-product" > /tmp/apt_rail.out
 o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/bundle.rail 2>/dev/null)
 ck "bundle multi-physics valid=1" "$o" "BUNDLE VALID (multi-physics, 2 stations) = 1"
 ck "bundle forgery rejected" "$o" "bundle valid = 0  (want 0)"
+# LRPT rung: soft-decision Viterbi (CCSDS r=1/2 K=7) recovers bits through noise
+$PY scripts/gen_viterbi.py --n 2000 --snr 4 >/dev/null 2>&1; $RN src/viterbi.rail >/dev/null 2>&1
+perl -e 'alarm 120;exec @ARGV' /tmp/rail_out > /tmp/vit_out.txt 2>/dev/null
+o=$($PY scripts/viterbi_check.py /tmp/vit_out.txt 2>/dev/null)
+ck "viterbi r=1/2 K=7 zero errors @4dB" "$o" "bit errors 0 "
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

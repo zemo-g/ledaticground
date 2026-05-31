@@ -1,0 +1,143 @@
+-- ledaticground LRPT rung: soft-decision Viterbi decoder (pure Rail).
+-- CCSDS r=1/2, K=7 convolutional code, G1=0o171 (121), G2=0o133 (91) — the code
+-- METEOR-M LRPT (and most CCSDS downlinks) use. 64-state trellis, soft-decision
+-- add-compare-select with per-step metric normalization (keeps int metrics bounded,
+-- no overflow), array-cell traceback. Reads int8 soft symbols from /tmp/vit_soft.s8
+-- (2 per trellis step, BPSK: bit 0 -> +, bit 1 -> -); prints "BITS <0/1 string>".
+-- All metrics are ints in arrays + recursions carry only int indices, dodging the
+-- float-accumulator self-loop miscompile.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+-- builtin malloc/free, bit_and/bit_or/shl/shr
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- int8 soft sample (signed) at index k
+soft_at bytes k =
+  let b = arr_get bytes k
+  if b < 128 then b else b - 256
+
+popc r = if r == 0 then 0 else (bit_and r 1) + popc (shr r 1)
+parity r = bit_and (popc r) 1
+
+-- output-bit tables: o1[reg]=parity(reg&G1), o2[reg]=parity(reg&G2), reg 0..127
+fill_tab reg o1 o2 g1 g2 =
+  if reg > 127 then 0
+  else
+    let _ = arr_set o1 reg (parity (bit_and reg g1))
+    let _ = arr_set o2 reg (parity (bit_and reg g2))
+    fill_tab (reg + 1) o1 o2 g1 g2
+
+init_pm pm i =
+  if i > 63 then 0
+  else
+    let _ = arr_set pm i (if i == 0 then 0 else (0 - 1000000000))
+    init_pm pm (i + 1)
+
+-- add-compare-select for every next-state ns at one trellis step.
+-- next-state ns has 2 predecessors {ns>>1, (ns>>1)|32}; input bit = ns&1.
+-- branch metric maximizes BPSK correlation: out 0 -> +soft, out 1 -> -soft.
+acs ns pm npm o1 o2 s1 s2 tb tbase =
+  if ns > 63 then 0
+  else
+    let bit = bit_and ns 1
+    let p0 = shr ns 1
+    let p1 = bit_or p0 32
+    let reg0 = bit_or (shl p0 1) bit
+    let reg1 = bit_or reg0 64
+    let bm0 = (if (arr_get o1 reg0) == 0 then s1 else (0 - s1)) + (if (arr_get o2 reg0) == 0 then s2 else (0 - s2))
+    let bm1 = (if (arr_get o1 reg1) == 0 then s1 else (0 - s1)) + (if (arr_get o2 reg1) == 0 then s2 else (0 - s2))
+    let c0 = (arr_get pm p0) + bm0
+    let c1 = (arr_get pm p1) + bm1
+    let _ = if c0 >= c1 then
+              let _ = arr_set npm ns c0
+              let _ = arr_set tb (tbase + ns) p0
+              0
+            else
+              let _ = arr_set npm ns c1
+              let _ = arr_set tb (tbase + ns) p1
+              0
+    acs (ns + 1) pm npm o1 o2 s1 s2 tb tbase
+
+arr_max a i n best =
+  if i >= n then best
+  else
+    let v = arr_get a i
+    arr_max a (i + 1) n (if v > best then v else best)
+sub_all a i n d =
+  if i >= n then 0
+  else
+    let _ = arr_set a i ((arr_get a i) - d)
+    sub_all a (i + 1) n d
+copy_arr src dst i n =
+  if i >= n then 0
+  else
+    let _ = arr_set dst i (arr_get src i)
+    copy_arr src dst (i + 1) n
+
+run_steps bytes nsteps t pm npm o1 o2 tb =
+  if t >= nsteps then 0
+  else
+    let s1 = soft_at bytes (t * 2)
+    let s2 = soft_at bytes (t * 2 + 1)
+    let _ = acs 0 pm npm o1 o2 s1 s2 tb (t * 64)
+    let mx = arr_max npm 0 64 (0 - 1000000000)
+    let _ = sub_all npm 0 64 mx
+    let _ = copy_arr npm pm 0 64
+    run_steps bytes nsteps (t + 1) pm npm o1 o2 tb
+
+-- traceback: state lives in a 1-cell array so the recursion carries only t
+trace tb t scell outbits =
+  if t < 0 then 0
+  else
+    let st = arr_get scell 0
+    let _ = arr_set outbits t (bit_and st 1)
+    let _ = arr_set scell 0 (arr_get tb (t * 64 + st))
+    trace tb (t - 1) scell outbits
+
+bitstr outbits i n acc =
+  if i >= n then acc
+  else bitstr outbits (i + 1) n (cat [acc, show (arr_get outbits i)])
+
+main =
+  let bytes = read_bytes "/tmp/vit_soft.s8"
+  let len = arr_len bytes
+  let nsteps = len / 2
+  let o1 = arr_new 128 0
+  let o2 = arr_new 128 0
+  let _ = fill_tab 0 o1 o2 121 91
+  let pm = arr_new 64 0
+  let npm = arr_new 64 0
+  let _ = init_pm pm 0
+  let tb = arr_new (nsteps * 64) 0
+  let _ = print (cat ["INFO soft_symbols=", show len, " trellis_steps=", show nsteps])
+  let _ = run_steps bytes nsteps 0 pm npm o1 o2 tb
+  -- terminated encoder ends in state 0; traceback from there
+  let outbits = arr_new nsteps 0
+  let scell = arr_new 1 0
+  let _ = arr_set scell 0 0
+  let _ = trace tb (nsteps - 1) scell outbits
+  let _ = print (cat ["BITS ", bitstr outbits 0 nsteps ""])
+  0
