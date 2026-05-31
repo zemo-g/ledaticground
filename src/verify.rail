@@ -1,0 +1,47 @@
+-- ledaticground: independent receipt verifier (pure Rail) — "the verifier is Rail".
+-- Reads data/receipt.json COLD (no shared state with the signer) and re-checks:
+--   (1) the Ed25519 signature over the receipt string under the stated signer key
+--   (2) the SHA-256 chain hash = sha256(receipt | "|sig=" | sig)
+-- Anyone can run this to verify a proof-of-reception. Run from the rail repo dir.
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- extract a JSON string field value:  "<key>": "<value>"
+field_val json key =
+  let pat = cat ["\"", key, "\": \""]
+  let i = str_find pat json
+  if i < 0 then ""
+  else
+    let start = i + (string_length_bytes pat)
+    let rest = str_sub json start (string_length_bytes json - start)
+    let q = str_find "\"" rest
+    if q < 0 then rest else str_sub rest 0 q
+
+main =
+  let json = read_file "/Users/ledaticempire/projects/ledaticground/data/receipt.json"
+  let receipt = field_val json "receipt"
+  let sighex = field_val json "sig"
+  let signerhex = field_val json "signer"
+  let chainstored = field_val json "chain_hash"
+
+  let pk = hex_to_bytes signerhex
+  let sig = hex_to_bytes sighex
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sigok = ed25519_verify pk msg mlen sig
+
+  let chaincalc = sha256_hex (cat [receipt, "|sig=", sighex])
+  let chainok = if chaincalc == chainstored then 1 else 0
+
+  let _ = print (cat ["receipt: ", receipt])
+  let _ = print (cat ["signer:  ", signerhex])
+  let _ = print (cat ["signature valid   = ", show sigok, "  (want 1)"])
+  let _ = print (cat ["chain hash matches = ", show chainok, "  (want 1)"])
+  let verdict = if sigok == 1 then (if chainok == 1 then 1 else 0) else 0
+  let _ = print (cat ["==> RECEIPT ", if verdict == 1 then "VALID" else "INVALID"])
+  0
