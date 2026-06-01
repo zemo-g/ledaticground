@@ -21,7 +21,7 @@ while true; do
   out=$(ssh -o ConnectTimeout=12 "$PI" \
     "timeout $((SECS+3)) rtl_fm -f 161975000 -M fm -s 48000 -g 40 -l 0 /tmp/ais_mon.s16 2>/dev/null; \
      python3 /home/ledatic/pi_ais_decode.py /tmp/ais_mon.s16 2>/dev/null; \
-     printf 'META up=%ss thr=%s sz=%s' \"\$(cut -d' ' -f1 /proc/uptime)\" \"\$(vcgencmd get_throttled 2>/dev/null||echo na)\" \"\$(stat -c%s /tmp/ais_mon.s16 2>/dev/null||echo 0)\"" 2>/dev/null)
+     printf 'META up=%ss temp=%s thr=%s sz=%s' \"\$(cut -d' ' -f1 /proc/uptime)\" \"\$(vcgencmd measure_temp 2>/dev/null|cut -d= -f2||echo na)\" \"\$(vcgencmd get_throttled 2>/dev/null||echo na)\" \"\$(stat -c%s /tmp/ais_mon.s16 2>/dev/null||echo 0)\"" 2>/dev/null)
   if [ -z "$out" ]; then
     echo "$(date -u +%FT%TZ)  PI UNREACHABLE (battery dead / off-net) — endurance ends here" >> "$MON"
     sleep 60; continue
