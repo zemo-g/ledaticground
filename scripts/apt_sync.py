@@ -8,9 +8,13 @@ from PIL import Image
 
 rows = {}
 for l in open(sys.argv[1]):
-    if l.startswith("ROW"):
-        p = l.split(); rows[int(p[1])] = [int(x) for x in p[2:]]
-stream = np.array([v for i in range(len(rows)) for v in rows[i]], float)
+    if not l.startswith("ROW"):
+        continue
+    p = l.split()
+    if len(p) < 3 or not p[1].lstrip("-").isdigit():
+        continue                                   # skip partial/raced/concatenated lines
+    rows[int(p[1])] = [int(x) for x in p[2:] if x.lstrip("-").isdigit()]
+stream = np.array([v for i in sorted(rows) for v in rows[i]], float)
 LINE = 2080
 nfull = len(stream)//LINE - 1
 

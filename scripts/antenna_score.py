@@ -85,9 +85,15 @@ def score_137(apt):
     m = (fr > 2300) & (fr < 2500)
     floor = np.median(S)
     ratio = S[m].max() / floor
+    # NOTE: this ratio is a COARSE proxy, not an image detector. Empirically pure APT
+    # noise reads ~4-5 here (the 2400Hz region has a broadband bump above the spectral
+    # median even with no signal), so a real image needs a ratio WELL above that. The
+    # definitive test is rendering the image + sync-lock strength (apt_sync.py). Verified
+    # 2026-06-01: a pass scoring 5.0 rendered as pure noise — thresholds recalibrated.
     rec = {"band": "137", "label": LABEL, "capture_mtime": os.path.getmtime(apt),
            "subcarrier_2400_ratio": round(float(ratio), 2),
-           "verdict": "signal" if ratio > 5 else ("weak" if ratio > 2 else "noise"),
+           "verdict": "likely-signal" if ratio > 12 else ("inconclusive" if ratio > 6 else "noise"),
+           "note": "coarse proxy; render + sync-lock is the real test",
            "secs": round(len(s) / fs, 1)}
     return rec
 
