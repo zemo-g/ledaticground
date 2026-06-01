@@ -78,4 +78,11 @@ ck "same decode (WXR/RWT/fips/station)" "$o" "Required Weekly Test"
 $PY scripts/gen_same.py --snr 25 --corrupt --out /tmp/st_samec.s16 >/dev/null 2>&1
 o=$($PY scripts/same_decode.py /tmp/st_samec.s16 2>/dev/null)
 ck "same 2-of-3 voting recovers" "$o" "026163"
+# RFML rung: a 5-class modulation classifier TRAINED IN RAIL (feature extract + softmax SGD, all
+# on the substrate) recovers the held-out synthetic set. Features match the Python oracle exactly;
+# on real off-air AIS it reproduces noise=528/msk=13 (Gate B, documented in docs/RFML.md).
+$PY scripts/gen_modclass.py >/dev/null 2>&1
+$RN src/modclass.rail >/dev/null 2>&1
+o=$(perl -e 'alarm 150;exec @ARGV' /tmp/rail_out 2>/dev/null)
+ck "rfml modclass held-out >=95% (rail-trained softmax)" "$o" "accuracy: 2[89][0-9]/300"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

@@ -1,0 +1,439 @@
+-- ledaticground RFML: pure-Rail modulation classifier, TRAINED IN RAIL (docs/RFML.md).
+-- The whole chain on the verifiable substrate: read FM-demod audio -> extract the 10 features
+-- (validated byte-for-byte against the Python oracle) -> standardize -> train a 5-class softmax by
+-- SGD -> evaluate held-out -> classify a real off-air capture. No baked Python weights; the model
+-- is fit here. classes: 0 noise 1 carrier 2 afsk 3 fsk 4 msk.
+--   train: data/modclass/train.s16 + train.labels   test: test.s16 + test.labels
+--   real : data/ais_clean_a.s16  (expect mostly noise + a few msk = the AIS bursts)
+-- All float loops accumulate into size-1 cells; no float arg depends on another updated arg.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+foreign cos x -> float
+foreign sin x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign log x -> float
+foreign exp x -> float
+foreign fabs x -> float
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+s16_at bytes i =
+  let lo = arr_get bytes (2 * i)
+  let hi = arr_get bytes (2 * i + 1)
+  let u = bit_or lo (shl hi 8)
+  if u >= 32768 then u - 65536 else u
+
+-- ---- radix-2 DIT FFT (mutual recursion avoids the self-loop miscompile) ----
+brev_one i bits acc =
+  let bit = i % 2
+  brev_loop (i / 2) (bits - 1) (acc * 2 + bit)
+brev_loop i bits acc =
+  if bits == 0 then acc
+  else brev_one i bits acc
+bitrev i bits = brev_loop i bits 0
+log2i n = if n <= 1 then 0 else 1 + log2i (n / 2)
+reorder re im n bits i =
+  if i >= n then 0
+  else
+    let r = bitrev i bits
+    let _ = if i < r then
+              let tr = float_arr_get re i
+              let ti = float_arr_get im i
+              let _ = float_arr_set re i (float_arr_get re r)
+              let _ = float_arr_set im i (float_arr_get im r)
+              let _ = float_arr_set re r tr
+              let _ = float_arr_set im r ti
+              0
+            else 0
+    reorder re im n bits (i + 1)
+bfly re im len half i j twopi =
+  if j >= half then 0
+  else
+    let ang = (0.0 - twopi) * (int_to_float j) / (int_to_float len)
+    let wr = cos ang
+    let wi = sin ang
+    let a = i + j
+    let b = i + j + half
+    let ur = float_arr_get re a
+    let ui = float_arr_get im a
+    let xr = float_arr_get re b
+    let xi = float_arr_get im b
+    let vr = xr * wr - xi * wi
+    let vi = xr * wi + xi * wr
+    let _ = float_arr_set re a (ur + vr)
+    let _ = float_arr_set im a (ui + vi)
+    let _ = float_arr_set re b (ur - vr)
+    let _ = float_arr_set im b (ui - vi)
+    bfly re im len half i (j + 1) twopi
+grp re im n len half i twopi =
+  if i >= n then 0
+  else
+    let _ = bfly re im len half i 0 twopi
+    grp re im n len half (i + len) twopi
+stage re im n len twopi =
+  if len > n then 0
+  else
+    let half = len / 2
+    let _ = grp re im n len half 0 twopi
+    stage re im n (len * 2) twopi
+fft re im n =
+  let bits = log2i n
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = reorder re im n bits 0
+  let _ = stage re im n 2 twopi
+  0
+
+fsign x = if x > 0.0 then 1.0 else (if x < 0.0 then (0.0 - 1.0) else 0.0)
+
+-- ---- feature accumulators (identical math to src/modfeat.rail / Python feats()) ----
+sumf f i n cell =
+  if i >= n then 0
+  else
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get f i))
+    sumf f (i + 1) n cell
+sumsq f i n mean cell =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + d * d)
+    sumsq f (i + 1) n mean cell
+sumabsdiff f i n cell =
+  if i >= (n - 1) then 0
+  else
+    let d = (float_arr_get f (i + 1)) - (float_arr_get f i)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (fabs d))
+    sumabsdiff f (i + 1) n cell
+sumsgnchg f i n mean cell =
+  if i >= (n - 1) then 0
+  else
+    let s1 = fsign ((float_arr_get f i) - mean)
+    let s2 = fsign ((float_arr_get f (i + 1)) - mean)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (fabs (s2 - s1)))
+    sumsgnchg f (i + 1) n mean cell
+summoments f i n mean sd c3 c4 =
+  if i >= n then 0
+  else
+    let z = ((float_arr_get f i) - mean) / sd
+    let z2 = z * z
+    let _ = float_arr_set c3 0 ((float_arr_get c3 0) + z * z2)
+    let _ = float_arr_set c4 0 ((float_arr_get c4 0) + z2 * z2)
+    summoments f (i + 1) n mean sd c3 c4
+fill_spec f re im i n mean sd twopi =
+  if i >= n then 0
+  else
+    let z = ((float_arr_get f i) - mean) / sd
+    let w = 0.5 - 0.5 * (cos (twopi * (int_to_float i) / (int_to_float (n - 1))))
+    let _ = float_arr_set re i (z * w)
+    let _ = float_arr_set im i 0.0
+    fill_spec f re im (i + 1) n mean sd twopi
+spec_pass re im k nb acc =
+  if k >= nb then 0
+  else
+    let pr = float_arr_get re k
+    let pii = float_arr_get im k
+    let p = pr * pr + pii * pii
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + p)
+    let _ = float_arr_set acc 1 ((float_arr_get acc 1) + (int_to_float k) * p)
+    let _ = if p > (float_arr_get acc 2) then
+              let _ = float_arr_set acc 2 p
+              float_arr_set acc 3 (int_to_float k)
+            else 0
+    let _ = float_arr_set acc 4 ((float_arr_get acc 4) + (log (p + 0.000000000001)))
+    let _ = float_arr_set acc 5 ((float_arr_get acc 5) + 1.0)
+    let _ = if k >= (nb / 3) then float_arr_set acc 6 ((float_arr_get acc 6) + p) else 0
+    let _ = if k < 170 then float_arr_set acc 7 ((float_arr_get acc 7) + p) else 0
+    spec_pass re im (k + 1) nb acc
+
+-- compute the 10 features of window f (len n) into F at offset off
+feat_store f n re im twopi F off =
+  let cm = float_arr_new 1 0.0
+  let _ = sumf f 0 n cm
+  let mean = (float_arr_get cm 0) / (int_to_float n)
+  let cv = float_arr_new 1 0.0
+  let _ = sumsq f 0 n mean cv
+  let var = (float_arr_get cv 0) / (int_to_float n)
+  let sd = (sqrt var) + 0.000000001
+  let cr = float_arr_new 1 0.0
+  let _ = sumabsdiff f 0 n cr
+  let rough = ((float_arr_get cr 0) / (int_to_float (n - 1))) / sd
+  let cz = float_arr_new 1 0.0
+  let _ = sumsgnchg f 0 n mean cz
+  let zcr = ((float_arr_get cz 0) / (int_to_float (n - 1))) / 2.0
+  let c3 = float_arr_new 1 0.0
+  let c4 = float_arr_new 1 0.0
+  let _ = summoments f 0 n mean sd c3 c4
+  let m3 = (float_arr_get c3 0) / (int_to_float n)
+  let m4 = (float_arr_get c4 0) / (int_to_float n)
+  let kurt = m4 - 3.0
+  let bimod = (m3 * m3 + 1.0) / (m4 + 0.000000001)
+  let _ = fill_spec f re im 0 n mean sd twopi
+  let _ = fft re im n
+  let nbins = (n / 2) + 1
+  let acc = float_arr_new 8 0.0
+  let _ = spec_pass re im 1 nbins acc
+  let ps = (float_arr_get acc 0) + 0.000000000001
+  let peak = (float_arr_get acc 2) / ps
+  let cent = ((float_arr_get acc 1) / ps) / (int_to_float nbins)
+  let hf = (float_arr_get acc 6) / ps
+  let lf = (float_arr_get acc 7) / ps
+  let dom = (float_arr_get acc 3) / (int_to_float nbins)
+  let cnt = float_arr_get acc 5
+  let geomean = exp ((float_arr_get acc 4) / cnt)
+  let amean = (float_arr_get acc 0) / cnt
+  let flat = geomean / (amean + 0.000000000001)
+  let _ = float_arr_set F (off + 0) rough
+  let _ = float_arr_set F (off + 1) zcr
+  let _ = float_arr_set F (off + 2) flat
+  let _ = float_arr_set F (off + 3) peak
+  let _ = float_arr_set F (off + 4) cent
+  let _ = float_arr_set F (off + 5) kurt
+  let _ = float_arr_set F (off + 6) bimod
+  let _ = float_arr_set F (off + 7) hf
+  let _ = float_arr_set F (off + 8) lf
+  let _ = float_arr_set F (off + 9) dom
+  0
+
+load_win bytes f base i n =
+  if i >= n then 0
+  else
+    let _ = float_arr_set f i (int_to_float (s16_at bytes (base + i)))
+    load_win bytes f base (i + 1) n
+ff_loop bytes F f re im twopi nwin w =
+  if w >= nwin then 0
+  else
+    let _ = load_win bytes f (w * 4096) 0 4096
+    let _ = feat_store f 4096 re im twopi F (w * 10)
+    ff_loop bytes F f re im twopi nwin (w + 1)
+-- featurize a whole s16 file into F (10 cols/row); returns window count
+featurize_file path F f re im twopi =
+  let bytes = read_bytes path
+  let ns = (arr_len bytes) / 2
+  let nwin = ns / 4096
+  let _ = ff_loop bytes F f re im twopi nwin 0
+  nwin
+
+-- ---- labels: single-digit class id per line ----
+lbl_loop bytes nb i y yc =
+  if i >= nb then 0
+  else
+    let b = arr_get bytes i
+    let isdigit = if b >= 48 then (if b <= 57 then 1 else 0) else 0
+    let _ = if isdigit == 1 then
+              let c = arr_get yc 0
+              let _ = arr_set y c (b - 48)
+              arr_set yc 0 (c + 1)
+            else 0
+    lbl_loop bytes nb (i + 1) y yc
+read_labels path y =
+  let bytes = read_bytes path
+  let nb = arr_len bytes
+  let yc = arr_new 1 0
+  let _ = lbl_loop bytes nb 0 y yc
+  arr_get yc 0
+
+-- ---- standardize (per-column z-score using train mu/sg) ----
+sum_col F n col i acc =
+  if i >= n then 0
+  else
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get F (i * 10 + col)))
+    sum_col F n col (i + 1) acc
+ssq_col F n col mu i acc =
+  if i >= n then 0
+  else
+    let d = (float_arr_get F (i * 10 + col)) - mu
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + d * d)
+    ssq_col F n col mu (i + 1) acc
+fit_stats F n col mu sg =
+  if col >= 10 then 0
+  else
+    let a1 = float_arr_new 1 0.0
+    let _ = sum_col F n col 0 a1
+    let m = (float_arr_get a1 0) / (int_to_float n)
+    let _ = float_arr_set mu col m
+    let a2 = float_arr_new 1 0.0
+    let _ = ssq_col F n col m 0 a2
+    let v = (float_arr_get a2 0) / (int_to_float n)
+    let _ = float_arr_set sg col ((sqrt v) + 0.000000001)
+    fit_stats F n (col + 1) mu sg
+zs_col F off f mu sg =
+  if f >= 10 then 0
+  else
+    let _ = float_arr_set F (off + f) (((float_arr_get F (off + f)) - (float_arr_get mu f)) / (float_arr_get sg f))
+    zs_col F off (f + 1) mu sg
+zscore F n i mu sg =
+  if i >= n then 0
+  else
+    let _ = zs_col F (i * 10) 0 mu sg
+    zscore F n (i + 1) mu sg
+
+-- ---- softmax classifier (W is 5x10 row-major, b is 5) ----
+dot_cf F off W c f acc =
+  if f >= 10 then float_arr_get acc 0
+  else
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get W (c * 10 + f)) * (float_arr_get F (off + f)))
+    dot_cf F off W c (f + 1) acc
+clog F off W b lg c =
+  if c >= 5 then 0
+  else
+    let acc = float_arr_new 1 0.0
+    let s = dot_cf F off W c 0 acc
+    let _ = float_arr_set lg c ((float_arr_get b c) + s)
+    clog F off W b lg (c + 1)
+max_of lg n i mx =
+  if i >= n then 0
+  else
+    let _ = if (float_arr_get lg i) > (float_arr_get mx 0) then float_arr_set mx 0 (float_arr_get lg i) else 0
+    max_of lg n (i + 1) mx
+exp_acc lg p n i m sm =
+  if i >= n then 0
+  else
+    let e = exp ((float_arr_get lg i) - m)
+    let _ = float_arr_set p i e
+    let _ = float_arr_set sm 0 ((float_arr_get sm 0) + e)
+    exp_acc lg p n (i + 1) m sm
+norm_p p n i s =
+  if i >= n then 0
+  else
+    let _ = float_arr_set p i ((float_arr_get p i) / s)
+    norm_p p n (i + 1) s
+softmax lg p =
+  let mx = float_arr_new 1 0.0
+  let _ = float_arr_set mx 0 (float_arr_get lg 0)
+  let _ = max_of lg 5 1 mx
+  let m = float_arr_get mx 0
+  let sm = float_arr_new 1 0.0
+  let _ = exp_acc lg p 5 0 m sm
+  let s = (float_arr_get sm 0) + 0.000000000001
+  norm_p p 5 0 s
+
+update_feats W F off c err lr f =
+  if f >= 10 then 0
+  else
+    let wv = float_arr_get W (c * 10 + f)
+    let _ = float_arr_set W (c * 10 + f) (wv - lr * (err * (float_arr_get F (off + f)) + 0.001 * wv))
+    update_feats W F off c err lr (f + 1)
+update_classes F off W b p yi lr c =
+  if c >= 5 then 0
+  else
+    let target = if c == yi then 1.0 else 0.0
+    let err = (float_arr_get p c) - target
+    let _ = update_feats W F off c err lr 0
+    let _ = float_arr_set b c ((float_arr_get b c) - lr * err)
+    update_classes F off W b p yi lr (c + 1)
+train_sample F off W b yi lr lg p =
+  let _ = clog F off W b lg 0
+  let _ = softmax lg p
+  update_classes F off W b p yi lr 0
+train_epoch F W b y n lr i lg p =
+  if i >= n then 0
+  else
+    let _ = train_sample F (i * 10) W b (arr_get y i) lr lg p
+    train_epoch F W b y n lr (i + 1) lg p
+train_all F W b y n lr epochs e lg p =
+  if e >= epochs then 0
+  else
+    let _ = train_epoch F W b y n lr 0 lg p
+    train_all F W b y n lr epochs (e + 1) lg p
+
+-- cell-based argmax: avoids the self-loop cross-dep miscompile (a recursive FLOAT arg
+-- whose new value depends on another updated arg). best/index live in cells instead.
+argmax_into lg n i bestcell bicell =
+  if i >= n then 0
+  else
+    let _ = if (float_arr_get lg i) > (float_arr_get bestcell 0) then
+              let _ = float_arr_set bestcell 0 (float_arr_get lg i)
+              arr_set bicell 0 i
+            else 0
+    argmax_into lg n (i + 1) bestcell bicell
+predict_row F off W b lg =
+  let _ = clog F off W b lg 0
+  let bestcell = float_arr_new 1 0.0
+  let _ = float_arr_set bestcell 0 (float_arr_get lg 0)
+  let bicell = arr_new 1 0
+  let _ = argmax_into lg 5 1 bestcell bicell
+  arr_get bicell 0
+-- count correct vs labels y
+eval_loop F n W b y i lg correct =
+  if i >= n then 0
+  else
+    let pr = predict_row F (i * 10) W b lg
+    let _ = if pr == (arr_get y i) then arr_set correct 0 ((arr_get correct 0) + 1) else 0
+    eval_loop F n W b y (i + 1) lg correct
+-- tally predicted classes into counts[5]
+tally_loop F n W b i lg counts =
+  if i >= n then 0
+  else
+    let pr = predict_row F (i * 10) W b lg
+    let _ = arr_set counts pr ((arr_get counts pr) + 1)
+    tally_loop F n W b (i + 1) lg counts
+
+main =
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let f = float_arr_new 4096 0.0
+  let re = float_arr_new 4096 0.0
+  let im = float_arr_new 4096 0.0
+  -- featurize train + test + real
+  let Ftr = float_arr_new 12000 0.0
+  let ntr = featurize_file "data/modclass/train.s16" Ftr f re im twopi
+  let Fte = float_arr_new 4000 0.0
+  let nte = featurize_file "data/modclass/test.s16" Fte f re im twopi
+  let Fre = float_arr_new 7000 0.0
+  let nre = featurize_file "data/ais_clean_a.s16" Fre f re im twopi
+  -- labels
+  let ytr = arr_new 1200 0
+  let nlbl = read_labels "data/modclass/train.labels" ytr
+  let yte = arr_new 400 0
+  let nlte = read_labels "data/modclass/test.labels" yte
+  -- standardize all three with TRAIN stats
+  let mu = float_arr_new 10 0.0
+  let sg = float_arr_new 10 0.0
+  let _ = fit_stats Ftr ntr 0 mu sg
+  let _ = zscore Ftr ntr 0 mu sg
+  let _ = zscore Fte nte 0 mu sg
+  let _ = zscore Fre nre 0 mu sg
+  let _ = print (cat ["windows: train=", show ntr, " test=", show nte, " real=", show nre])
+  -- train softmax
+  let W = float_arr_new 50 0.0
+  let b = float_arr_new 5 0.0
+  let lg = float_arr_new 5 0.0
+  let p = float_arr_new 5 0.0
+  let _ = train_all Ftr W b ytr ntr 0.3 300 0 lg p
+  let tc = arr_new 1 0
+  let _ = eval_loop Ftr ntr W b ytr 0 lg tc
+  let _ = print (cat ["train fit: ", show (arr_get tc 0), "/", show ntr, " (nlbl=", show nlbl, ")"])
+  -- held-out accuracy (Gate A)
+  let correct = arr_new 1 0
+  let _ = eval_loop Fte nte W b yte 0 lg correct
+  let nc = arr_get correct 0
+  let _ = print (cat ["Gate A  held-out accuracy: ", show nc, "/", show nte])
+  -- real-capture class tally (Gate B)
+  let counts = arr_new 5 0
+  let _ = tally_loop Fre nre W b 0 lg counts
+  let _ = print (cat ["Gate B  ais_clean_a: noise=", show (arr_get counts 0),
+                      " carrier=", show (arr_get counts 1),
+                      " afsk=", show (arr_get counts 2),
+                      " fsk=", show (arr_get counts 3),
+                      " msk=", show (arr_get counts 4)])
+  0

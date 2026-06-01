@@ -1,0 +1,235 @@
+-- ledaticground RFML: pure-Rail modulation feature extractor (docs/RFML.md).
+-- Reads /tmp/modfeat_in.s16 (FM-demod audio, s16 LE @48k), splits into 4096-sample windows,
+-- prints one "FEAT f0 .. f9" line per window: the 10 SCALE-INVARIANT features that separate
+-- {noise,carrier,afsk,fsk,msk}. Mirrors scripts/modclass_proto.py feats() exactly so the Rail
+-- characterizer and the Python oracle agree.
+--   0 rough  1 zcr  2 flat  3 peak  4 cent  5 kurt  6 bimod  7 hf  8 lf  9 dom
+-- Float loops accumulate into size-1 cells (the self-loop-safe pattern); no float arg ever
+-- depends on another updated arg, so the self-loop optimizer miscompile never triggers.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+foreign cos x -> float
+foreign sin x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign log x -> float
+foreign exp x -> float
+foreign fabs x -> float
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+s16_at bytes i =
+  let lo = arr_get bytes (2 * i)
+  let hi = arr_get bytes (2 * i + 1)
+  let u = bit_or lo (shl hi 8)
+  if u >= 32768 then u - 65536 else u
+
+-- ---- radix-2 DIT FFT, in-place (from src/fft.rail; mutual recursion avoids the miscompile) ----
+brev_one i bits acc =
+  let bit = i % 2
+  brev_loop (i / 2) (bits - 1) (acc * 2 + bit)
+brev_loop i bits acc =
+  if bits == 0 then acc
+  else brev_one i bits acc
+bitrev i bits = brev_loop i bits 0
+log2i n = if n <= 1 then 0 else 1 + log2i (n / 2)
+reorder re im n bits i =
+  if i >= n then 0
+  else
+    let r = bitrev i bits
+    let _ = if i < r then
+              let tr = float_arr_get re i
+              let ti = float_arr_get im i
+              let _ = float_arr_set re i (float_arr_get re r)
+              let _ = float_arr_set im i (float_arr_get im r)
+              let _ = float_arr_set re r tr
+              let _ = float_arr_set im r ti
+              0
+            else 0
+    reorder re im n bits (i + 1)
+bfly re im len half i j twopi =
+  if j >= half then 0
+  else
+    let ang = (0.0 - twopi) * (int_to_float j) / (int_to_float len)
+    let wr = cos ang
+    let wi = sin ang
+    let a = i + j
+    let b = i + j + half
+    let ur = float_arr_get re a
+    let ui = float_arr_get im a
+    let xr = float_arr_get re b
+    let xi = float_arr_get im b
+    let vr = xr * wr - xi * wi
+    let vi = xr * wi + xi * wr
+    let _ = float_arr_set re a (ur + vr)
+    let _ = float_arr_set im a (ui + vi)
+    let _ = float_arr_set re b (ur - vr)
+    let _ = float_arr_set im b (ui - vi)
+    bfly re im len half i (j + 1) twopi
+grp re im n len half i twopi =
+  if i >= n then 0
+  else
+    let _ = bfly re im len half i 0 twopi
+    grp re im n len half (i + len) twopi
+stage re im n len twopi =
+  if len > n then 0
+  else
+    let half = len / 2
+    let _ = grp re im n len half 0 twopi
+    stage re im n (len * 2) twopi
+fft re im n =
+  let bits = log2i n
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = reorder re im n bits 0
+  let _ = stage re im n 2 twopi
+  0
+
+fsign x = if x > 0.0 then 1.0 else (if x < 0.0 then (0.0 - 1.0) else 0.0)
+
+-- ---- accumulation helpers (float into size-1 cells) ----
+sumf f i n cell =
+  if i >= n then 0
+  else
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get f i))
+    sumf f (i + 1) n cell
+sumsq f i n mean cell =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + d * d)
+    sumsq f (i + 1) n mean cell
+sumabsdiff f i n cell =
+  if i >= (n - 1) then 0
+  else
+    let d = (float_arr_get f (i + 1)) - (float_arr_get f i)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (fabs d))
+    sumabsdiff f (i + 1) n cell
+sumsgnchg f i n mean cell =
+  if i >= (n - 1) then 0
+  else
+    let s1 = fsign ((float_arr_get f i) - mean)
+    let s2 = fsign ((float_arr_get f (i + 1)) - mean)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (fabs (s2 - s1)))
+    sumsgnchg f (i + 1) n mean cell
+summoments f i n mean sd c3 c4 =
+  if i >= n then 0
+  else
+    let z = ((float_arr_get f i) - mean) / sd
+    let z2 = z * z
+    let _ = float_arr_set c3 0 ((float_arr_get c3 0) + z * z2)
+    let _ = float_arr_set c4 0 ((float_arr_get c4 0) + z2 * z2)
+    summoments f (i + 1) n mean sd c3 c4
+fill_spec f re im i n mean sd twopi =
+  if i >= n then 0
+  else
+    let z = ((float_arr_get f i) - mean) / sd
+    let w = 0.5 - 0.5 * (cos (twopi * (int_to_float i) / (int_to_float (n - 1))))
+    let _ = float_arr_set re i (z * w)
+    let _ = float_arr_set im i 0.0
+    fill_spec f re im (i + 1) n mean sd twopi
+-- one pass over power bins k=1..nb-1, updating acc[0..7]:
+-- 0 Ps  1 sum(k*P)  2 maxP  3 argmaxP  4 sum(log P)  5 count  6 hf-energy  7 lf-energy
+spec_pass re im k nb acc =
+  if k >= nb then 0
+  else
+    let pr = float_arr_get re k
+    let pii = float_arr_get im k
+    let p = pr * pr + pii * pii
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + p)
+    let _ = float_arr_set acc 1 ((float_arr_get acc 1) + (int_to_float k) * p)
+    let _ = if p > (float_arr_get acc 2) then
+              let _ = float_arr_set acc 2 p
+              float_arr_set acc 3 (int_to_float k)
+            else 0
+    let _ = float_arr_set acc 4 ((float_arr_get acc 4) + (log (p + 0.000000000001)))
+    let _ = float_arr_set acc 5 ((float_arr_get acc 5) + 1.0)
+    let _ = if k >= (nb / 3) then float_arr_set acc 6 ((float_arr_get acc 6) + p) else 0
+    let _ = if k < 170 then float_arr_set acc 7 ((float_arr_get acc 7) + p) else 0
+    spec_pass re im (k + 1) nb acc
+
+feat_window f n re im twopi =
+  let cm = float_arr_new 1 0.0
+  let _ = sumf f 0 n cm
+  let mean = (float_arr_get cm 0) / (int_to_float n)
+  let cv = float_arr_new 1 0.0
+  let _ = sumsq f 0 n mean cv
+  let var = (float_arr_get cv 0) / (int_to_float n)
+  let sd = (sqrt var) + 0.000000001
+  let cr = float_arr_new 1 0.0
+  let _ = sumabsdiff f 0 n cr
+  let rough = ((float_arr_get cr 0) / (int_to_float (n - 1))) / sd
+  let cz = float_arr_new 1 0.0
+  let _ = sumsgnchg f 0 n mean cz
+  let zcr = ((float_arr_get cz 0) / (int_to_float (n - 1))) / 2.0
+  let c3 = float_arr_new 1 0.0
+  let c4 = float_arr_new 1 0.0
+  let _ = summoments f 0 n mean sd c3 c4
+  let m3 = (float_arr_get c3 0) / (int_to_float n)
+  let m4 = (float_arr_get c4 0) / (int_to_float n)
+  let kurt = m4 - 3.0
+  let bimod = (m3 * m3 + 1.0) / (m4 + 0.000000001)
+  let _ = fill_spec f re im 0 n mean sd twopi
+  let _ = fft re im n
+  let nbins = (n / 2) + 1
+  let acc = float_arr_new 8 0.0
+  let _ = spec_pass re im 1 nbins acc
+  let ps = (float_arr_get acc 0) + 0.000000000001
+  let peak = (float_arr_get acc 2) / ps
+  let cent = ((float_arr_get acc 1) / ps) / (int_to_float nbins)
+  let hf = (float_arr_get acc 6) / ps
+  let lf = (float_arr_get acc 7) / ps
+  let dom = (float_arr_get acc 3) / (int_to_float nbins)
+  let cnt = float_arr_get acc 5
+  let geomean = exp ((float_arr_get acc 4) / cnt)
+  let amean = (float_arr_get acc 0) / cnt
+  let flat = geomean / (amean + 0.000000000001)
+  print (cat ["FEAT ", show_float rough, " ", show_float zcr, " ", show_float flat, " ",
+              show_float peak, " ", show_float cent, " ", show_float kurt, " ",
+              show_float bimod, " ", show_float hf, " ", show_float lf, " ", show_float dom])
+
+load_win bytes f base i n =
+  if i >= n then 0
+  else
+    let _ = float_arr_set f i (int_to_float (s16_at bytes (base + i)))
+    load_win bytes f base (i + 1) n
+each_window bytes f re im twopi winsz nwin w =
+  if w >= nwin then 0
+  else
+    let _ = load_win bytes f (w * winsz) 0 winsz
+    let _ = feat_window f winsz re im twopi
+    each_window bytes f re im twopi winsz nwin (w + 1)
+
+main =
+  let bytes = read_bytes "/tmp/modfeat_in.s16"
+  let nbytes = arr_len bytes
+  let ns = nbytes / 2
+  let winsz = 4096
+  let nwin = ns / winsz
+  let f = float_arr_new winsz 0.0
+  let re = float_arr_new winsz 0.0
+  let im = float_arr_new winsz 0.0
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = each_window bytes f re im twopi winsz nwin 0
+  0
