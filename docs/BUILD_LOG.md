@@ -231,7 +231,9 @@ lon/lat (28/27-bit two's-complement, 1/600000 deg), SOG, COG, per the AIS bit-fi
 Big-endian bit-fold via int array-cell accumulator. vs a known encoded ship report:
 **MMSI + lat/lon + sog + cog all exact** (MMSI 366123456, 0.0/-0.0, 7.2 kn).
 
-**Remaining AIS rungs (the middle that chains demod->parser):** clock recovery (Gardner) ·
+**Rung 3 — CRC-16/X-25 ✅** `src/crc16.rail`: reflected (poly 0x8408, init+xorout 0xFFFF), matches the published check value 0x906e for "123456789". The HDLC frame validator.
+
+**Remaining AIS glue:** clock recovery (Gardner) ·
 NRZI decode · HDLC deframe (0x7E flags + bit-destuff) · CRC-16-CCITT. Tie-in: a live
 Detroit-River vessel feed for the Great Lakes logistics work.
 

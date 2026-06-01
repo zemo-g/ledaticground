@@ -1,0 +1,43 @@
+-- ledaticground AIS rung: CRC-16/X-25 (pure Rail) — the HDLC frame-check AIS uses.
+-- Reflected algorithm: poly 0x1021 reversed = 0x8408, init 0xFFFF, refin/refout, xorout
+-- 0xFFFF. Published check value: CRC of ASCII "123456789" = 0x906E. The AIS receiver
+-- runs this over each de-stuffed HDLC frame to reject corrupt packets.
+-- crc state lives in a cell so the byte loop carries only an int index (self-loop-safe).
+
+-- one bit step (reflected): crc depends only on crc + constants -> safe direct recursion
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+
+-- fold one byte into the crc
+crcbyte crc b = crcbit (bit_xor crc b) 0
+
+crc_loop bytes n i cell =
+  if i >= n then 0
+  else
+    let _ = arr_set cell 0 (crcbyte (arr_get cell 0) (arr_get bytes i))
+    crc_loop bytes n (i + 1) cell
+
+crc16_x25 bytes n =
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let _ = crc_loop bytes n 0 cell
+  bit_xor (arr_get cell 0) 65535
+
+hexd v = str_sub "0123456789abcdef" v 1
+hex16 v = cat [hexd (bit_and (shr v 12) 15), hexd (bit_and (shr v 8) 15), hexd (bit_and (shr v 4) 15), hexd (bit_and v 15)]
+
+-- write the test vector "123456789" (bytes 0x31..0x39) into an array
+fill_test arr i =
+  if i >= 9 then 0
+  else
+    let _ = arr_set arr i (49 + i)
+    fill_test arr (i + 1)
+
+main =
+  let t = arr_new 9 0
+  let _ = fill_test t 0
+  let crc = crc16_x25 t 9
+  let _ = print (cat ["CRC16_X25(\"123456789\") = 0x", hex16 crc, "  (want 0x906e)"])
+  let _ = print (cat ["MATCH=", show (if crc == 36974 then 1 else 0)])
+  0
