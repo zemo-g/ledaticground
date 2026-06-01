@@ -50,3 +50,25 @@ First real-image target after the dipole: **NOAA 19, 09:04 UTC / 05:04 EDT, El 6
 - **161.975 / 162.025** AIS (ship tracking — strong at this roof; see the AIS decoder).
   The 137 V-dipole is ~18% off-tune at 162 but the local AIS signal is strong enough; a
   dedicated 162 dipole (legs ~45 cm) would be better for a permanent AIS feed.
+
+## Tuning the current adjustable dipole kit (interim, until the new antenna lands)
+
+The node currently runs the **silver telescopic dipole kit** (adjustable elements). It's
+tunable, so set it per band — λ/4 minus ~2% end-effect:
+
+| Band | Use | Element length (each leg) | Geometry / polarization |
+|------|-----|---------------------------|--------------------------|
+| **137.5 MHz** | NOAA/METEOR weather | **~53.4 cm** | 120° **V, horizontal**, legs N–S (approximates the sat's circular pol; broadside faces the N↔S pass) |
+| **162.0 MHz** | AIS ship tracking | **~44 cm** | **Vertical** dipole (marine signals are vertically polarized) |
+
+These two optima **conflict** (horizontal-V vs vertical, different lengths), so "both
+equally" means one of:
+- **Two presets, swapped by hand** — best per-band result, but each swap is a roof trip.
+- **One compromise** — ~48 cm legs in a shallow V. Decodes both, optimal for neither.
+
+**Don't guess — measure.** That's what `scripts/antenna_score.sh 162` is for: set the
+elements, run it, read the SNR + decode count, adjust, re-run. Baselines accumulate in
+`data/antenna_scores.jsonl`, so the current-kit numbers are the yardstick the new antenna
+has to beat. Since AIS already works and 137 weather imaging waits on the **new** antenna
+anyway, a sane interim is: tune the kit for **162 vertical** now (lock in the Lakes vessel
+feed), and let the incoming antenna own 137.
