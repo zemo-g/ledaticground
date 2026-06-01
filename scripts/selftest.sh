@@ -35,4 +35,9 @@ $PY scripts/gen_viterbi.py --n 2000 --snr 4 >/dev/null 2>&1; $RN src/viterbi.rai
 perl -e 'alarm 120;exec @ARGV' /tmp/rail_out > /tmp/vit_out.txt 2>/dev/null
 o=$($PY scripts/viterbi_check.py /tmp/vit_out.txt 2>/dev/null)
 ck "viterbi r=1/2 K=7 zero errors @4dB" "$o" "bit errors 0 "
+# LRPT rung: QPSK Costas carrier recovery locks + demaps (within pull-in range)
+$PY scripts/gen_qpsk.py --n 2000 --foff 0.003 --snr 12 >/dev/null 2>&1; $RN src/qpsk.rail >/dev/null 2>&1
+perl -e 'alarm 120;exec @ARGV' /tmp/rail_out > /tmp/qpsk_out.txt 2>/dev/null
+if $PY scripts/qpsk_check.py /tmp/qpsk_out.txt >/dev/null 2>&1; then q=OK_LOCK; else q=NO_LOCK; fi
+ck "qpsk costas carrier lock SER<5%" "$q" "OK_LOCK"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

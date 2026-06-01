@@ -1,0 +1,88 @@
+-- ledaticground LRPT rung: QPSK carrier recovery (pure Rail) — decision-directed
+-- Costas loop. Recovers QPSK symbols rotated by an unknown carrier frequency + phase
+-- offset (the core "QPSK demod" problem). 2nd-order loop; NCO phase/freq live in a
+-- float-array cell so the sample recursion carries only an int index (dodges the
+-- float-accumulator self-loop miscompile). Reads int8 IQ from /tmp/qpsk_in.s8
+-- (1 sample/symbol — isolates carrier recovery), prints "SYM <I/Q bit string>".
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+soft_at bytes k =
+  let b = arr_get bytes k
+  let s = if b < 128 then b else b - 256
+  int_to_float s
+
+-- Costas loop over one sample. st = [phase, freq]; alpha/beta = loop gains.
+-- Emits the 2 decision bits for symbol i into outbits[2i], outbits[2i+1].
+costas bytes nsym i st alpha beta outbits =
+  if i >= nsym then 0
+  else
+    let ii = soft_at bytes (i * 2)
+    let qq = soft_at bytes (i * 2 + 1)
+    let ph = float_arr_get st 0
+    let c = cos ph
+    let s = sin ph
+    -- derotate by -phase: z = rx * e^{-j ph}
+    let zr = ii * c + qq * s
+    let zi = qq * c - ii * s
+    -- normalize so the phase error is amplitude-independent (acts as an AGC)
+    let mag = sqrt (zr * zr + zi * zi + 0.000001)
+    let nr = zr / mag
+    let ni = zi / mag
+    let di = if zr >= 0.0 then 1.0 else (0.0 - 1.0)
+    let dq = if zi >= 0.0 then 1.0 else (0.0 - 1.0)
+    -- QPSK decision-directed phase error: sign(I)*Q - sign(Q)*I  (on normalized z)
+    let err = di * ni - dq * nr
+    -- 2nd-order loop filter (freq then phase) — both updates into the cell
+    let _ = float_arr_set st 1 ((float_arr_get st 1) + beta * err)
+    let _ = float_arr_set st 0 (ph + (float_arr_get st 1) + alpha * err)
+    -- emit decision bits (0 for +, 1 for -)
+    let _ = arr_set outbits (i * 2) (if di > 0.0 then 0 else 1)
+    let _ = arr_set outbits (i * 2 + 1) (if dq > 0.0 then 0 else 1)
+    costas bytes nsym (i + 1) st alpha beta outbits
+
+bitstr outbits i n acc =
+  if i >= n then acc
+  else bitstr outbits (i + 1) n (cat [acc, show (arr_get outbits i)])
+
+main =
+  let bytes = read_bytes "/tmp/qpsk_in.s8"
+  let len = arr_len bytes
+  let nsym = len / 2
+  let st = float_arr_new 2 0.0
+  let alpha = 0.026
+  let beta = 0.00035
+  let outbits = arr_new (nsym * 2) 0
+  let _ = print (cat ["INFO samples=", show len, " symbols=", show nsym])
+  let _ = costas bytes nsym 0 st alpha beta outbits
+  let _ = print (cat ["LOCK final_freq_cyc_per_samp=", show_float ((float_arr_get st 1) / 6.283185307)])
+  let _ = print (cat ["SYM ", bitstr outbits 0 (nsym * 2) ""])
+  0

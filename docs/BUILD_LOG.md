@@ -169,6 +169,28 @@ forgery as coattest (attacker holds only A's key) is **rejected = 0**. This is w
 all the rungs add up to — forging it means a consistent orbit+geometry at two places
 at once *and* both station keys. selftest now 11/11.
 
+### LRPT decode chain (METEOR-M, digital QPSK — NOT analog APT) — in progress
+The high METEOR passes carry LRPT: QPSK, CCSDS r=1/2 K=7 conv-coded, randomized,
+RS(255,223), JPEG-ish. Building it bottom-up, each rung falsified on synthetic.
+
+**Rung 1 — Viterbi ✅** `src/viterbi.rail`: soft-decision, 64-state, G1=0o171 G2=0o133
+(the LRPT/CCSDS code). int metrics in arrays + per-step normalization + array-cell
+traceback (no float-accumulator miscompile). vs reference encoder+BPSK channel:
+**0 bit errors at 4 dB; corrects all 640 channel symbol-errors at 3 dB to zero**;
+degrades near threshold (~1 dB) as theory predicts.
+
+**Rung 2 — QPSK carrier recovery ✅** `src/qpsk.rail`: decision-directed 2nd-order
+Costas loop, NCO state in a float-array cell. Recovers an unknown carrier
+frequency+phase: locked freq matches injected (0.004/0.008/-0.005/0.012 cyc/samp
+all tracked), **0.0000 steady-state SER after lock**. Pull-in time scales with
+offset (narrow-band Costas) — a coarse FFT freq pre-estimate is the documented
+refinement to shorten acquisition. 4-fold phase ambiguity resolved downstream.
+
+**Remaining rungs (roadmap):** RRC matched filter + Gardner symbol-timing recovery
+· bit-ordering/phase de-ambiguity · CCSDS derandomizer (LFSR x^8+x^7+x^5+x^3+1) ·
+frame sync (0x1ACFFC1D ASM) · Reed-Solomon (255,223) · JPEG-ish decompress →
+METEOR image. selftest 14/14.
+
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →
 decode → attest) is built and falsified. v10+ (multi-station mesh,
