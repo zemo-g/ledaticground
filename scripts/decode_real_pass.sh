@@ -24,6 +24,12 @@ cp -n /tmp/apt_shift.s16 /tmp/apt_shift_synth.bak 2>/dev/null || true
 dd if="$SRC" of=/tmp/apt_shift.s16 bs=$BPS skip=$SKIP count=$LEN 2>/dev/null
 echo "staged $(wc -c </tmp/apt_shift.s16) bytes -> /tmp/apt_shift.s16"
 
+# 137 antenna figure-of-merit: log this pass's 2400Hz subcarrier/noise ratio so antenna
+# changes are measured automatically. Noise baseline ~1.0; a real image is >5. When the
+# new antenna lands, this line jumps on its own -> the improvement is on record.
+echo "=== 137 reception quality (antenna figure-of-merit) ==="
+$PY "$GD/scripts/antenna_score.py" 137 /tmp/apt_shift.s16 "pass_$(date -u +%Y%m%dT%H%MZ)" 2>/dev/null || echo "  (score skipped)"
+
 echo "=== pure-Rail APT decode ==="
 perl -e 'alarm 600; exec @ARGV' "$RN" run "$GD/src/apt.rail" \
   > /tmp/apt_rail_real.out 2>/tmp/apt_rail_real.err
