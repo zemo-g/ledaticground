@@ -99,31 +99,74 @@ def bursts_s16(s, fs=48000.0):
             yield s[lo:hi].astype(float); i=j
         else: i+=1
 
-census={}
-for f in sys.argv[1:]:
-    src=os.path.basename(f); n=0
-    if f.endswith(".iq"):
-        b=np.fromfile(f,np.uint8).astype(np.float32)-127.5; z=b[0::2]+1j*b[1::2]
-        gen=bursts_iq(z)
-    else:
-        gen=bursts_s16(np.fromfile(f,dtype="<i2").astype(float))
-    for disc in gen:
-        p=decode_disc(disc)
-        if not p: continue
-        r=parse(p); k=r["mmsi"]; n+=1
-        if k not in census:
-            census[k]=r; census[k]["sightings"]=0; census[k]["sources"]=set()
-        census[k]["sightings"]+=1; census[k]["sources"].add(src)
-        census[k].update({x:r[x] for x in r if x not in ("sightings","sources")})
-    print(f"  {src}: {n} CRC-valid messages")
+DATA = os.path.join(os.path.dirname(__file__), "..", "data")
+LOG = os.path.join(DATA, "vessel_log.jsonl")     # append-only timeline (one line per msg)
 
-for k in census: census[k]["sources"]=sorted(census[k]["sources"])
-rows=sorted(census.values(), key=lambda r:(r["type"],r["mmsi"]))
+def decode_file(f):
+    """Decode one capture -> list of parsed AIS records (one per CRC-valid burst)."""
+    if f.endswith(".iq"):
+        b = np.fromfile(f, np.uint8).astype(np.float32) - 127.5
+        gen = bursts_iq(b[0::2] + 1j * b[1::2])
+    else:
+        gen = bursts_s16(np.fromfile(f, dtype="<i2").astype(float))
+    out = []
+    for disc in gen:
+        p = decode_disc(disc)
+        if p:
+            out.append(parse(p))
+    return out
+
+def fmt(r):
+    loc = f"{r['lat']:.4f},{r['lon']:.4f}" if "lat" in r else "—"
+    nm = f' "{r["name"]}"' if r.get("name") else ""
+    return f"MMSI {r['mmsi']:>9}  type {r['type']:>2} {NAMES_T.get(r['type'],'?'):18s}{nm:14s} {loc:>20}"
+
+# ---- mode: --ingest <capture> <unix_ts> : decode one capture, append to the timeline ----
+if len(sys.argv) >= 2 and sys.argv[1] == "--ingest":
+    cap, ts = sys.argv[2], int(sys.argv[3])
+    recs = decode_file(cap)
+    with open(LOG, "a") as fh:
+        for r in recs:
+            fh.write(json.dumps({**r, "ts": ts}) + "\n")
+    mvs = sum(1 for r in recs if r["type"] in (1, 2, 3, 18, 19))   # moving-vessel reports
+    print(f"ingest @ {ts}: {len(recs)} msgs ({mvs} moving-vessel), appended {os.path.relpath(LOG)}")
+    sys.exit(0)
+
+# ---- mode: --summary : build census + movement timeline from the log ----
+if len(sys.argv) >= 2 and sys.argv[1] == "--summary":
+    log = [json.loads(l) for l in open(LOG)] if os.path.exists(LOG) else []
+    by = {}
+    for r in log:
+        by.setdefault(r["mmsi"], []).append(r)
+    print(f"=== TIMELINE CENSUS — {len(by)} distinct sources, {len(log)} msgs ===")
+    movers = []
+    for mmsi, hist in sorted(by.items(), key=lambda kv: (kv[1][0]["type"], kv[0])):
+        hist.sort(key=lambda r: r["ts"]); last = hist[-1]
+        span = hist[-1]["ts"] - hist[0]["ts"]
+        pos = [(r["lat"], r["lon"]) for r in hist if "lat" in r]
+        moved = len(set(pos)) > 1
+        if moved and last["type"] in (1, 2, 3, 18, 19): movers.append(mmsi)
+        tag = "  ►MOVING" if moved and last["type"] in (1, 2, 3, 18, 19) else ""
+        print(f"  {fmt(last)}  x{len(hist)} over {span//60}m{tag}")
+    print(f"\n{len(movers)} moving vessels tracked: {movers}")
+    json.dump([by[m][-1] for m in by], open(os.path.join(DATA, "vessel_census.json"), "w"), indent=2)
+    sys.exit(0)
+
+# ---- default mode: ad-hoc multi-file census ----
+census = {}
+for f in sys.argv[1:]:
+    src = os.path.basename(f); recs = decode_file(f)
+    for r in recs:
+        k = r["mmsi"]
+        if k not in census:
+            census[k] = {**r, "sightings": 0, "sources": set()}
+        census[k]["sightings"] += 1; census[k]["sources"].add(src)
+        census[k].update({x: r[x] for x in r})
+    print(f"  {src}: {len(recs)} CRC-valid messages")
+for k in census: census[k]["sources"] = sorted(census[k]["sources"])
+rows = sorted(census.values(), key=lambda r: (r["type"], r["mmsi"]))
 print(f"\n=== VESSEL CENSUS — {len(rows)} distinct AIS sources ===")
 for r in rows:
-    loc=f"{r['lat']:.4f},{r['lon']:.4f}" if "lat" in r else "—"
-    nm=f' "{r["name"]}"' if r.get("name") else ""
-    print(f"  MMSI {r['mmsi']:>9}  type {r['type']:>2} {NAMES_T.get(r['type'],'?'):18s}{nm:14s} {loc:>20}  x{r['sightings']}")
-out=os.path.join(os.path.dirname(__file__),"..","data","vessel_census.json")
-json.dump(rows, open(out,"w"), indent=2)
-print(f"\nwrote {os.path.relpath(out)}")
+    print(f"  {fmt(r)}  x{r['sightings']}")
+json.dump(rows, open(os.path.join(DATA, "vessel_census.json"), "w"), indent=2)
+print(f"\nwrote data/vessel_census.json")

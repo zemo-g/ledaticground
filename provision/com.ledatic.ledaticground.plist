@@ -3,7 +3,9 @@
 <plist version="1.0"><dict>
   <key>Label</key><string>com.ledatic.ledaticground</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>/Users/ledaticempire/projects/ledaticground/scripts/orchestrate.sh</string></array>
+  <!-- AIS continuous monitor (2026-06-01 "flip"): the roof hears 162 MHz, not 137.
+       Swap back to scripts/orchestrate.sh for NOAA pass capture once a 137 antenna is up. -->
+  <array><string>/bin/bash</string><string>/Users/ledaticempire/projects/ledaticground/scripts/ais_monitor.sh</string></array>
   <key>EnvironmentVariables</key>
   <dict><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
         <key>PI_HOST</key><string>ledaticground-node</string></dict>
