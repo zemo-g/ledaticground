@@ -40,4 +40,9 @@ $PY scripts/gen_qpsk.py --n 2000 --foff 0.003 --snr 12 >/dev/null 2>&1; $RN src/
 perl -e 'alarm 120;exec @ARGV' /tmp/rail_out > /tmp/qpsk_out.txt 2>/dev/null
 if $PY scripts/qpsk_check.py /tmp/qpsk_out.txt >/dev/null 2>&1; then q=OK_LOCK; else q=NO_LOCK; fi
 ck "qpsk costas carrier lock SER<5%" "$q" "OK_LOCK"
+# LRPT rung: CCSDS derandomizer reproduces the published PN sequence + round-trips
+$PY scripts/gen_derand.py >/dev/null 2>&1; $RN src/derand.rail >/dev/null 2>&1
+perl -e 'alarm 60;exec @ARGV' /tmp/rail_out > /tmp/derand_out.txt 2>/dev/null
+if $PY scripts/derand_check.py /tmp/derand_out.txt >/dev/null 2>&1; then d=OK; else d=BAD; fi
+ck "ccsds derandomizer matches published" "$d" "OK"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

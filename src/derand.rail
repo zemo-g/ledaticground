@@ -1,0 +1,77 @@
+-- ledaticground LRPT rung: CCSDS pseudo-derandomizer (pure Rail).
+-- The LRPT byte stream is randomized (additive scrambler) per CCSDS 131.0-B with
+-- polynomial h(x)=x^8+x^7+x^5+x^3+1, continuous 8-bit LFSR init 0xFF. Derandomizing
+-- = XOR the data with the same PN byte sequence (period 255 bytes), which is
+-- self-inverse. LFSR convention (output MSB, shift left, feedback = b0^b2^b4^b7)
+-- reproduces the published sequence FF 48 0E C0 9A 0D 70 BC. Reads /tmp/derand_in.s8,
+-- prints "PN <first 8 hex>" and "OUT <derandomized bytes>".
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- xor via bitwise primitives (a^b = (a|b) - (a&b), borrow-free per bit)
+xor8 a b = (bit_or a b) - (bit_and a b)
+
+-- produce one PN byte (8 LFSR steps, MSB-first); LFSR state lives in scell[0]
+pn_byte scell j acc =
+  if j >= 8 then acc
+  else
+    let st = arr_get scell 0
+    let out = bit_and (shr st 7) 1
+    let fb = xor8 (xor8 (bit_and st 1) (bit_and (shr st 2) 1)) (xor8 (bit_and (shr st 4) 1) (bit_and (shr st 7) 1))
+    let _ = arr_set scell 0 (bit_and (bit_or (shl st 1) fb) 255)
+    pn_byte scell (j + 1) (bit_or (shl acc 1) out)
+
+fill_pn scell i count pn =
+  if i >= count then 0
+  else
+    let _ = arr_set pn i (pn_byte scell 0 0)
+    fill_pn scell (i + 1) count pn
+
+derand bytes n i pn outbits =
+  if i >= n then 0
+  else
+    let _ = arr_set outbits i (xor8 (arr_get bytes i) (arr_get pn (i % 255)))
+    derand bytes n (i + 1) pn outbits
+
+-- "PN <8 hex bytes>"
+hex1 v = let d = "0123456789abcdef" in cat [str_sub d (shr v 4) 1, str_sub d (bit_and v 15) 1]
+pn_hex pn i n acc = if i >= n then acc else pn_hex pn (i + 1) n (cat [acc, hex1 (arr_get pn i), " "])
+
+decs out i n acc = if i >= n then acc else decs out (i + 1) n (cat [acc, show (arr_get out i), " "])
+
+main =
+  let scell = arr_new 1 0
+  let _ = arr_set scell 0 255
+  let pn = arr_new 256 0
+  let _ = fill_pn scell 0 256 pn
+  let _ = print (cat ["PN ", pn_hex pn 0 8 ""])
+  let bytes = read_bytes "/tmp/derand_in.s8"
+  let n = arr_len bytes
+  let outbits = arr_new n 0
+  let _ = derand bytes n 0 pn outbits
+  let _ = print (cat ["OUT ", decs outbits 0 n ""])
+  0

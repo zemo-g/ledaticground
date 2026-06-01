@@ -186,10 +186,15 @@ all tracked), **0.0000 steady-state SER after lock**. Pull-in time scales with
 offset (narrow-band Costas) — a coarse FFT freq pre-estimate is the documented
 refinement to shorten acquisition. 4-fold phase ambiguity resolved downstream.
 
+**Rung 3 — CCSDS derandomizer ✅** `src/derand.rail`: continuous 8-bit LFSR,
+h(x)=x^8+x^7+x^5+x^3+1, init 0xFF (output MSB / shift-left / fb=b0^b2^b4^b7).
+Reproduces the **published CCSDS PN sequence FF 48 0E C0 9A 0D 70 BC** exactly
+(validated against the standard, not just self-round-trip) and XOR-derandomizes a
+payload to the expected bytes. xor via (a|b)-(a&b). LFSR state in an array cell.
+
 **Remaining rungs (roadmap):** RRC matched filter + Gardner symbol-timing recovery
-· bit-ordering/phase de-ambiguity · CCSDS derandomizer (LFSR x^8+x^7+x^5+x^3+1) ·
-frame sync (0x1ACFFC1D ASM) · Reed-Solomon (255,223) · JPEG-ish decompress →
-METEOR image. selftest 13/13.
+· bit-ordering/phase de-ambiguity · frame sync (0x1ACFFC1D ASM) · Reed-Solomon
+(255,223), interleave 4 · JPEG-ish decompress → METEOR image. selftest 14/14.
 
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →
