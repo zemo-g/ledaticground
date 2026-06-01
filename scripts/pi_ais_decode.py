@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""ledaticground Pi-side AIS decoder — runs ON the roof Pi (Zero 2 W) so only tiny JSON
-crosses the weak roof WiFi, never megabytes of samples. Pure Python, NO numpy (don't
-assume it's installed). Same validated algorithm as src/ais_decode.rail / ais_census.py:
-roughness burst-detect -> per-symbol integrate+slice (sps=5) over polarity/phase +
-multi-flag-pair search -> NRZI -> HDLC deframe -> CRC-16/X-25 -> byte-reverse -> AIS parse.
+"""ledaticground Pi-side AIS decoder — runs ON the roof Pi (Zero 2 W), pure Python (NO numpy),
+so only tiny JSON crosses the weak roof WiFi. Same validated algorithm as src/ais_decode.rail.
 
-Input: FM-demod ch-A s16 @48kHz (rtl_fm output). Emits one JSON object per CRC-valid
-message to stdout. Usage: pi_ais_decode.py /tmp/ais_mon.s16
+EXHAUSTIVE (2026-06-01): extracts EVERY CRC-valid frame in each burst region, not just the
+first. In busy traffic a strong regular AtoN beacon used to win the "first CRC" race and the
+vessel sharing the window was discarded — we were throwing away frames we'd already received.
+Now we collect all distinct payloads (deduped by payload bits) → the vessels come out too.
+
+Input: FM-demod ch-A s16 @48kHz. Emits one JSON object per distinct CRC-valid message.
+Usage: pi_ais_decode.py /tmp/ais_mon.s16
 """
 import sys, json
 from array import array
@@ -21,29 +23,22 @@ def load_s16(path):
     return a
 
 def roughness_bursts(s):
-    """Yield (lo, hi) sample windows of low-roughness (signal) regions."""
-    B = int(0.005 * FS)            # 5 ms blocks
+    B = int(0.005 * FS)
     nb = len(s) // B
     rough = []
     for i in range(nb):
-        b = i * B
-        acc = 0
+        b = i * B; acc = 0
         for j in range(b + 1, b + B):
-            d = s[j] - s[j - 1]
-            acc += d if d >= 0 else -d
+            d = s[j] - s[j - 1]; acc += d if d >= 0 else -d
         rough.append(acc / (B - 1))
-    sr = sorted(rough)
-    med = sr[len(sr) // 2] if sr else 0
-    thr = med * 0.6
-    i = 0
+    sr = sorted(rough); med = sr[len(sr) // 2] if sr else 0
+    thr = med * 0.6; i = 0
     while i < nb:
         if rough[i] < thr:
             j = i
             while j < nb and rough[j] < thr:
                 j += 1
-            lo = max(i * B - int(0.004 * FS), 0)
-            hi = min(j * B + int(0.004 * FS), len(s))
-            yield lo, hi
+            yield max(i * B - int(0.004 * FS), 0), min(j * B + int(0.004 * FS), len(s))
             i = j
         else:
             i += 1
@@ -51,8 +46,7 @@ def roughness_bursts(s):
 def crc_res(bits):
     c = 0xFFFF
     for b in bits:
-        c ^= b
-        c = (c >> 1) ^ 0x8408 if (c & 1) else (c >> 1)
+        c ^= b; c = (c >> 1) ^ 0x8408 if (c & 1) else (c >> 1)
     return c
 
 def destuff(d, c0, c1):
@@ -87,10 +81,11 @@ def name6(p, a, nch):
         r += chr(v + 64) if v < 32 else chr(v)
     return r.replace('@', ' ').strip()
 
-def decode_window(s, lo, hi):
-    w = s[lo:hi]
-    n = len(w)
+def frames_in_window(s, lo, hi):
+    """EXHAUSTIVE: every distinct CRC-valid payload in this region (deduped by payload bits)."""
+    w = s[lo:hi]; n = len(w)
     m = sum(w) / n if n else 0
+    found = {}                                       # payload-tuple -> payload list
     for pol in (1, -1):
         for ph in range(SPS):
             ns = (n - ph) // SPS - 1
@@ -98,8 +93,7 @@ def decode_window(s, lo, hi):
                 continue
             raw = []
             for k in range(ns):
-                base = ph + k * SPS
-                acc = 0
+                base = ph + k * SPS; acc = 0
                 for j in range(SPS):
                     acc += w[base + j] - m
                 raw.append(1 if pol * acc > 0 else 0)
@@ -112,8 +106,9 @@ def decode_window(s, lo, hi):
                         continue
                     o = destuff(d, fl[a] + 8, fl[b])
                     if len(o) >= 48 and crc_res(o) == 0xF0B8:
-                        return byterev(o[:-16])
-    return None
+                        payload = byterev(o[:-16])
+                        found[tuple(payload)] = payload   # dedup identical payloads
+    return list(found.values())
 
 def parse(p):
     typ = gb(p, 0, 6); mmsi = gb(p, 8, 30); r = {"type": typ, "mmsi": mmsi}
@@ -133,16 +128,16 @@ def parse(p):
 
 def main():
     s = load_s16(sys.argv[1])
-    seen = set()
+    seen = {}                                        # dedup across regions by payload tuple
     for lo, hi in roughness_bursts(s):
-        p = decode_window(s, lo, hi)
-        if p:
-            r = parse(p)
-            key = (r["type"], r["mmsi"])
-            if key in seen:
-                continue
-            seen.add(key)
-            print(json.dumps(r))
+        for payload in frames_in_window(s, lo, hi):
+            seen[tuple(payload)] = payload
+    # emit one JSON per distinct message; dedup repeats of the same source to latest content
+    out = {}
+    for payload in seen.values():
+        r = parse(payload); out[r["mmsi"]] = r
+    for r in out.values():
+        print(json.dumps(r))
 
 if __name__ == "__main__":
     main()

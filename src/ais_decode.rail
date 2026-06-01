@@ -176,6 +176,18 @@ emit_decode out plen =
     1
   else 1
 
+-- dedup key = first 48 bits of the byte-reversed payload (type+repeat+MMSI+...). The same
+-- physical frame decodes at several (pol,phase,flag-pair) combos; the key collapses them.
+payload_key out plen =
+  let nbytes = plen / 8
+  let msg = arr_new plen 0
+  let _ = byterev out msg nbytes 0
+  getbits msg 0 48
+seen_has keys n key i =
+  if i >= n then 0
+  else if (arr_get keys i) == key then 1
+  else seen_has keys n key (i + 1)
+
 -- collect every flag start position into flags[] (real frame's flags may not be the
 -- first pair: idle noise before the burst can produce spurious 0x7E patterns).
 record_flag flags fccell pos =
@@ -189,8 +201,10 @@ collect_flags d nn i flags fccell =
     let _ = if (flagmatch d i) == 1 then record_flag flags fccell i else 0
     collect_flags d nn (i + 1) flags fccell
 
--- try one (start-flag fi, end-flag fj) pair: de-stuff -> CRC; on pass emit + set found
-try_pair d nn fi fj foundcell =
+-- try one (start-flag fi, end-flag fj) pair: de-stuff -> CRC; on a NEW (unseen) CRC-valid
+-- payload, record its key + emit. EXHAUSTIVE: never stops the search — every distinct frame
+-- in the window comes out, not just the loudest. keys[]/kcell are the per-capture dedup set.
+try_pair d nn fi fj keys kcell =
   if (fj - fi) < 48 then 0
   else
     let out = arr_new nn 0
@@ -204,27 +218,29 @@ try_pair d nn fi fj foundcell =
       let calc = fcs_of out plen
       let rxfcs = fcsbits out plen 0 0
       if calc == rxfcs then
-        let _ = emit_decode out plen
-        let _ = arr_set foundcell 0 1
-        1
+        let key = payload_key out plen
+        let n = arr_get kcell 0
+        if (seen_has keys n key 0) == 1 then 0
+        else
+          let _ = arr_set keys n key
+          let _ = arr_set kcell 0 (n + 1)
+          emit_decode out plen
       else 0
 
--- nested loops over all flag pairs (i<j); stop at first CRC-valid frame
-pair_j d nn flags nf i j foundcell =
+-- nested loops over ALL flag pairs (i<j) — no early exit; dedup is by payload key
+pair_j d nn flags nf i j keys kcell =
   if j >= nf then 0
-  else if (arr_get foundcell 0) == 1 then 0
   else
-    let _ = try_pair d nn (arr_get flags i) (arr_get flags j) foundcell
-    pair_j d nn flags nf i (j + 1) foundcell
-pair_i d nn flags nf i foundcell =
+    let _ = try_pair d nn (arr_get flags i) (arr_get flags j) keys kcell
+    pair_j d nn flags nf i (j + 1) keys kcell
+pair_i d nn flags nf i keys kcell =
   if i >= nf then 0
-  else if (arr_get foundcell 0) == 1 then 0
   else
-    let _ = pair_j d nn flags nf i (i + 1) foundcell
-    pair_i d nn flags nf (i + 1) foundcell
+    let _ = pair_j d nn flags nf i (i + 1) keys kcell
+    pair_i d nn flags nf (i + 1) keys kcell
 
--- one (polarity, phase): slice -> NRZI -> collect flags -> search all pairs
-attempt samp ns meanv pol phase foundcell =
+-- one (polarity, phase): slice -> NRZI -> collect flags -> search ALL pairs (exhaustive)
+attempt samp ns meanv pol phase keys kcell =
   let nsym = (ns - phase) / SPS - 1
   if nsym < 40 then 0
   else
@@ -236,17 +252,16 @@ attempt samp ns meanv pol phase foundcell =
     let fccell = arr_new 1 0
     let _ = collect_flags d nsym 0 flags fccell
     let nf = arr_get fccell 0
-    let _ = pair_i d nsym flags nf 0 foundcell
+    let _ = pair_i d nsym flags nf 0 keys kcell
     0
 
--- sweep phase {0..SPS-1} at fixed polarity; stop at first success.
+-- sweep phase {0..SPS-1} at fixed polarity; runs ALL phases (dedup handles repeats).
 -- self-recurses on `phase` only (pol constant) — avoids the self-loop cross-dep miscompile.
-sweep samp ns meanv pol phase foundcell =
+sweep samp ns meanv pol phase keys kcell =
   if phase >= SPS then 0
-  else if (arr_get foundcell 0) == 1 then 0
   else
-    let _ = attempt samp ns meanv pol phase foundcell
-    sweep samp ns meanv pol (phase + 1) foundcell
+    let _ = attempt samp ns meanv pol phase keys kcell
+    sweep samp ns meanv pol (phase + 1) keys kcell
 
 main =
   let bytes = read_bytes "/tmp/ais_win.s16"
@@ -258,8 +273,9 @@ main =
     let samp = arr_new nb 0
     let _ = load_s16 bytes nb samp 0
     let meanv = mean_of samp nb
-    let foundcell = arr_new 1 0
-    let _ = sweep samp nb meanv 1 0 foundcell
-    let _ = if (arr_get foundcell 0) == 0 then sweep samp nb meanv (0 - 1) 0 foundcell else 0
-    let _ = if (arr_get foundcell 0) == 0 then print "NO_DECODE" else 0
+    let keys = arr_new 512 0          -- per-capture dedup set (distinct payload keys)
+    let kcell = arr_new 1 0
+    let _ = sweep samp nb meanv 1 0 keys kcell
+    let _ = sweep samp nb meanv (0 - 1) 0 keys kcell
+    let _ = if (arr_get kcell 0) == 0 then print "NO_DECODE" else 0
     0
