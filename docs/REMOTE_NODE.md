@@ -85,11 +85,16 @@ sky; only the observer coords change.
 5. **Guest WiFi captive-portal risk** — a headless Pi can't click "Accept". Test the roof
    network with a phone first; if a portal pops, the node can't use it.
 
-## Status
+## Status (2026-06-01 ~03:46 UTC)
 - [x] Mini-side decode pipeline (validated)
-- [x] Pi provisioned headless (firstrun.sh) + on Tailscale (ledaticground-node) + SDR confirmed
-- [x] full Pi->Mini capture+pull pipeline proven over Tailscale (8s test grab)
-- [ ] V-dipole built + mounted on the roof
-- [ ] SITE_WIFI auto-join confirmed at the roof (captive portal? band?)
-- [ ] first real pass captured at the remote site (next: NOAA 19 03:02 UTC, El 84)
+- [x] Pi provisioned headless + on Tailscale (ledaticground-node) + SDR confirmed
+- [x] full Pi->Mini capture+pull pipeline proven over Tailscale
+- [x] **deployed on the building roof**, on `SITE_WIFI` (SSID is SalsO not SalsA),
+      internet OK, no captive portal, 2.4 GHz, signal ~40%
+- [x] orchestrator LIVE as LaunchAgent `com.ledatic.ledaticground`, auto-captures next pass
+- [x] weak-WiFi fix: Pi windows the clip (~2.6 MB) before shipping (24 MB full-pull stalled)
+- [ ] **137 V-dipole built + swapped for the whip** (in progress — see `ANTENNA.md`).
+      THE BLOCKER: first two real passes were noise on the whip (137 MHz too weak for it).
+- [ ] first real image (next pass armed: **NOAA 19, 09:04 UTC / 05:04 EDT, El 60**)
+- [ ] AIS live decode (roof hears 162 MHz at 18x; chain built, needs Gardner clock recovery)
 - [ ] two-node simultaneous capture -> live TDOA / cross-attestation
