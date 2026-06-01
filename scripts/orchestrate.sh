@@ -17,6 +17,11 @@ while true; do
   sleep $(( RDUR + 60 ))
   rf=$(ssh "${PI_USER}@${PI}" "ls -t /tmp/cap_roof_*.s16 2>/dev/null | head -1")
   [ -n "$rf" ] || { echo "no recording on Pi"; continue; }
-  loc="/tmp/incoming_$(basename "$rf")"; scp "${PI_USER}@${PI}:$rf" "$loc"
-  echo "decoding $(basename "$rf")"; bash "$GD/scripts/recv_decode.sh" "$loc" roof_node "$LAT" "$LON"
+  # roof WiFi is weak -> have the Pi extract the high-elevation window (~120s, ~2.6MB)
+  # centered on the pass peak (recording starts AOS-30s; peak ~30+DUR*30s in), pull only that
+  WSKIP=$(( DUR*30 - 30 )); [ "$WSKIP" -lt 0 ] && WSKIP=0
+  ssh "${PI_USER}@${PI}" "dd if='$rf' of=/tmp/roof_win.s16 bs=22050 skip=$WSKIP count=120 2>/dev/null"
+  loc="/tmp/incoming_win.s16"; scp -C "${PI_USER}@${PI}:/tmp/roof_win.s16" "$loc"
+  echo "decoding windowed $(basename "$rf") ($(wc -c <"$loc" 2>/dev/null) bytes)"
+  bash "$GD/scripts/recv_decode.sh" "$loc" roof_node "$LAT" "$LON" 0 110
 done
