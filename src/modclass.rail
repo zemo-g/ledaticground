@@ -394,6 +394,78 @@ tally_loop F n W b i lg counts =
     let _ = arr_set counts pr ((arr_get counts pr) + 1)
     tally_loop F n W b (i + 1) lg counts
 
+-- ---- open-set novelty: per-class centroids + spreads, diagonal-Mahalanobis distance ----
+cs_loop F y n c f i cell =
+  if i >= n then 0
+  else
+    let _ = if (arr_get y i) == c then float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get F (i * 10 + f))) else 0
+    cs_loop F y n c f (i + 1) cell
+ss_loop F y n c f m i cell =
+  if i >= n then 0
+  else
+    let _ = if (arr_get y i) == c then
+              let d = (float_arr_get F (i * 10 + f)) - m
+              float_arr_set cell 0 ((float_arr_get cell 0) + d * d)
+            else 0
+    ss_loop F y n c f m (i + 1) cell
+count_into y n c i cell =
+  if i >= n then 0
+  else
+    let _ = if (arr_get y i) == c then float_arr_set cell 0 ((float_arr_get cell 0) + 1.0) else 0
+    count_into y n c (i + 1) cell
+cent_cols F y n c nc cent cstd f =
+  if f >= 10 then 0
+  else
+    let s1 = float_arr_new 1 0.0
+    let _ = cs_loop F y n c f 0 s1
+    let m = (float_arr_get s1 0) / nc
+    let _ = float_arr_set cent (c * 10 + f) m
+    let s2 = float_arr_new 1 0.0
+    let _ = ss_loop F y n c f m 0 s2
+    let _ = float_arr_set cstd (c * 10 + f) ((sqrt ((float_arr_get s2 0) / nc)) + 0.001)
+    cent_cols F y n c nc cent cstd (f + 1)
+fit_centroids F y n cent cstd c =
+  if c >= 5 then 0
+  else
+    let cc = float_arr_new 1 0.0
+    let _ = count_into y n c 0 cc
+    let nc = (float_arr_get cc 0) + 0.000000001
+    let _ = cent_cols F y n c nc cent cstd 0
+    fit_centroids F y n cent cstd (c + 1)
+dist_feats F off cent cstd c f acc =
+  if f >= 10 then 0
+  else
+    let z = ((float_arr_get F (off + f)) - (float_arr_get cent (c * 10 + f))) / (float_arr_get cstd (c * 10 + f))
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + z * z)
+    dist_feats F off cent cstd c (f + 1) acc
+nov_scan F off cent cstd c bc =
+  if c >= 5 then 0
+  else
+    let acc = float_arr_new 1 0.0
+    let _ = dist_feats F off cent cstd c 0 acc
+    let d = sqrt ((float_arr_get acc 0) / 10.0)
+    let _ = if d < (float_arr_get bc 0) then float_arr_set bc 0 d else 0
+    nov_scan F off cent cstd (c + 1) bc
+-- min diagonal-Mahalanobis distance to any class centroid (the novelty score)
+novelty_one F off cent cstd =
+  let bc = float_arr_new 1 0.0
+  let _ = float_arr_set bc 0 1000000000.0
+  let _ = nov_scan F off cent cstd 0 bc
+  float_arr_get bc 0
+nov_stats F n cent cstd i sumc sqc =
+  if i >= n then 0
+  else
+    let nv = novelty_one F (i * 10) cent cstd
+    let _ = float_arr_set sumc 0 ((float_arr_get sumc 0) + nv)
+    let _ = float_arr_set sqc 0 ((float_arr_get sqc 0) + nv * nv)
+    nov_stats F n cent cstd (i + 1) sumc sqc
+count_unknown F n cent cstd tau i unk =
+  if i >= n then 0
+  else
+    let nv = novelty_one F (i * 10) cent cstd
+    let _ = if nv > tau then arr_set unk 0 ((arr_get unk 0) + 1) else 0
+    count_unknown F n cent cstd tau (i + 1) unk
+
 main =
   let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
   let f = float_arr_new 4096 0.0
@@ -460,4 +532,29 @@ main =
                         cat ["B", frange b 0 5 ""]]
   let _ = write_file "models/audio_softmax.txt" dump
   let _ = print "WROTE models/audio_softmax.txt"
+  -- open-set novelty model (same trained, standardized feature space): per-class centroids +
+  -- spreads; UNKNOWN when diagonal-Mahalanobis to the nearest class > tau (=mean+2*std of train
+  -- novelty, sort-free ~97th pctile). The node admits it hears something it can't name.
+  let cent = float_arr_new 50 0.0
+  let cstd = float_arr_new 50 0.0
+  let _ = fit_centroids Ftr ytr ntr cent cstd 0
+  let nsum = float_arr_new 1 0.0
+  let nsq = float_arr_new 1 0.0
+  let _ = nov_stats Ftr ntr cent cstd 0 nsum nsq
+  let nmean = (float_arr_get nsum 0) / (int_to_float ntr)
+  let nvar = ((float_arr_get nsq 0) / (int_to_float ntr)) - nmean * nmean
+  let tau = nmean + 2.0 * (sqrt (fabs nvar))
+  let unk = arr_new 1 0
+  let _ = if nre > 0 then count_unknown Fre nre cent cstd tau 0 unk else 0
+  let _ = print (cat ["Gate C  novelty tau=", show_float tau, " real-unknown-windows=", show (arr_get unk 0), "/", show nre])
+  let novdump = join "\n" ["# open-set novelty (rail); diagonal-Mahalanobis to class centroids; UNKNOWN if score>TAU",
+                           cat ["TAU ", show_float tau],
+                           cat ["C0", frange cent 0 10 ""], cat ["C1", frange cent 10 20 ""],
+                           cat ["C2", frange cent 20 30 ""], cat ["C3", frange cent 30 40 ""],
+                           cat ["C4", frange cent 40 50 ""],
+                           cat ["S0", frange cstd 0 10 ""], cat ["S1", frange cstd 10 20 ""],
+                           cat ["S2", frange cstd 20 30 ""], cat ["S3", frange cstd 30 40 ""],
+                           cat ["S4", frange cstd 40 50 ""]]
+  let _ = write_file "models/audio_novelty.txt" novdump
+  let _ = print "WROTE models/audio_novelty.txt"
   0

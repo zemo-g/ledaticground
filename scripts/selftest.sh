@@ -102,6 +102,10 @@ ck "rfml IQ characterizer held-out >=95% (rail-trained)" "$o" "accuracy: 29[0-9]
 # RFML rung: edge characterizer (pure-python, NO numpy — the Pi path) runs the Rail-trained
 # weights (models/audio_softmax.txt, written by the modclass gate above) on a known signal.
 $PY -c "import numpy as np,scripts.gen_modclass as G;r=np.random.default_rng(7);np.concatenate([G.make_window('fsk',4096,r) for _ in range(20)]).tofile('/tmp/char_test.s16')"
-o=$($PY scripts/pi_characterize.py /tmp/char_test.s16 models/audio_softmax.txt 2>/dev/null)
+o=$($PY scripts/pi_characterize.py /tmp/char_test.s16 models/audio_softmax.txt models/audio_novelty.txt 2>/dev/null)
 ck "rfml edge characterizer (pure-python, rail weights)" "$o" "\"fsk\": [12][0-9]"
+# RFML rung: open-set novelty — a NOVEL modulation (chirp) the model never trained on flags UNKNOWN
+$PY -c "import numpy as np,scripts.modnovelty_proto as N;r=np.random.default_rng(5);np.concatenate([N.novel_window('chirp',4096,r).astype('<i2') for _ in range(40)]).tofile('/tmp/chirp40.s16')"
+o=$($PY scripts/pi_characterize.py /tmp/chirp40.s16 models/audio_softmax.txt models/audio_novelty.txt 2>/dev/null)
+ck "rfml novelty flags a novel modulation UNKNOWN" "$o" "\"unknown_windows\": [23][0-9]"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

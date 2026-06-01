@@ -59,6 +59,42 @@ Four bricks on top of the audio characterizer, all pure Rail, all validated agai
 selftest **29/29**. The audio + IQ characterizers together cover both domains the node produces;
 LRPT (QPSK) now has a home in the IQ characterizer; and the audio model runs live at the edge.
 
+## Open-set novelty + the self-labeling flywheel (2026-06-01 cont.)
+
+**Open-set novelty — the node admits it hears something it can't name** (`src/modclass.rail` exports
+`models/audio_novelty.txt`; `scripts/pi_characterize.py` applies it; `scripts/modnovelty_proto.py`
+oracle). The softmax always force-fits to one of 5 classes; the novelty head adds an OOD score =
+min diagonal-Mahalanobis distance to any class centroid in the trained feature space, with a
+**sort-free threshold τ = mean + 2·std of training novelty** (≈97th pctile). Above τ → UNKNOWN.
+Rail and Python agree exactly (τ = 1.468). Validated falsifiably:
+- a **chirp** (novel modulation, never trained) flags UNKNOWN ~75–85% (vs being force-fit to afsk);
+- **real off-air AIS** flags **0** windows UNKNOWN (no false-alarm on familiar signal);
+- **honest blind spot:** a **multitone** signal is *not* flagged (0%) — it's feature-indistinguishable
+  from afsk in this space. Novelty only catches signals outside the known feature envelope; an unknown
+  that mimics a known class needs a discriminating feature (a spectral-peak-count would separate it).
+  Documented, not hidden. Live on the Pi: a window scoring > τ is reported `unknown`, not mislabeled.
+
+**Self-labeling coverage-gap flywheel — does the learned detector reach below the decode floor?**
+(`scripts/coverage_gap.py`). The deterministic AIS decoder self-labels real bursts (a CRC-valid frame
+can't pass by chance = ground-truth "a burst is here"); we add progressively more noise and measure
+decode-recall vs detect-recall vs **idle false-positive** (the control that makes recall meaningful).
+On 6 decoder-confirmed real bursts + 264 idle windows from `ais_clean_a`:
+- decode 50%-floor ~25 dB; **detector usable floor (recall ≥ 50% AND idle-FPR ≤ 10%) ~7 dB** →
+  the learned detector usefully detects bursts **~18 dB below the decode floor** (presence below the
+  MMSI-decode floor), *before* noise defeats it too (below ~5 dB its FPR explodes → meaningless).
+- **Honest caveats:** audio-domain noise (a model of weaker post-demod SNR, not strictly RF) so the
+  dB axis is *relative, not RF-calibrated*; only 6 bursts (directional); and **detection ≠ decode** —
+  a detected-but-undecodable burst says "a vessel is here," not its MMSI. Still real value for the
+  port product: traffic presence below the ID-decode floor.
+- **Domain lesson (earned the hard way):** running the audio detector on a *channelized* IQ demod
+  (narrow LPF → smoother idle noise) gave 100% false-positive — it called band-limited idle "msk."
+  The detector must be evaluated in its native domain (rtl_fm wideband audio). Matched domains matter;
+  this is itself a finding about transfer limits.
+
+selftest **30/30** (novelty gate added). The flywheel's honest verdict: ML extends *detection*
+coverage well below the matched receiver's *decode* floor, bounded by where noise defeats detection —
+the actual provenance moat is training on attested real labels, which the next-antenna SNR unlocks.
+
 ## What this is (and what it is not)
 
 The romantic version — *"an LLM that learns to cipher/uncipher any band"* — hits three walls:

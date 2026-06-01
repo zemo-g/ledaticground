@@ -50,7 +50,7 @@ while true; do
   if [ $((CYC % CHAR_EVERY)) -eq 0 ]; then
     cout=$(perl -e 'alarm 150; exec @ARGV' ssh -o ConnectTimeout=12 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$PI" \
       "timeout $((CHAR_SECS+3)) rtl_fm -f $FREQ -M fm -s 48000 -g 40 -l 0 /tmp/char.s16 2>/dev/null; \
-       timeout 120 python3 /home/ledatic/pi_characterize.py /tmp/char.s16 /home/ledatic/audio_softmax.txt 2>/dev/null" 2>/dev/null | grep '^{')
+       timeout 120 python3 /home/ledatic/pi_characterize.py /tmp/char.s16 /home/ledatic/audio_softmax.txt /home/ledatic/audio_novelty.txt 2>/dev/null" 2>/dev/null | grep '^{')
     if [ -n "$cout" ]; then
       printf '%s\n' "$cout" | "$PY" -c \
         "import sys,json; ts=int(sys.argv[1]); ch=sys.argv[2]; [print(json.dumps({**json.loads(l),'ts':ts,'ch':ch})) for l in sys.stdin]" \

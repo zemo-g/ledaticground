@@ -94,27 +94,52 @@ def params(d, spec):
 def classify(F, mu, sg, W, b):
     z = [(F[i] - mu[i]) / sg[i] for i in range(len(F))]
     lg = [b[c] + sum(W[c][i] * z[i] for i in range(len(z))) for c in range(5)]
-    return max(range(5), key=lambda c: lg[c])
+    return max(range(5), key=lambda c: lg[c]), z
+
+def load_novelty(path):
+    tau = None; C = [None] * 5; S = [None] * 5
+    for line in open(path):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        t, *v = line.split()
+        if t == "TAU": tau = float(v[0])
+        elif t.startswith("C"): C[int(t[1:])] = [float(x) for x in v]
+        elif t.startswith("S"): S[int(t[1:])] = [float(x) for x in v]
+    return tau, C, S
+
+def novelty(z, C, S):
+    # min diagonal-Mahalanobis distance to any class centroid (standardized feature space)
+    return min(math.sqrt(sum(((z[f] - C[c][f]) / S[c][f]) ** 2 for f in range(len(z))) / len(z)) for c in range(5))
 
 def main():
     cap = sys.argv[1]
     mpath = sys.argv[2] if len(sys.argv) > 2 else "models/audio_softmax.txt"
+    npath = sys.argv[3] if len(sys.argv) > 3 else "models/audio_novelty.txt"
     mu, sg, W, b = load_model(mpath)
+    try:
+        tau, C, S = load_novelty(npath)
+    except OSError:
+        tau, C, S = None, None, None       # novelty optional; classify-only if absent
     a = array("h"); a.frombytes(open(cap, "rb").read())
     s = [float(x) for x in a]
     nwin = len(s) // WIN
-    tally = {c: 0 for c in CLASSES}
-    sig = []   # (class, center, baud, snr) for non-idle windows
+    tally = {c: 0 for c in CLASSES}; tally["unknown"] = 0
+    sig = []   # (class, center, baud, snr) for non-idle, recognized windows
     for w in range(nwin):
         d = s[w * WIN:(w + 1) * WIN]
         F, spec = feats(d)
-        ci = classify(F, mu, sg, W, b)
+        ci, z = classify(F, mu, sg, W, b)
+        if tau is not None and novelty(z, C, S) > tau:   # the node admits it doesn't recognize this
+            tally["unknown"] += 1
+            continue
         tally[CLASSES[ci]] += 1
         if CLASSES[ci] not in ("noise", "carrier"):
             c, bd, sn = params(d, spec)
             sig.append((CLASSES[ci], c, bd, sn))
     out = {"capture": cap, "windows": nwin, "classes": tally,
-           "signal_windows": len(sig), "model": "rail-trained-audio-softmax"}
+           "signal_windows": len(sig), "unknown_windows": tally["unknown"],
+           "model": "rail-trained-audio-softmax+novelty"}
     if sig:
         # dominant non-idle class + its aggregate params
         from collections import Counter
