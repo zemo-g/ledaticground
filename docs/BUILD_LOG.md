@@ -189,7 +189,7 @@ refinement to shorten acquisition. 4-fold phase ambiguity resolved downstream.
 **Remaining rungs (roadmap):** RRC matched filter + Gardner symbol-timing recovery
 · bit-ordering/phase de-ambiguity · CCSDS derandomizer (LFSR x^8+x^7+x^5+x^3+1) ·
 frame sync (0x1ACFFC1D ASM) · Reed-Solomon (255,223) · JPEG-ish decompress →
-METEOR image. selftest 14/14.
+METEOR image. selftest 13/13.
 
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →
