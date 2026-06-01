@@ -1,41 +1,37 @@
 #!/bin/bash
 # ledaticground continuous AIS monitor (the "flip" — replaces the 137 noise-capture loop).
-# Every cycle: capture ch-A (161.975 MHz) FM-demod on the roof Pi, pull it, decode + append
-# to the timestamped vessel timeline (vessel_log.jsonl). Also logs the Pi's uptime + voltage
-# throttle word each cycle so we can watch the power bank sag and clock its endurance.
+# DECODE-ON-PI architecture: the roof Pi captures ch-A (161.975 MHz) AND decodes it locally
+# (pi_ais_decode.py, pure-Python ~4s on a Zero 2 W), so only tiny JSON crosses the weak roof
+# WiFi (~13 KB/s) — never megabytes of samples. The Mini stamps each decode with the capture
+# time and appends to the vessel timeline (vessel_log.jsonl). Per cycle we also log the Pi's
+# uptime + `vcgencmd get_throttled` (voltage word) to watch the power bank sag / clock endurance.
 set -u
 GD=/Users/ledaticempire/projects/ledaticground
 PI=${PI_USER:-ledatic}@${PI_HOST:-ledaticground-node}
 PY=/opt/homebrew/bin/python3.11
-SECS=${AIS_SECS:-25}            # capture length (25s/2.4MB pulls reliably over weak roof WiFi)
-CYCLE=${AIS_CYCLE:-420}         # 7min between cycles — margin over the slow pull, no backlog
-# NOTE: the pull is the bottleneck on the weak roof WiFi. Proper fix = decode ON the Pi
-# (pure-python s16 decoder is light enough for a Zero 2 W) and ship only the JSON. TODO.
+SECS=${AIS_SECS:-25}            # capture length per cycle
+CYCLE=${AIS_CYCLE:-300}         # seconds between cycles (decode-on-Pi has no big pull, so tighter)
 MON=/tmp/ais_monitor.log
-START=$(date -u +%FT%TZ)
-echo "$START  ais_monitor START — capture ${SECS}s ch-A every ${CYCLE}s" >> "$MON"
+LOG="$GD/data/vessel_log.jsonl"
+echo "$(date -u +%FT%TZ)  ais_monitor START (decode-on-Pi) — capture ${SECS}s ch-A every ${CYCLE}s" >> "$MON"
 
 while true; do
   ts=$(date +%s)
-  # capture on the Pi, then report uptime + throttle (battery health) + file size
-  info=$(ssh -o ConnectTimeout=10 "$PI" \
+  # capture on the Pi, decode on the Pi, return JSON + a META line (uptime/voltage/size)
+  out=$(ssh -o ConnectTimeout=12 "$PI" \
     "timeout $((SECS+3)) rtl_fm -f 161975000 -M fm -s 48000 -g 40 -l 0 /tmp/ais_mon.s16 2>/dev/null; \
-     printf 'up=%ss thr=%s sz=%s' \"\$(cut -d' ' -f1 /proc/uptime)\" \"\$(vcgencmd get_throttled 2>/dev/null||echo na)\" \"\$(stat -c%s /tmp/ais_mon.s16 2>/dev/null||echo 0)\"" 2>/dev/null)
-  if [ -z "$info" ]; then
+     python3 /home/ledatic/pi_ais_decode.py /tmp/ais_mon.s16 2>/dev/null; \
+     printf 'META up=%ss thr=%s sz=%s' \"\$(cut -d' ' -f1 /proc/uptime)\" \"\$(vcgencmd get_throttled 2>/dev/null||echo na)\" \"\$(stat -c%s /tmp/ais_mon.s16 2>/dev/null||echo 0)\"" 2>/dev/null)
+  if [ -z "$out" ]; then
     echo "$(date -u +%FT%TZ)  PI UNREACHABLE (battery dead / off-net) — endurance ends here" >> "$MON"
     sleep 60; continue
   fi
-  # pull with a HARD time cap (perl alarm — macOS has no `timeout`) so a slow link skips
-  # the cycle instead of blocking forever. rsync --partial resumes next cycle.
-  rm -f /tmp/ais_mon_local.s16
-  perl -e 'alarm 150; exec @ARGV' rsync --partial --timeout=60 -e ssh "$PI:/tmp/ais_mon.s16" /tmp/ais_mon_local.s16 2>/dev/null \
-    || perl -e 'alarm 100; exec @ARGV' scp -C "$PI:/tmp/ais_mon.s16" /tmp/ais_mon_local.s16 2>/dev/null
-  sz=$(wc -c </tmp/ais_mon_local.s16 2>/dev/null || echo 0)
-  if [ "$sz" -gt 100000 ]; then
-    res=$("$PY" "$GD/scripts/ais_census.py" --ingest /tmp/ais_mon_local.s16 "$ts" 2>&1 | tail -1)
-  else
-    res="pull short ($sz B) — skipped ingest"
-  fi
-  echo "$(date -u +%FT%TZ)  $info | $res" >> "$MON"
+  meta=$(printf '%s\n' "$out" | grep '^META' | sed 's/^META //')
+  n=$(printf '%s\n' "$out" | grep -c '^{')
+  # stamp each decoded message with the capture time, append to the timeline
+  printf '%s\n' "$out" | grep '^{' | "$PY" -c \
+    "import sys,json; ts=int(sys.argv[1]); [print(json.dumps({**json.loads(l),'ts':ts})) for l in sys.stdin]" \
+    "$ts" >> "$LOG"
+  echo "$(date -u +%FT%TZ)  ${meta:-no-meta} | decoded $n sources" >> "$MON"
   sleep "$CYCLE"
 done
