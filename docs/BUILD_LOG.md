@@ -196,6 +196,25 @@ payload to the expected bytes. xor via (a|b)-(a&b). LFSR state in an array cell.
 · bit-ordering/phase de-ambiguity · frame sync (0x1ACFFC1D ASM) · Reed-Solomon
 (255,223), interleave 4 · JPEG-ish decompress → METEOR image. selftest 14/14.
 
+### First real NOAA 15 pass (2026-06-01 00:09 UTC) — NOISE, antenna-limited (honest)
+Clean 25 MB / 18.9-min capture of the 81° NOAA 15 pass, SDR locked to 137.620 MHz.
+But the audio is **pure noise floor**: the 2400 Hz APT subcarrier sits at only
+**1.0–1.5× the noise floor across the whole pass** (a real signal is 5–20×). No
+satellite signal was received. Diagnosis: **front-end, not software** — the SDR's
+telescopic whip can pull a megawatt local FM broadcast but not a ~5 W, 137 MHz,
+800+ km weather-sat downlink. The decode chain is proven correct on synthetic;
+it just needs a real signal. **No receipt kept** — attesting noise would be fake
+evidence. Fix = a proper 137 MHz antenna with sky view (see REMOTE_NODE.md).
+
+### Remote node kit (toward a real signal + station #2) — built
+`docs/REMOTE_NODE.md` + `scripts/pi_capture.sh` (Pi Zero 2 W records a pass, ships
+to the Mini over Tailscale) + `scripts/recv_decode.sh` (Mini decodes + attests under
+the remote station's identity). `attest.rail` station coords now file-driven
+(station_name/lat/lon, regional defaults) — a remote node attests under its own
+coords with no code change, which is also exactly what the live 2-station TDOA /
+bundle needs. 137 MHz V-dipole spec: two 53.4 cm legs at 120°, horizontal, N–S.
+selftest 14/14.
+
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →
 decode → attest) is built and falsified. v10+ (multi-station mesh,
