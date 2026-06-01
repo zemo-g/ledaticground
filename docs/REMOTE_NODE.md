@@ -64,11 +64,32 @@ Pass times: compute on the Mini with `src/passes.rail` (the friend's lat/lon), t
 Pi when to record (cron or a one-shot `at`). NOAA 15/19 + METEOR schedule is the same
 sky; only the observer coords change.
 
+## Node identity (deployed 2026-06-01)
+- Pi Zero 2 W, hostname **ledaticground-roof**, Tailscale **ledaticground-node** (reach from
+  the Mini anywhere over the tailnet; survives the WiFi change at the roof).
+- User `ledatic`, passwordless sudo, Mini SSH key authorized, SDR = Nooelec NESDR
+  SMArt v5 SN REDACTED (R820T). Home WiFi `HOME_WIFI`, roof WiFi `SITE_WIFI`
+  (both autoconnect, home priority 10 > roof 9).
+
+## Gotchas earned during bring-up (read before doing another Pi)
+1. **Bookworm ignores boot-partition `wpa_supplicant.conf`** — the Pi never gets WiFi.
+   Fix = `provision/firstrun.sh` (kernel `systemd.run` hook converts it to native
+   NetworkManager `.nmconnection` files). `ssh`+`userconf.txt` ARE honored (consumed on
+   first boot); only the WiFi import is dead.
+2. **SSIDs are case-sensitive** — `HOME_WIFI` != `HOME_WIFI`. Verify against
+   a device that's actually joined the network.
+3. **SDR drops off USB after a warm reboot** — `lsusb` empty though it worked pre-reboot.
+   It's power/contact, not driver. Full power-cycle + re-seat (powered hub ideal). Pi
+   Zero 2 W + RTL-SDR is power-marginal.
+4. **DVB driver claims the dongle** — blacklist `dvb_usb_rtl28xxu`, takes effect on reboot.
+5. **Guest WiFi captive-portal risk** — a headless Pi can't click "Accept". Test the roof
+   network with a phone first; if a portal pops, the node can't use it.
+
 ## Status
 - [x] Mini-side decode pipeline (validated)
-- [x] `scripts/pi_capture.sh` (record + ship)
-- [ ] friend's lat/lon for pass prediction
-- [ ] Pi on Tailscale + SDR confirmed
-- [ ] V-dipole built + mounted
-- [ ] first real pass captured at the remote site
+- [x] Pi provisioned headless (firstrun.sh) + on Tailscale (ledaticground-node) + SDR confirmed
+- [x] full Pi->Mini capture+pull pipeline proven over Tailscale (8s test grab)
+- [ ] V-dipole built + mounted on the roof
+- [ ] SITE_WIFI auto-join confirmed at the roof (captive portal? band?)
+- [ ] first real pass captured at the remote site (next: NOAA 19 03:02 UTC, El 84)
 - [ ] two-node simultaneous capture -> live TDOA / cross-attestation
