@@ -23,9 +23,12 @@ while true; do
   if [ $((CYC % 2)) -eq 0 ]; then FREQ=161975000; CH=A; else FREQ=162025000; CH=B; fi
   CYC=$((CYC + 1))
   # capture on the Pi, decode on the Pi (exhaustive), return JSON + a META line
-  out=$(ssh -o ConnectTimeout=12 "$PI" \
+  # HARD overall timeout (perl alarm) + ServerAlive: a connect-only timeout let a hung
+  # remote command stall the whole loop for an hour after a WiFi blip (2026-06-01). Now the
+  # cycle self-aborts at 90s and the Pi-side decode self-kills at 30s.
+  out=$(perl -e 'alarm 90; exec @ARGV' ssh -o ConnectTimeout=12 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$PI" \
     "timeout $((SECS+3)) rtl_fm -f $FREQ -M fm -s 48000 -g 40 -l 0 /tmp/ais_mon.s16 2>/dev/null; \
-     python3 /home/ledatic/pi_ais_decode.py /tmp/ais_mon.s16 2>/dev/null; \
+     timeout 30 python3 /home/ledatic/pi_ais_decode.py /tmp/ais_mon.s16 2>/dev/null; \
      printf 'META up=%ss temp=%s thr=%s sz=%s' \"\$(cut -d' ' -f1 /proc/uptime)\" \"\$(vcgencmd measure_temp 2>/dev/null|cut -d= -f2||echo na)\" \"\$(vcgencmd get_throttled 2>/dev/null||echo na)\" \"\$(stat -c%s /tmp/ais_mon.s16 2>/dev/null||echo 0)\"" 2>/dev/null)
   if [ -z "$out" ]; then
     echo "$(date -u +%FT%TZ)  PI UNREACHABLE (battery dead / off-net) — endurance ends here" >> "$MON"
