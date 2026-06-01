@@ -85,16 +85,39 @@ sky; only the observer coords change.
 5. **Guest WiFi captive-portal risk** — a headless Pi can't click "Accept". Test the roof
    network with a phone first; if a portal pops, the node can't use it.
 
-## Status (2026-06-01 ~03:46 UTC)
+## Status (2026-06-01, updated ~15:00 UTC)
 - [x] Mini-side decode pipeline (validated)
 - [x] Pi provisioned headless + on Tailscale (ledaticground-node) + SDR confirmed
-- [x] full Pi->Mini capture+pull pipeline proven over Tailscale
 - [x] **deployed on the building roof**, on `SITE_WIFI` (SSID is SalsO not SalsA),
-      internet OK, no captive portal, 2.4 GHz, signal ~40%
-- [x] orchestrator LIVE as LaunchAgent `com.ledatic.ledaticground`, auto-captures next pass
-- [x] weak-WiFi fix: Pi windows the clip (~2.6 MB) before shipping (24 MB full-pull stalled)
-- [ ] **137 V-dipole built + swapped for the whip** (in progress — see `ANTENNA.md`).
-      THE BLOCKER: first two real passes were noise on the whip (137 MHz too weak for it).
-- [ ] first real image (next pass armed: **NOAA 19, 09:04 UTC / 05:04 EDT, El 60**)
-- [ ] AIS live decode (roof hears 162 MHz at 18x; chain built, needs Gardner clock recovery)
+      internet OK, no captive portal, 2.4 GHz, signal ~40% (link throughput **only ~13 KB/s**)
+- [x] **FLIPPED to continuous AIS monitoring** — LaunchAgent `com.ledatic.ledaticground` runs
+      `scripts/ais_monitor.sh`: every 5 min the Pi captures 25 s, **decodes on-board**
+      (`pi_ais_decode.py`, pure-Python, exhaustive), ships only JSON. Alternates ch-A/ch-B.
+      Decode-on-Pi is the weak-WiFi fix (a 2.4 MB pull at 13 KB/s never kept up).
+- [x] battery + thermal endurance logged per cycle (`vcgencmd get_throttled` + `measure_temp`)
+- [x] **REAL off-air AIS decoded + attested** — USCG base station + ~21 aids-to-navigation
+      across the Detroit River / L.St.Clair / W.L.Erie corridor. Catalog in `data/vessel_log.jsonl`.
+- [ ] **moving vessels** — the gap; see the sensitivity finding below. Needs the tuned antenna.
+- [ ] **137 weather imaging** — still antenna-blocked (whip/kit can't hear the satellites).
+      Incoming: the **137MLCHD horizontal halo** (see `ANTENNA.md`).
 - [ ] two-node simultaneous capture -> live TDOA / cross-attestation
+
+## Finding (2026-06-01): the vessel gap is RF SENSITIVITY, not decode
+Compared our feed to live **aisstream.io** ground truth (`scripts/ais_groundtruth.py`): we match
+the fixed AtoN + base station and even uniquely catch a few, but decode **zero of the ~16 moving
+vessels** aisstream shows in the river (freighters `H LEE WHITE`, `AMERICAN INTEGRITY`, `ALPENA`,
+saltie `FEDERAL WELLAND`, riverboat `DETROIT PRINCESS`, USCG, pleasure craft).
+- Tested **both channels**, exhaustive decode → AtoN + base only on each. Not a decoder bug.
+- We're not 92-km-capable; we hear the **strong fixed infrastructure** (the base station + the
+  AtoN it broadcasts district-wide). Mobile vessels (low antennas, weaker) sit below our front end.
+- The decode side is now **exhaustive** (`ais_decode.rail` + `pi_ais_decode.py` collect every
+  distinct frame, deduped) — it'll extract vessels the instant they're audible. The unlock is the antenna.
+
+## Antenna-day playbook (when the 137MLCHD halo is mounted)
+1. **Connector:** SO-239 (antenna) ↔ SMA (SDR) — have a PL-259→SMA coax/adapter ready (see `ANTENNA.md`).
+2. **Mount** horizontal, ≥12 ft, clear of metal; **6-turn coax choke** at the feed.
+3. **Score 162 (AIS):** `bash scripts/antenna_score.sh 162` → compare SNR/decode to the dipole baseline.
+4. **Ground-truth:** `python3 scripts/ais_groundtruth.py --secs 150` → **measure how many vessels we now
+   recover** vs aisstream. This is THE metric that says the feed became a vessel-traffic feed.
+5. **137 weather:** peak the gamma match ~137.4 by rendering a pass + the 2400 Hz ratio
+   (`antenna_score.py 137`); swap the plist back to `orchestrate.sh` for NOAA pass capture if desired.
