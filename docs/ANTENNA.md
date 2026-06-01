@@ -1,4 +1,5 @@
-# Antenna — 137 MHz V-dipole for the ledaticground node
+# Antenna — 137 MHz NOAA reception for the ledaticground node
+(Primary: the ordered 137MLCHD horizontal halo. DIY V-dipole kept as the fallback.)
 
 ## Why (the empirical diagnosis, 2026-06-01)
 Two real overhead passes (NOAA 15 81°, NOAA 19 82°) came down as **pure noise** — the
@@ -11,7 +12,44 @@ location or pipeline:
   *tuned, sky-facing* antenna. A whip catches strong-near signals but not weak-far ones.
 The decode pipeline is fully validated; the antenna is the only gap.
 
-## The fix — build a 137.5 MHz V-dipole
+## The antenna we ordered (incoming, 2026-06-01) — 137MLCHD horizontal halo
+
+the operator ordered a purpose-built 137 MHz antenna. Spec:
+- Model **137MLCHD**, element 5/16″ 6061 aluminum solid rod, **14″ diameter circle**.
+- Usable **136–138 MHz (adjustable)**, 2 MHz bandwidth, **50 Ω**, **gamma-match** tuning.
+- **Omni-directional**, **horizontal polarization**, SO-239 (UHF female), U-bolt mast clamp.
+- Min mounting height **12 ft**.
+
+**What it is — a halo (half-wave loop), NOT circular polarization.** Physically circular ≠
+circularly polarized. 14″ circumference = π·14″ ≈ 1.12 m ≈ λ/2 at 137 MHz → it's a half-wave
+dipole bent into a circle, fed by the gamma match. **Horizontally polarized, omni in azimuth.**
+
+**Performance for NOAA (honest):**
+- NOAA downlink is **RHCP** → a horizontal antenna takes a **constant ~3 dB** polarization
+  mismatch (NOT the deep fading a vertical suffers). One S-unit; not a dealbreaker.
+- **Omni azimuth** beats a V-dipole (no end-nulls) — catches passes from any bearing.
+- Horizontal loops tend to **favor low elevation** (peak toward horizon, some reduction toward
+  zenith) → may give *longer* horizon-to-horizon passes / taller images; verify empirically.
+- Properly resonant + gamma-matched + 50 Ω = a real, efficient antenna. **This decodes NOAA**
+  where the whip got only noise. Mid-ladder (a QFH/turnstile would be ~3 dB better + circular).
+
+**Install checklist (earned in the analysis — do these before/at mount):**
+1. **Connector adapter (do this FIRST).** Antenna = **SO-239 (UHF female)**; the SDR = **SMA**.
+   Need coax with **PL-259 (UHF male)** at the antenna and **SMA at the SDR**, or an SO-239→SMA
+   adapter. Have it in hand before climbing.
+2. **Mount horizontal, ≥12 ft, clear of metal** — loop plane parallel to the ground.
+3. **Common-mode choke** — coil the coax ~5 turns (~5 cm) at the feedpoint. Cheapest SNR gain;
+   keeps feedline-conducted noise out even with the gamma match.
+4. **Peak the gamma match ~137.4 MHz** (splits NOAA 19 @137.1 / NOAA 15 @137.62; 2 MHz BW covers
+   both). **Tune by measurement, not spec:** adjust gamma → run `scripts/antenna_score.sh`
+   (162 baseline check) and, on the next pass, render the image + read the 2400 Hz ratio
+   (`antenna_score.py 137`); re-adjust and compare. The rendered image + sync-lock is the real test.
+
+When mounted: swap the antenna onto the SDR, then flip the node back from AIS to NOAA
+(`provision` plist → `orchestrate.sh`) OR keep AIS and capture passes manually. Everything
+downstream (APT decode → Doppler proof-of-reception → attested receipt → LRPT) is built and waiting.
+
+## DIY fallback — build a 137.5 MHz V-dipole
 λ at 137.5 MHz = 218 cm; ¼λ = 54.5 cm; minus end-effect → **53.4 cm per leg**.
 
 **Best / easiest:** the RTL-SDR.com (or Nooelec) dipole kit (~$20) — telescopic elements
