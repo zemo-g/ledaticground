@@ -85,4 +85,13 @@ $PY scripts/gen_modclass.py >/dev/null 2>&1
 $RN src/modclass.rail >/dev/null 2>&1
 o=$(perl -e 'alarm 150;exec @ARGV' /tmp/rail_out 2>/dev/null)
 ck "rfml modclass held-out >=95% (rail-trained softmax)" "$o" "accuracy: 2[89][0-9]/300"
+# RFML rung: parameter head recovers a known carrier center-offset (pure-Rail estimator)
+$PY -c "import numpy as np;v=round(2400*65534/48000);(np.full(8192,v)+np.random.RandomState(1).randint(-2,3,8192)).astype('<i2').tofile('/tmp/modfeat_in.s16')"
+$RN src/modparam.rail >/dev/null 2>&1
+o=$(perl -e 'alarm 60;exec @ARGV' /tmp/rail_out 2>/dev/null)
+ck "rfml param head recovers 2400Hz carrier center" "$o" "center=2[34][0-9][0-9]"
+# RFML rung: attested characterization receipt (Ed25519 sign + self-verify + tamper) — PAOS loop
+printf 'RFML_CHAR selftest noise=528 msk=13\n' > /tmp/modclass_result.txt
+o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/modclass_attest.rail 2>/dev/null)
+ck "rfml attest verify=1" "$o" "own-sig accepted = 1"; ck "rfml attest tamper=0" "$o" "modified-msg accepted = 0"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

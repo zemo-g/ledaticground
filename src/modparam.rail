@@ -1,0 +1,201 @@
+-- ledaticground RFML: pure-Rail parameter head (docs/RFML.md). Beyond the class, estimate
+-- physically-grounded parameters per FM-demod-audio window so the characterizer ROUTES with
+-- parameters, not just a label. Reads /tmp/modfeat_in.s16, prints "PARAM center=.. baud=.. snr=..".
+--   center : mean instantaneous frequency (Hz), = mean(sample) * FS/(2*32767)   [synthetic-calibrated]
+--   baud   : symbol rate (Hz) via first zero-crossing of the autocorrelation     [scale-invariant;
+--            exact for square FSK; Gaussian-shaped (MSK) reads lower via ISI, oscillatory (AFSK)
+--            reflects its tone -- documented limits, class stays authoritative for known protocols]
+--   snr    : spectral peak-to-average power (dB)                                  [scale-invariant]
+-- Mirrors scripts/modparam_proto.py. Float loops use size-1 cells (self-loop-safe).
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+foreign cos x -> float
+foreign sin x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign log x -> float
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+s16_at bytes i =
+  let lo = arr_get bytes (2 * i)
+  let hi = arr_get bytes (2 * i + 1)
+  let u = bit_or lo (shl hi 8)
+  if u >= 32768 then u - 65536 else u
+
+brev_one i bits acc =
+  let bit = i % 2
+  brev_loop (i / 2) (bits - 1) (acc * 2 + bit)
+brev_loop i bits acc =
+  if bits == 0 then acc
+  else brev_one i bits acc
+bitrev i bits = brev_loop i bits 0
+log2i n = if n <= 1 then 0 else 1 + log2i (n / 2)
+reorder re im n bits i =
+  if i >= n then 0
+  else
+    let r = bitrev i bits
+    let _ = if i < r then
+              let tr = float_arr_get re i
+              let ti = float_arr_get im i
+              let _ = float_arr_set re i (float_arr_get re r)
+              let _ = float_arr_set im i (float_arr_get im r)
+              let _ = float_arr_set re r tr
+              let _ = float_arr_set im r ti
+              0
+            else 0
+    reorder re im n bits (i + 1)
+bfly re im len half i j twopi =
+  if j >= half then 0
+  else
+    let ang = (0.0 - twopi) * (int_to_float j) / (int_to_float len)
+    let wr = cos ang
+    let wi = sin ang
+    let a = i + j
+    let b = i + j + half
+    let ur = float_arr_get re a
+    let ui = float_arr_get im a
+    let xr = float_arr_get re b
+    let xi = float_arr_get im b
+    let vr = xr * wr - xi * wi
+    let vi = xr * wi + xi * wr
+    let _ = float_arr_set re a (ur + vr)
+    let _ = float_arr_set im a (ui + vi)
+    let _ = float_arr_set re b (ur - vr)
+    let _ = float_arr_set im b (ui - vi)
+    bfly re im len half i (j + 1) twopi
+grp re im n len half i twopi =
+  if i >= n then 0
+  else
+    let _ = bfly re im len half i 0 twopi
+    grp re im n len half (i + len) twopi
+stage re im n len twopi =
+  if len > n then 0
+  else
+    let half = len / 2
+    let _ = grp re im n len half 0 twopi
+    stage re im n (len * 2) twopi
+fft re im n =
+  let bits = log2i n
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = reorder re im n bits 0
+  let _ = stage re im n 2 twopi
+  0
+
+sumf f i n cell =
+  if i >= n then 0
+  else
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get f i))
+    sumf f (i + 1) n cell
+sumsq f i n mean cell =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + d * d)
+    sumsq f (i + 1) n mean cell
+fill_spec f re im i n mean sd twopi =
+  if i >= n then 0
+  else
+    let z = ((float_arr_get f i) - mean) / sd
+    let w = 0.5 - 0.5 * (cos (twopi * (int_to_float i) / (int_to_float (n - 1))))
+    let _ = float_arr_set re i (z * w)
+    let _ = float_arr_set im i 0.0
+    fill_spec f re im (i + 1) n mean sd twopi
+-- power-spectrum pass: acc[0]=Ps  acc[2]=maxP  acc[5]=count (bins 1..nb-1)
+spec_pass re im k nb acc =
+  if k >= nb then 0
+  else
+    let pr = float_arr_get re k
+    let pii = float_arr_get im k
+    let p = pr * pr + pii * pii
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + p)
+    let _ = if p > (float_arr_get acc 2) then float_arr_set acc 2 p else 0
+    let _ = float_arr_set acc 5 ((float_arr_get acc 5) + 1.0)
+    spec_pass re im (k + 1) nb acc
+
+-- autocorrelation at lag L (mean-removed), summed over valid overlap
+ac_at f mean n L i cell =
+  if i >= (n - L) then float_arr_get cell 0
+  else
+    let a = (float_arr_get f i) - mean
+    let b = (float_arr_get f (i + L)) - mean
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + a * b)
+    ac_at f mean n L (i + 1) cell
+-- first lag L in [1,maxlag] where normalized autocorr <= 0 (symbol-period proxy); 0 if none
+first_zero f mean n ac0 L maxlag =
+  if L > maxlag then 0
+  else
+    let c = float_arr_new 1 0.0
+    let acL = ac_at f mean n L 0 c
+    if (acL / ac0) <= 0.0 then L
+    else first_zero f mean n ac0 (L + 1) maxlag
+
+param_window f n re im twopi =
+  let cm = float_arr_new 1 0.0
+  let _ = sumf f 0 n cm
+  let mean = (float_arr_get cm 0) / (int_to_float n)
+  let center = mean * (48000.0 / 65534.0)
+  let cv = float_arr_new 1 0.0
+  let _ = sumsq f 0 n mean cv
+  let sd = (sqrt ((float_arr_get cv 0) / (int_to_float n))) + 0.000000001
+  -- snr = 10*log10(maxP / avgP)
+  let _ = fill_spec f re im 0 n mean sd twopi
+  let _ = fft re im n
+  let nbins = (n / 2) + 1
+  let acc = float_arr_new 8 0.0
+  let _ = spec_pass re im 1 nbins acc
+  let maxp = float_arr_get acc 2
+  let avgp = ((float_arr_get acc 0) / (float_arr_get acc 5)) + 0.000000000001
+  let ln10 = log 10.0
+  let snr = 10.0 * ((log (maxp / avgp)) / ln10)
+  -- baud via autocorr first zero
+  let c0 = float_arr_new 1 0.0
+  let ac0 = (ac_at f mean n 0 0 c0) + 0.000000001
+  let lz = first_zero f mean n ac0 1 256
+  let baud = if lz == 0 then 0.0 else (48000.0 / (int_to_float lz))
+  print (cat ["PARAM center=", show_float center, " baud=", show_float baud, " snr=", show_float snr])
+
+load_win bytes f base i n =
+  if i >= n then 0
+  else
+    let _ = float_arr_set f i (int_to_float (s16_at bytes (base + i)))
+    load_win bytes f base (i + 1) n
+each_window bytes f re im twopi winsz nwin w =
+  if w >= nwin then 0
+  else
+    let _ = load_win bytes f (w * winsz) 0 winsz
+    let _ = param_window f winsz re im twopi
+    each_window bytes f re im twopi winsz nwin (w + 1)
+
+main =
+  let bytes = read_bytes "/tmp/modfeat_in.s16"
+  let ns = (arr_len bytes) / 2
+  let winsz = 4096
+  let nwin = ns / winsz
+  let f = float_arr_new winsz 0.0
+  let re = float_arr_new winsz 0.0
+  let im = float_arr_new winsz 0.0
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = each_window bytes f re im twopi winsz nwin 0
+  0

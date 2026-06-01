@@ -436,4 +436,11 @@ main =
                       " afsk=", show (arr_get counts 2),
                       " fsk=", show (arr_get counts 3),
                       " msk=", show (arr_get counts 4)])
+  -- characterization product (the object an attestation receipt binds + signs)
+  let result = cat ["RFML_CHAR capture=ais_clean_a windows=", show nre,
+                    " noise=", show (arr_get counts 0), " carrier=", show (arr_get counts 1),
+                    " afsk=", show (arr_get counts 2), " fsk=", show (arr_get counts 3),
+                    " msk=", show (arr_get counts 4)]
+  let _ = write_file "/tmp/modclass_result.txt" result
+  let _ = print "WROTE /tmp/modclass_result.txt"
   0
