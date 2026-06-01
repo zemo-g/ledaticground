@@ -70,4 +70,12 @@ ck "ais real-burst decode (off-air)" "$o" "mmsi=3669778"
 printf 'selftest-ais-product\n' > /tmp/ais_decoded.txt; echo "0" > /tmp/ais_pulse.txt
 o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/ais_attest.rail 2>/dev/null)
 ck "ais attest verify=1" "$o" "own-sig accepted = 1"; ck "ais attest tamper=0" "$o" "modified-msg accepted = 0"
+# SAME rung: decode a synthetic NWR alert burst (AFSK -> preamble sync -> frame -> parse)
+$PY scripts/gen_same.py --snr 25 --out /tmp/st_same.s16 >/dev/null 2>&1
+o=$($PY scripts/same_decode.py /tmp/st_same.s16 2>/dev/null)
+ck "same decode (WXR/RWT/fips/station)" "$o" "Required Weekly Test"
+# SAME rung: 2-of-3 byte voting recovers a message with errors injected in EVERY repeat
+$PY scripts/gen_same.py --snr 25 --corrupt --out /tmp/st_samec.s16 >/dev/null 2>&1
+o=$($PY scripts/same_decode.py /tmp/st_samec.s16 2>/dev/null)
+ck "same 2-of-3 voting recovers" "$o" "026163"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]
