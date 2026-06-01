@@ -7,8 +7,10 @@ set -u
 GD=/Users/ledaticempire/projects/ledaticground
 PI=${PI_USER:-ledatic}@${PI_HOST:-ledaticground-node}
 PY=/opt/homebrew/bin/python3.11
-SECS=${AIS_SECS:-45}            # capture length per cycle
-CYCLE=${AIS_CYCLE:-240}         # seconds between cycle starts
+SECS=${AIS_SECS:-25}            # capture length (25s/2.4MB pulls reliably over weak roof WiFi)
+CYCLE=${AIS_CYCLE:-420}         # 7min between cycles — margin over the slow pull, no backlog
+# NOTE: the pull is the bottleneck on the weak roof WiFi. Proper fix = decode ON the Pi
+# (pure-python s16 decoder is light enough for a Zero 2 W) and ship only the JSON. TODO.
 MON=/tmp/ais_monitor.log
 START=$(date -u +%FT%TZ)
 echo "$START  ais_monitor START — capture ${SECS}s ch-A every ${CYCLE}s" >> "$MON"
@@ -23,9 +25,11 @@ while true; do
     echo "$(date -u +%FT%TZ)  PI UNREACHABLE (battery dead / off-net) — endurance ends here" >> "$MON"
     sleep 60; continue
   fi
-  # pull (rsync resumable, scp fallback for the weak roof WiFi)
-  rsync --partial --timeout=80 -e ssh "$PI:/tmp/ais_mon.s16" /tmp/ais_mon_local.s16 2>/dev/null \
-    || scp -C "$PI:/tmp/ais_mon.s16" /tmp/ais_mon_local.s16 2>/dev/null
+  # pull with a HARD time cap (perl alarm — macOS has no `timeout`) so a slow link skips
+  # the cycle instead of blocking forever. rsync --partial resumes next cycle.
+  rm -f /tmp/ais_mon_local.s16
+  perl -e 'alarm 150; exec @ARGV' rsync --partial --timeout=60 -e ssh "$PI:/tmp/ais_mon.s16" /tmp/ais_mon_local.s16 2>/dev/null \
+    || perl -e 'alarm 100; exec @ARGV' scp -C "$PI:/tmp/ais_mon.s16" /tmp/ais_mon_local.s16 2>/dev/null
   sz=$(wc -c </tmp/ais_mon_local.s16 2>/dev/null || echo 0)
   if [ "$sz" -gt 100000 ]; then
     res=$("$PY" "$GD/scripts/ais_census.py" --ingest /tmp/ais_mon_local.s16 "$ts" 2>&1 | tail -1)
