@@ -58,4 +58,8 @@ ck "ais type1 parse MMSI+lat/lon" "$a" "OK"
 # AIS rung: CRC-16/X-25 (HDLC frame check) matches published 0x906e
 $RN src/crc16.rail >/dev/null 2>&1; o=$(perl -e 'alarm 60;exec @ARGV' /tmp/rail_out 2>/dev/null)
 ck "crc16/x25 check value 0x906e" "$o" "MATCH=1"
+# AIS rung: NRZI + HDLC deframe (flags + destuff + CRC) recovers a valid frame end-to-end
+$PY scripts/gen_ais_msg.py >/dev/null 2>&1; $PY scripts/gen_ais_frame.py >/dev/null 2>&1
+$RN src/ais_deframe.rail >/dev/null 2>&1; o=$(perl -e 'alarm 60;exec @ARGV' /tmp/rail_out 2>/dev/null)
+ck "ais hdlc deframe CRC ok" "$o" "CRC_OK=1"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

@@ -233,7 +233,9 @@ Big-endian bit-fold via int array-cell accumulator. vs a known encoded ship repo
 
 **Rung 3 — CRC-16/X-25 ✅** `src/crc16.rail`: reflected (poly 0x8408, init+xorout 0xFFFF), matches the published check value 0x906e for "123456789". The HDLC frame validator.
 
-**Remaining AIS glue:** clock recovery (Gardner) ·
+**Rung 4 — NRZI + HDLC deframe ✅** `src/ais_deframe.rail`: NRZI-decode, dual 0x7E flag-find, bit-destuff, bit-wise CRC-16/X-25 check. On a full synthetic frame: flags found, 184->168-bit payload recovered EXACTLY, CRC_OK. **The AIS chain is now end-to-end: 162 MHz IQ -> GMSK -> deframe -> parse -> ship MMSI/lat/lon, all pure Rail, all validated.**
+
+**Remaining polish:** clock recovery (Gardner) ·
 NRZI decode · HDLC deframe (0x7E flags + bit-destuff) · CRC-16-CCITT. Tie-in: a live
 Detroit-River vessel feed for the Great Lakes logistics work.
 
