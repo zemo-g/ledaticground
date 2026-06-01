@@ -235,9 +235,37 @@ Big-endian bit-fold via int array-cell accumulator. vs a known encoded ship repo
 
 **Rung 4 — NRZI + HDLC deframe ✅** `src/ais_deframe.rail`: NRZI-decode, dual 0x7E flag-find, bit-destuff, bit-wise CRC-16/X-25 check. On a full synthetic frame: flags found, 184->168-bit payload recovered EXACTLY, CRC_OK. **The AIS chain is now end-to-end: 162 MHz IQ -> GMSK -> deframe -> parse -> ship MMSI/lat/lon, all pure Rail, all validated.**
 
-**Remaining polish:** clock recovery (Gardner) ·
-NRZI decode · HDLC deframe (0x7E flags + bit-destuff) · CRC-16-CCITT. Tie-in: a live
-Detroit-River vessel feed for the Great Lakes logistics work.
+**Rung 5 — REAL off-air decode ✅ (2026-06-01)** `src/ais_decode.rail` — the first decode
+of a *real* signal by this station. The roof RTL-SDR (still on the stock whip, which hears
+162 MHz at ~18× the floor) captured live Detroit-River AIS; the pure-Rail chain decoded it
+end-to-end. `ais_decode.rail` is self-contained per burst: DC-remove → per-symbol
+integrate+slice (sps=5) over a polarity/phase + **multi-flag-pair** search → NRZI → HDLC
+deframe → CRC-16/X-25 → **byte-reverse (HDLC sends each byte LSB-first — the one real-data
+fix synthetic frames never needed)** → field parse. Two host driver stages (same
+host-orchestrates / Rail-decodes split as APT sync):
+- `scripts/ais_bursts.py` — raw IQ (both channels), magnitude-envelope detection.
+  12 s roof capture → **9/9 CRC-valid** (USCG base station 003669778 + US aids-to-navigation
+  across the Detroit River / Lake St. Clair / W. Lake Erie corridor).
+- `scripts/ais_bursts_s16.py` — the **autonomous** path: FM-demod s16 (small files that
+  survive the weak roof WiFi; ~62 s/6 MB vs IQ's ~12 s). Detector = per-5 ms **lag-1
+  roughness** (idle FM-noise is rough ±π, a constant-envelope GMSK burst is smooth → ~7×
+  separation). Clean 46 s capture → **13/14 bursts decoded** (14th is a 10 ms file-edge
+  fragment). Gotcha: tight-window each burst *before* mean-subtraction so the removed DC is
+  the burst's carrier offset, not idle noise (a wide window's idle-dominated mean kills it).
+
+**Rung 6 — attested AIS reception ✅** `src/ais_attest.rail`: binds the decoded observation
+set (sha256 of the pure-Rail decode) + node identity + capture pulse under an Ed25519
+signature, hash-chained, **self-verify=1 / tamper=0**. Receiver geolocation is a labeled
+`PENDING_needs_GPS_PPS` field (the v100 rung) — no fabricated coords. Proof-of-reception
+applied to ship traffic: *this node received exactly these messages at this time.*
+
+Regression: a tiny **real** burst fixture (`tests/fixtures/ais_burst_real.s16`, 3 KB) — the
+selftest decodes it to MMSI 003669778. selftest now **21/21**.
+
+**Remaining for a moving freighter (the Great Lakes tie-in):** a longer / both-channel
+capture at a busier time — so far only fixed infra (base station + AtoN) was transmitting;
+the decoder already handles type 1/2/3 vessel position/SOG/COG. Future precision: Gardner
+clock recovery for drift / faint distant ships; a 162-tuned dipole for a permanent feed.
 
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →

@@ -1,0 +1,265 @@
+-- ledaticground AIS rung 5: REAL off-air decoder (pure Rail), end-to-end.
+-- Input: /tmp/ais_win.s16 = one windowed AIS burst, FM-demodulated to s16 LE @48kHz
+--        (rtl_fm output IS the frequency discriminator gmsk.rail computes from IQ).
+-- Pipeline, all in Rail: DC-remove -> per-symbol integrate+slice (sps=5) over a
+-- polarity/phase search -> NRZI -> HDLC flag find -> de-stuff -> CRC-16/X-25 ->
+-- byte-reverse (HDLC sends each byte LSB-first) -> AIS field parse. Prints the first
+-- CRC-valid decode (type + MMSI, plus lat/lon/SOG/COG for position reports 1/2/3).
+-- Loops carry int indices + array cells only (self-loop-safe). No floats until the
+-- final lat/lon scaling.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- decode little-endian s16 byte array into signed-int sample array
+s16_at bytes i =
+  let lo = arr_get bytes (2 * i)
+  let hi = arr_get bytes (2 * i + 1)
+  let u = bit_or lo (shl hi 8)
+  if u >= 32768 then u - 65536 else u
+load_s16 bytes nb samp i =
+  if i >= nb then 0
+  else
+    let _ = arr_set samp i (s16_at bytes i)
+    load_s16 bytes nb samp (i + 1)
+
+-- integer mean of the whole window (DC = carrier-frequency-offset bias)
+sum_acc samp ns i cell =
+  if i >= ns then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (arr_get samp i))
+    sum_acc samp ns (i + 1) cell
+mean_of samp ns =
+  let cell = arr_new 1 0
+  let _ = sum_acc samp ns 0 cell
+  (arr_get cell 0) / ns
+
+-- per-symbol integrate over sps samples at given phase; bit = sign(pol * (sum - sps*mean))
+SPS = 5
+symsum samp base meanv j cell =
+  if j >= SPS then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + ((arr_get samp (base + j)) - meanv))
+    symsum samp base meanv (j + 1) cell
+slice_bits samp meanv pol phase nsym raw k =
+  if k >= nsym then 0
+  else
+    let cell = arr_new 1 0
+    let _ = symsum samp (phase + k * SPS) meanv 0 cell
+    let acc = arr_get cell 0
+    let v = pol * acc
+    let _ = arr_set raw k (if v > 0 then 1 else 0)
+    slice_bits samp meanv pol phase nsym raw (k + 1)
+
+-- NRZI decode: D[i] = 1 if level unchanged from i-1 (prev=0 at start), else 0
+nrzi_dec n nn d i =
+  if i >= nn then 0
+  else
+    let prev = if i == 0 then 0 else arr_get n (i - 1)
+    let _ = arr_set d i (if (arr_get n i) == prev then 1 else 0)
+    nrzi_dec n nn d (i + 1)
+
+-- HDLC flag 01111110 detection
+flag_pat k = if k == 0 then 0 else (if k == 7 then 0 else 1)
+fm_acc d i k cell =
+  if k >= 8 then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get d (i + k)) == (flag_pat k) then 1 else 0))
+    fm_acc d i (k + 1) cell
+flagmatch d i =
+  let cell = arr_new 1 0
+  let _ = fm_acc d i 0 cell
+  if (arr_get cell 0) == 8 then 1 else 0
+find_flag d nn i =
+  if (i + 8) > nn then (0 - 1)
+  else if (flagmatch d i) == 1 then i else find_flag d nn (i + 1)
+
+-- de-stuff content d[c0..c1) into out; drop the 0 after five consecutive 1s
+destuff d c1 out onescell oicell i =
+  if i >= c1 then 0
+  else
+    let ones = arr_get onescell 0
+    if ones == 5 then
+      let _ = arr_set onescell 0 0
+      destuff d c1 out onescell oicell (i + 1)
+    else
+      let b = arr_get d i
+      let oi = arr_get oicell 0
+      let _ = arr_set out oi b
+      let _ = arr_set oicell 0 (oi + 1)
+      let _ = arr_set onescell 0 (if b == 1 then ones + 1 else 0)
+      destuff d c1 out onescell oicell (i + 1)
+
+-- bit-wise CRC-16/X-25 (reflected poly 0x8408=33800, init 0xFFFF, xorout 0xFFFF)
+crcbits out n i cell =
+  if i >= n then 0
+  else
+    let c = bit_xor (arr_get cell 0) (arr_get out i)
+    let _ = arr_set cell 0 (if (bit_and c 1) == 1 then bit_xor (shr c 1) 33800 else shr c 1)
+    crcbits out n (i + 1) cell
+fcs_of out n =
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let _ = crcbits out n 0 cell
+  bit_xor (arr_get cell 0) 65535
+fcsbits out start i acc =
+  if i >= 16 then acc
+  else fcsbits out start (i + 1) (bit_or acc (shl (arr_get out (start + i)) i))
+
+-- byte-reverse: HDLC sends each byte LSB-first; reverse within each group of 8 so the
+-- AIS application fields read MSB-first big-endian.
+rev_byte src dst base j =
+  if j >= 8 then 0
+  else
+    let _ = arr_set dst (base + j) (arr_get src (base + 7 - j))
+    rev_byte src dst base (j + 1)
+byterev src dst nbytes b =
+  if b >= nbytes then 0
+  else
+    let _ = rev_byte src dst (b * 8) 0
+    byterev src dst nbytes (b + 1)
+
+-- big-endian bit fold (int cell accumulator)
+gb_acc bits start n i cell =
+  if i >= n then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) * 2 + (arr_get bits (start + i)))
+    gb_acc bits start n (i + 1) cell
+getbits bits start n =
+  let cell = arr_new 1 0
+  let _ = gb_acc bits start n 0 cell
+  arr_get cell 0
+ipow2 n = if n == 0 then 1 else 2 * ipow2 (n - 1)
+signext v nbits =
+  let half = ipow2 (nbits - 1)
+  if v >= half then v - (ipow2 nbits) else v
+
+-- parse + print a CRC-valid payload (transmission order in `out`, plen bits)
+emit_decode out plen =
+  let nbytes = plen / 8
+  let msg = arr_new plen 0
+  let _ = byterev out msg nbytes 0
+  let mtype = getbits msg 0 6
+  let mmsi = getbits msg 8 30
+  let _ = print (cat ["DECODE_OK type=", show mtype, " mmsi=", show mmsi, " payload_bits=", show plen])
+  if (mtype == 1) || ((mtype == 2) || (mtype == 3)) then
+    let lonr = signext (getbits msg 61 28) 28
+    let latr = signext (getbits msg 89 27) 27
+    let sogr = getbits msg 50 10
+    let cogr = getbits msg 116 12
+    let _ = print (cat ["  LAT=", show_float ((int_to_float latr) / 600000.0)])
+    let _ = print (cat ["  LON=", show_float ((int_to_float lonr) / 600000.0)])
+    let _ = print (cat ["  SOG=", show_float ((int_to_float sogr) / 10.0), " COG=", show_float ((int_to_float cogr) / 10.0)])
+    1
+  else 1
+
+-- collect every flag start position into flags[] (real frame's flags may not be the
+-- first pair: idle noise before the burst can produce spurious 0x7E patterns).
+record_flag flags fccell pos =
+  let c = arr_get fccell 0
+  let _ = arr_set flags c pos
+  let _ = arr_set fccell 0 (c + 1)
+  0
+collect_flags d nn i flags fccell =
+  if (i + 8) > nn then 0
+  else
+    let _ = if (flagmatch d i) == 1 then record_flag flags fccell i else 0
+    collect_flags d nn (i + 1) flags fccell
+
+-- try one (start-flag fi, end-flag fj) pair: de-stuff -> CRC; on pass emit + set found
+try_pair d nn fi fj foundcell =
+  if (fj - fi) < 48 then 0
+  else
+    let out = arr_new nn 0
+    let onescell = arr_new 1 0
+    let oicell = arr_new 1 0
+    let _ = destuff d fj out onescell oicell (fi + 8)
+    let total = arr_get oicell 0
+    let plen = total - 16
+    if plen < 32 then 0
+    else
+      let calc = fcs_of out plen
+      let rxfcs = fcsbits out plen 0 0
+      if calc == rxfcs then
+        let _ = emit_decode out plen
+        let _ = arr_set foundcell 0 1
+        1
+      else 0
+
+-- nested loops over all flag pairs (i<j); stop at first CRC-valid frame
+pair_j d nn flags nf i j foundcell =
+  if j >= nf then 0
+  else if (arr_get foundcell 0) == 1 then 0
+  else
+    let _ = try_pair d nn (arr_get flags i) (arr_get flags j) foundcell
+    pair_j d nn flags nf i (j + 1) foundcell
+pair_i d nn flags nf i foundcell =
+  if i >= nf then 0
+  else if (arr_get foundcell 0) == 1 then 0
+  else
+    let _ = pair_j d nn flags nf i (i + 1) foundcell
+    pair_i d nn flags nf (i + 1) foundcell
+
+-- one (polarity, phase): slice -> NRZI -> collect flags -> search all pairs
+attempt samp ns meanv pol phase foundcell =
+  let nsym = (ns - phase) / SPS - 1
+  if nsym < 40 then 0
+  else
+    let raw = arr_new nsym 0
+    let _ = slice_bits samp meanv pol phase nsym raw 0
+    let d = arr_new nsym 0
+    let _ = nrzi_dec raw nsym d 0
+    let flags = arr_new nsym 0
+    let fccell = arr_new 1 0
+    let _ = collect_flags d nsym 0 flags fccell
+    let nf = arr_get fccell 0
+    let _ = pair_i d nsym flags nf 0 foundcell
+    0
+
+-- sweep phase {0..SPS-1} at fixed polarity; stop at first success.
+-- self-recurses on `phase` only (pol constant) — avoids the self-loop cross-dep miscompile.
+sweep samp ns meanv pol phase foundcell =
+  if phase >= SPS then 0
+  else if (arr_get foundcell 0) == 1 then 0
+  else
+    let _ = attempt samp ns meanv pol phase foundcell
+    sweep samp ns meanv pol (phase + 1) foundcell
+
+main =
+  let bytes = read_bytes "/tmp/ais_win.s16"
+  let nb = (arr_len bytes) / 2
+  if nb < 100 then
+    let _ = print "NO_DATA"
+    0
+  else
+    let samp = arr_new nb 0
+    let _ = load_s16 bytes nb samp 0
+    let meanv = mean_of samp nb
+    let foundcell = arr_new 1 0
+    let _ = sweep samp nb meanv 1 0 foundcell
+    let _ = if (arr_get foundcell 0) == 0 then sweep samp nb meanv (0 - 1) 0 foundcell else 0
+    let _ = if (arr_get foundcell 0) == 0 then print "NO_DECODE" else 0
+    0

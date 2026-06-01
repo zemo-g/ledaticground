@@ -62,4 +62,12 @@ ck "crc16/x25 check value 0x906e" "$o" "MATCH=1"
 $PY scripts/gen_ais_msg.py >/dev/null 2>&1; $PY scripts/gen_ais_frame.py >/dev/null 2>&1
 $RN src/ais_deframe.rail >/dev/null 2>&1; o=$(perl -e 'alarm 60;exec @ARGV' /tmp/rail_out 2>/dev/null)
 ck "ais hdlc deframe CRC ok" "$o" "CRC_OK=1"
+# AIS rung: full real-off-air decoder on a committed REAL roof burst (USCG base 003669778)
+$RN src/ais_decode.rail >/dev/null 2>&1; cp tests/fixtures/ais_burst_real.s16 /tmp/ais_win.s16
+o=$(perl -e 'alarm 60;exec @ARGV' /tmp/rail_out 2>/dev/null)
+ck "ais real-burst decode (off-air)" "$o" "mmsi=3669778"
+# AIS rung: attested reception receipt (Ed25519 sign + self-verify + tamper)
+printf 'selftest-ais-product\n' > /tmp/ais_decoded.txt; echo "0" > /tmp/ais_pulse.txt
+o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/ais_attest.rail 2>/dev/null)
+ck "ais attest verify=1" "$o" "own-sig accepted = 1"; ck "ais attest tamper=0" "$o" "modified-msg accepted = 0"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]
