@@ -11,8 +11,11 @@ PI=${PI_USER:-ledatic}@${PI_HOST:-ledaticground-node}
 PY=/opt/homebrew/bin/python3.11
 SECS=${AIS_SECS:-25}            # capture length per cycle
 CYCLE=${AIS_CYCLE:-300}         # seconds between cycles (decode-on-Pi has no big pull, so tighter)
+CHAR_EVERY=${CHAR_EVERY:-6}     # run the RFML characterizer every Nth cycle (the node says what it hears)
+CHAR_SECS=${CHAR_SECS:-3}       # short capture — pure-python FFT on the Zero is CPU-heavy
 MON=/tmp/ais_monitor.log
 LOG="$GD/data/vessel_log.jsonl"
+CHARLOG="$GD/data/characterize_log.jsonl"
 echo "$(date -u +%FT%TZ)  ais_monitor START (decode-on-Pi, dual-channel, exhaustive) — ${SECS}s every ${CYCLE}s" >> "$MON"
 
 CYC=0
@@ -41,5 +44,19 @@ while true; do
     "import sys,json; ts=int(sys.argv[1]); [print(json.dumps({**json.loads(l),'ts':ts})) for l in sys.stdin]" \
     "$ts" >> "$LOG"
   echo "$(date -u +%FT%TZ)  ch${CH} ${meta:-no-meta} | decoded $n sources" >> "$MON"
+  # periodic RFML characterize: the Rail-trained model (pure-python on the Pi) reports WHAT the
+  # node is hearing (class + params), not just decoded AIS — short capture, occasional, so the
+  # CPU-heavy pure-python FFT doesn't tax the power bank. Ships compact JSON like the decode path.
+  if [ $((CYC % CHAR_EVERY)) -eq 0 ]; then
+    cout=$(perl -e 'alarm 150; exec @ARGV' ssh -o ConnectTimeout=12 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$PI" \
+      "timeout $((CHAR_SECS+3)) rtl_fm -f $FREQ -M fm -s 48000 -g 40 -l 0 /tmp/char.s16 2>/dev/null; \
+       timeout 120 python3 /home/ledatic/pi_characterize.py /tmp/char.s16 /home/ledatic/audio_softmax.txt 2>/dev/null" 2>/dev/null | grep '^{')
+    if [ -n "$cout" ]; then
+      printf '%s\n' "$cout" | "$PY" -c \
+        "import sys,json; ts=int(sys.argv[1]); ch=sys.argv[2]; [print(json.dumps({**json.loads(l),'ts':ts,'ch':ch})) for l in sys.stdin]" \
+        "$ts" "$CH" >> "$CHARLOG"
+      echo "$(date -u +%FT%TZ)  ch${CH} CHARACTERIZE $cout" >> "$MON"
+    fi
+  fi
   sleep "$CYCLE"
 done

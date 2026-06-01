@@ -107,6 +107,11 @@ fft re im n =
 
 fsign x = if x > 0.0 then 1.0 else (if x < 0.0 then (0.0 - 1.0) else 0.0)
 
+-- space-joined float range [start,end) for the weight dump the Pi loads
+frange arr start end acc =
+  if start >= end then acc
+  else frange arr (start + 1) end (cat [acc, " ", show_float (float_arr_get arr start)])
+
 -- ---- feature accumulators (identical math to src/modfeat.rail / Python feats()) ----
 sumf f i n cell =
   if i >= n then 0
@@ -443,4 +448,16 @@ main =
                     " msk=", show (arr_get counts 4)]
   let _ = write_file "/tmp/modclass_result.txt" result
   let _ = print "WROTE /tmp/modclass_result.txt"
+  -- export the Rail-trained model so the edge node (pi_characterize.py) runs THIS model
+  let dump = join "\n" ["# audio softmax (rail-trained); classes: noise carrier afsk fsk msk; 10 feats: rough zcr flat peak cent kurt bimod hf lf dom",
+                        cat ["MU", frange mu 0 10 ""],
+                        cat ["SG", frange sg 0 10 ""],
+                        cat ["W0", frange W 0 10 ""],
+                        cat ["W1", frange W 10 20 ""],
+                        cat ["W2", frange W 20 30 ""],
+                        cat ["W3", frange W 30 40 ""],
+                        cat ["W4", frange W 40 50 ""],
+                        cat ["B", frange b 0 5 ""]]
+  let _ = write_file "models/audio_softmax.txt" dump
+  let _ = print "WROTE models/audio_softmax.txt"
   0

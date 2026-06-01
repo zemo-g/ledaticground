@@ -47,8 +47,17 @@ Four bricks on top of the audio characterizer, all pure Rail, all validated agai
   IQ → 98% idle noise + the burst windows read as `fsk`/`qpsk`** — GMSK is constant-envelope FM, so
   `fsk` is the right neighbour; the fsk↔qpsk split is honest (GMSK isn't exactly any synthetic class).
 
-selftest **28/28**. The audio + IQ characterizers together cover both domains the node produces;
-LRPT (QPSK) now has a home in the IQ characterizer.
+- **Live on the roof Pi** (`scripts/pi_characterize.py`, `models/audio_softmax.txt`): training stays
+  in Rail on the Mini (`modclass.rail` exports the trained weights); the Pi runs **lightweight
+  pure-Python inference, NO numpy** (own radix-2 FFT), like `pi_ais_decode`. It reproduces the Rail
+  model **bit-identically** on `ais_clean_a` (noise=528/msk=13) at 7 ms/window. **Deployed and
+  live-tested:** a 3 s roof capture → 60 windows → 58 noise + **2 msk** (real AIS bursts flagged in
+  real time), Pi at 60.7 °C. Wired into `ais_monitor.sh` as a periodic step (every 6th cycle, short
+  capture) → `data/characterize_log.jsonl`. The node now **says what it hears**, not just decodes the
+  AIS we hand-coded.
+
+selftest **29/29**. The audio + IQ characterizers together cover both domains the node produces;
+LRPT (QPSK) now has a home in the IQ characterizer; and the audio model runs live at the edge.
 
 ## What this is (and what it is not)
 

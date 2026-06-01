@@ -99,4 +99,9 @@ $PY scripts/gen_modclass_iq.py >/dev/null 2>&1
 $RN src/modclass_iq.rail >/dev/null 2>&1
 o=$(perl -e 'alarm 150;exec @ARGV' /tmp/rail_out 2>/dev/null)
 ck "rfml IQ characterizer held-out >=95% (rail-trained)" "$o" "accuracy: 29[0-9]/300"
+# RFML rung: edge characterizer (pure-python, NO numpy — the Pi path) runs the Rail-trained
+# weights (models/audio_softmax.txt, written by the modclass gate above) on a known signal.
+$PY -c "import numpy as np,scripts.gen_modclass as G;r=np.random.default_rng(7);np.concatenate([G.make_window('fsk',4096,r) for _ in range(20)]).tofile('/tmp/char_test.s16')"
+o=$($PY scripts/pi_characterize.py /tmp/char_test.s16 models/audio_softmax.txt 2>/dev/null)
+ck "rfml edge characterizer (pure-python, rail weights)" "$o" "\"fsk\": [12][0-9]"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]
