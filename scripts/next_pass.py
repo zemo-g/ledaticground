@@ -21,4 +21,4 @@ for l in out.split('\n'):
     if best is None or mins<best[1]: best=(cur,mins,dur,elev)
 if best is None: print("NONE"); sys.exit(0)
 sat,mins,dur,elev=best
-print(f"SAT={sat} MINS={mins} DUR={dur} ELEV={elev} FREQ={FREQ[sat]} AOS_EPOCH={int(time.time())+mins*60}")
+print(f'SAT="{sat}" MINS={mins} DUR={dur} ELEV={elev} FREQ={FREQ[sat]} AOS_EPOCH={int(time.time())+mins*60}')

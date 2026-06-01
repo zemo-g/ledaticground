@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.ledatic.ledaticground</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>/Users/ledaticempire/projects/ledaticground/scripts/orchestrate.sh</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>PI_HOST</key><string>ledaticground-node</string></dict>
+  <key>WorkingDirectory</key><string>/Users/ledaticempire/projects/ledaticground</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/ledaticground_orch.log</string>
+  <key>StandardErrorPath</key><string>/tmp/ledaticground_orch.log</string>
+</dict></plist>
