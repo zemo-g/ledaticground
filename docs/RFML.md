@@ -25,6 +25,31 @@ Artifacts: `scripts/gen_modclass.py` (corpus) · `scripts/modclass_proto.py` (Py
 nearest-centroid floor) · `src/modfeat.rail` (Rail feature extractor) · `src/modclass.rail` (Rail
 feature-extract + softmax SGD + eval) · selftest gate "rfml modclass held-out >=95%".
 
+## Extensions (2026-06-01 cont.) — params, attestation, IQ sibling
+
+Four bricks on top of the audio characterizer, all pure Rail, all validated against the Python oracle:
+
+- **Parameter head** (`src/modparam.rail`, `scripts/modparam_proto.py`): beyond the class, estimate
+  per-window **center** (mean inst-freq, Hz), **baud** (symbol rate via autocorr first-zero), and
+  **snr** (spectral peak-to-average, dB) so the node routes *with* parameters. Rail matches Python to
+  ~10 decimals. Baud is exact for square FSK (1200.8 vs 1200); Gaussian-MSK reads lower (ISI) and
+  oscillatory AFSK reflects its tone — documented limits, best aggregated over windows; the **class
+  stays authoritative** for known protocols.
+- **Attested characterization** (`src/modclass_attest.rail`): binds the Rail-trained classifier's
+  output over a capture to the node under an Ed25519 signature, hash-chained, verify=1/tamper=0 — the
+  `ais_attest` pattern applied to RFML. **Closes the PAOS provenance loop:** *this node characterized
+  this capture, this way, at this time.* `modclass.rail` writes the `RFML_CHAR` product the receipt binds.
+- **IQ-domain characterizer** (`src/modclass_iq.rail`, `gen_modclass_iq.py`, `modclass_iq_proto.py`):
+  the sibling for *coherent* modulations (PSK), which live in complex baseband, not FM-demod audio.
+  cu8 @ 240 kHz (the real roof format). 5 classes {noise, cw, bpsk, qpsk, fsk}, 8 scale-invariant
+  complex features (incl. the 2nd-moment cumulant that splits BPSK/QPSK). **Gate A: softmax trained
+  in Rail = 294/300 = 98.0%** (Python 99.7%, nearest-centroid floor 97.7%). **Gate B: real roof AIS
+  IQ → 98% idle noise + the burst windows read as `fsk`/`qpsk`** — GMSK is constant-envelope FM, so
+  `fsk` is the right neighbour; the fsk↔qpsk split is honest (GMSK isn't exactly any synthetic class).
+
+selftest **28/28**. The audio + IQ characterizers together cover both domains the node produces;
+LRPT (QPSK) now has a home in the IQ characterizer.
+
 ## What this is (and what it is not)
 
 The romantic version — *"an LLM that learns to cipher/uncipher any band"* — hits three walls:

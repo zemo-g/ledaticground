@@ -94,4 +94,9 @@ ck "rfml param head recovers 2400Hz carrier center" "$o" "center=2[34][0-9][0-9]
 printf 'RFML_CHAR selftest noise=528 msk=13\n' > /tmp/modclass_result.txt
 o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/modclass_attest.rail 2>/dev/null)
 ck "rfml attest verify=1" "$o" "own-sig accepted = 1"; ck "rfml attest tamper=0" "$o" "modified-msg accepted = 0"
+# RFML rung: IQ-domain characterizer TRAINED IN RAIL (coherent modulations in complex baseband)
+$PY scripts/gen_modclass_iq.py >/dev/null 2>&1
+$RN src/modclass_iq.rail >/dev/null 2>&1
+o=$(perl -e 'alarm 150;exec @ARGV' /tmp/rail_out 2>/dev/null)
+ck "rfml IQ characterizer held-out >=95% (rail-trained)" "$o" "accuracy: 29[0-9]/300"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]
