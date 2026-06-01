@@ -226,9 +226,14 @@ z·conj(z₋₁) — no atan2) + per-symbol integrate-and-slice recovers bits. v
 GMSK: **BER 0.0000 @ 15 dB, 0.005 @ 10 dB**, degrades near 3 dB (normal for a
 discriminator demod; real AIS from ships is strong). Float sums in array cells (self-loop-safe).
 
-**Remaining AIS rungs:** clock recovery (Gardner) · NRZI decode · HDLC deframe (0x7E
-flags + bit-destuff) · CRC-16-CCITT · 6-bit AIS payload parse (MMSI/lat/lon/speed/course).
-Tie-in: a live Detroit-River vessel feed for the Great Lakes logistics work.
+**Rung 2 — Type-1 parser ✅** `src/ais_parse.rail`: 168-bit payload -> message type, MMSI,
+lon/lat (28/27-bit two's-complement, 1/600000 deg), SOG, COG, per the AIS bit-field spec.
+Big-endian bit-fold via int array-cell accumulator. vs a known encoded ship report:
+**MMSI + lat/lon + sog + cog all exact** (MMSI 366123456, 0.0/-0.0, 7.2 kn).
+
+**Remaining AIS rungs (the middle that chains demod->parser):** clock recovery (Gardner) ·
+NRZI decode · HDLC deframe (0x7E flags + bit-destuff) · CRC-16-CCITT. Tie-in: a live
+Detroit-River vessel feed for the Great Lakes logistics work.
 
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →

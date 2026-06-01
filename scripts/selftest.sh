@@ -50,4 +50,9 @@ $PY scripts/gen_ais.py --n 2000 --snr 15 >/dev/null 2>&1; $RN src/gmsk.rail >/de
 perl -e 'alarm 120;exec @ARGV' /tmp/rail_out > /tmp/gmsk_out.txt 2>/dev/null
 if $PY scripts/gmsk_check.py /tmp/gmsk_out.txt >/dev/null 2>&1; then g=OK; else g=BAD; fi
 ck "ais gmsk demod BER<2%" "$g" "OK"
+# AIS rung: Type-1 payload parser -> MMSI / lat / lon / sog / cog
+$PY scripts/gen_ais_msg.py >/dev/null 2>&1; $RN src/ais_parse.rail >/dev/null 2>&1
+perl -e 'alarm 60;exec @ARGV' /tmp/rail_out > /tmp/ais_parse_out.txt 2>/dev/null
+if $PY scripts/ais_parse_check.py /tmp/ais_parse_out.txt >/dev/null 2>&1; then a=OK; else a=BAD; fi
+ck "ais type1 parse MMSI+lat/lon" "$a" "OK"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

@@ -1,0 +1,72 @@
+-- ledaticground AIS rung: Type 1 position-report parser (pure Rail).
+-- Given the 168-bit AIS payload (one byte per bit in /tmp/ais_msg.bits), extract the
+-- ship fields per the AIS bit-field spec: message type, MMSI, longitude, latitude,
+-- speed-over-ground, course-over-ground. Big-endian bit packing; lon/lat are two's-
+-- complement (1/600000 deg). This is the payoff end — bits -> actual ship position.
+-- Bit folding uses an int array-cell accumulator so the loop carries only int indices.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- fold bits [start, start+n) big-endian into an int (cell accumulator -> self-loop-safe)
+gb_acc bits start n i cell =
+  if i >= n then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) * 2 + (arr_get bits (start + i)))
+    gb_acc bits start n (i + 1) cell
+getbits bits start n =
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 0
+  let _ = gb_acc bits start n 0 cell
+  arr_get cell 0
+
+-- two's-complement sign extension over nbits
+ipow2 n = if n == 0 then 1 else 2 * ipow2 (n - 1)
+signext v nbits =
+  let half = ipow2 (nbits - 1)
+  if v >= half then v - (ipow2 nbits) else v
+
+main =
+  let bits = read_bytes "/tmp/ais_msg.bits"
+  let nb = arr_len bits
+  let mtype = getbits bits 0 6
+  let mmsi = getbits bits 8 30
+  let sogr = getbits bits 50 10
+  let lonr = signext (getbits bits 61 28) 28
+  let latr = signext (getbits bits 89 27) 27
+  let cogr = getbits bits 116 12
+  let lon = (int_to_float lonr) / 600000.0
+  let lat = (int_to_float latr) / 600000.0
+  let sog = (int_to_float sogr) / 10.0
+  let cog = (int_to_float cogr) / 10.0
+  let _ = print (cat ["INFO payload_bits=", show nb])
+  let _ = print (cat ["TYPE=", show mtype])
+  let _ = print (cat ["MMSI=", show mmsi])
+  let _ = print (cat ["LAT=", show_float lat])
+  let _ = print (cat ["LON=", show_float lon])
+  let _ = print (cat ["SOG=", show_float sog])
+  let _ = print (cat ["COG=", show_float cog])
+  0
