@@ -1,0 +1,84 @@
+-- ledaticground AIS rung 1: GMSK demodulator (pure Rail).
+-- AIS is MSK (9600 baud, +/-2400 Hz dev). A differential phase discriminator recovers
+-- the instantaneous-frequency sign per sample: disc[n] = Q[n]*I[n-1] - I[n]*Q[n-1]
+-- (the imaginary part of z[n]*conj(z[n-1]) — same idea as the FM demod, no atan2 needed).
+-- Integrate disc over each symbol window and slice the sign -> bit. Reads int8 IQ from
+-- /tmp/ais_gmsk.s8 (sps=10, known timing for this rung; clock recovery is a later rung).
+-- Floats accumulate in array cells so the loops carry only int indices (self-loop-safe).
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 sample at byte index k -> float
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- disc[n] = Q[n]*I[n-1] - I[n]*Q[n-1]
+fill_disc bytes nsamp disc n =
+  if n >= nsamp then 0
+  else
+    let in0 = isig bytes (2 * n)
+    let qn0 = isig bytes (2 * n + 1)
+    let ip = isig bytes (2 * (n - 1))
+    let qp = isig bytes (2 * (n - 1) + 1)
+    let _ = float_arr_set disc n (qn0 * ip - in0 * qp)
+    fill_disc bytes nsamp disc (n + 1)
+
+-- sum disc over [start, start+n) into acc[0] (cell accumulator; recursion carries only i)
+sum_win disc start n i acc =
+  if i >= n then 0
+  else
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get disc (start + i)))
+    sum_win disc start n (i + 1) acc
+
+do_syms disc nsym sps k acc outbits =
+  if k >= nsym then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = sum_win disc (k * sps) sps 0 acc
+    let s = float_arr_get acc 0
+    let _ = arr_set outbits k (if s > 0.0 then 1 else 0)
+    do_syms disc nsym sps (k + 1) acc outbits
+
+bitstr outbits i n acc =
+  if i >= n then acc
+  else bitstr outbits (i + 1) n (cat [acc, show (arr_get outbits i)])
+
+main =
+  let bytes = read_bytes "/tmp/ais_gmsk.s8"
+  let len = arr_len bytes
+  let nsamp = len / 2
+  let sps = 10
+  let disc = float_arr_new nsamp 0.0
+  let _ = fill_disc bytes nsamp disc 1
+  let nsym = nsamp / sps
+  let outbits = arr_new nsym 0
+  let acc = float_arr_new 1 0.0
+  let _ = print (cat ["INFO samples=", show nsamp, " sps=", show sps, " symbols=", show nsym])
+  let _ = do_syms disc nsym sps 0 acc outbits
+  let _ = print (cat ["BITS ", bitstr outbits 0 nsym ""])
+  0

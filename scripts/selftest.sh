@@ -45,4 +45,9 @@ $PY scripts/gen_derand.py >/dev/null 2>&1; $RN src/derand.rail >/dev/null 2>&1
 perl -e 'alarm 60;exec @ARGV' /tmp/rail_out > /tmp/derand_out.txt 2>/dev/null
 if $PY scripts/derand_check.py /tmp/derand_out.txt >/dev/null 2>&1; then d=OK; else d=BAD; fi
 ck "ccsds derandomizer matches published" "$d" "OK"
+# AIS rung: GMSK discriminator demod recovers MSK bits (9600 baud)
+$PY scripts/gen_ais.py --n 2000 --snr 15 >/dev/null 2>&1; $RN src/gmsk.rail >/dev/null 2>&1
+perl -e 'alarm 120;exec @ARGV' /tmp/rail_out > /tmp/gmsk_out.txt 2>/dev/null
+if $PY scripts/gmsk_check.py /tmp/gmsk_out.txt >/dev/null 2>&1; then g=OK; else g=BAD; fi
+ck "ais gmsk demod BER<2%" "$g" "OK"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

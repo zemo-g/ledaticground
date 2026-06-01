@@ -215,6 +215,21 @@ coords with no code change, which is also exactly what the live 2-station TDOA /
 bundle needs. 137 MHz V-dipole spec: two 53.4 cm legs at 120°, horizontal, N–S.
 selftest 14/14.
 
+### AIS decode chain (162 MHz ship tracking — Detroit River / Great Lakes) — in progress
+The roof node hears the marine VHF band strongly (162 MHz peak ~18x noise floor, both
+AIS channels 161.975/162.025 lit at ~9-11x) — even on the 137-tuned V-dipole. Building
+the AIS decoder bottom-up, same falsify-each-rung method as LRPT.
+
+**Rung 1 — GMSK demod ✅** `src/gmsk.rail`: AIS is MSK (9600 baud, +/-2400 Hz dev). A
+differential phase discriminator (`disc[n]=Q[n]I[n-1]-I[n]Q[n-1]`, the imag part of
+z·conj(z₋₁) — no atan2) + per-symbol integrate-and-slice recovers bits. vs synthetic
+GMSK: **BER 0.0000 @ 15 dB, 0.005 @ 10 dB**, degrades near 3 dB (normal for a
+discriminator demod; real AIS from ships is strong). Float sums in array cells (self-loop-safe).
+
+**Remaining AIS rungs:** clock recovery (Gardner) · NRZI decode · HDLC deframe (0x7E
+flags + bit-destuff) · CRC-16-CCITT · 6-bit AIS payload parse (MMSI/lat/lon/speed/course).
+Tie-in: a live Detroit-River vessel feed for the Great Lakes logistics work.
+
 ### Foundation status vs V100_BLUEPRINT
 The entire single-station v0.x→v1 chain (predict → capture → spectrum → demod →
 decode → attest) is built and falsified. v10+ (multi-station mesh,
