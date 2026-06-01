@@ -22,6 +22,20 @@ mast + clear-sky location is the asset; mount a purpose-built 137 antenna up the
 - Better (optional, later): a **QFH** (quadrifilar helix) matches the satellites' circular
   polarization and fades less, but it's fiddlier to build. V-dipole first.
 
+## Deployment site: rooftop ~1 mile away (preferred)
+
+A roof beats the friend's HF antenna — unobstructed sky view is what 137 MHz wants.
+1 mile is negligible for pass prediction (reuse the regional schedule from
+`passes.rail`). Rooftop practicalities:
+- **Power:** Pi Zero 2 W + SDR need ~5 V / 1.5 A. Roof outlet, or a long USB run from
+  inside, or a battery/solar pack for passes only.
+- **Weatherproofing:** it's outdoors — Pi + SDR in a sealed IP65 box, antenna outside
+  it, a drip loop on the coax. Vent to avoid condensation.
+- **WiFi + Tailscale:** confirm the building WiFi reaches the roof; Tailscale gives the
+  Mini a stable path regardless of the local network.
+- **Baseline note:** a 1-mile site is for IMAGES, not TDOA. For the live two-station
+  TDOA/bundle, the *second* site (e.g. the friend's) must be ~10+ km away.
+
 ## Pi Zero 2 W setup (capture node)
 
 ```bash
