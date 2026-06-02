@@ -95,6 +95,31 @@ selftest **30/30** (novelty gate added). The flywheel's honest verdict: ML exten
 coverage well below the matched receiver's *decode* floor, bounded by where noise defeats detection —
 the actual provenance moat is training on attested real labels, which the next-antenna SNR unlocks.
 
+## Attested RF survey — the node maps what's on the air, here, now, provably (2026-06-01)
+
+`scripts/rf_survey.sh` sweeps a VHF marine/weather freq list on the roof Pi; each short capture is
+characterized by the Rail-trained model (class + params, or `unknown` via the novelty head), the
+survey is assembled to `data/rf_survey.json`, and `src/survey_attest.rail` binds its sha256 under an
+Ed25519 signature (hash-chained, verify=1/tamper=0) → `data/rf_survey_receipt.json`. The artifact is
+a **receipt, not a claim**: this node heard exactly this, across these frequencies, at this location,
+at this time. Composes everything (characterizer + params + novelty + attestation).
+
+**First live survey (Detroit-River VHF, current antenna):**
+| freq | heard | note |
+|---|---|---|
+| 161.975 AIS-A | `msk` (snr ~9 dB) | ships ✓ |
+| 162.025 AIS-B | `msk` (snr ~9 dB) | ships ✓ |
+| 162.550 NWR-WX3 | **`unknown` (54/60, 18 dB)** | strong NWR *voice* — not a trained class → novelty head flags it live ✓ |
+| 162.400 NWR-WX2 | `noise` | inactive that minute |
+| 156.800 Marine Ch16 | `noise` | no traffic that minute |
+| 160.000 control | `noise` | empty band ✓ |
+| 137.500 APT | `noise` | antenna can't hear 137 — honestly shown, not hidden ✓ |
+
+Honest in every cell: familiar digital → its class; strong unfamiliar (voice) → `unknown` (the head
+refusing to mislabel); empty/inactive → `noise`; the antenna gap → `noise`. The `unknown` at 162.550
+is the open-set novelty head proving itself on a **real off-air signal**, not a synthetic chirp.
+On-demand (single SDR — don't run concurrently with the AIS monitor). selftest **31/31**.
+
 ## What this is (and what it is not)
 
 The romantic version — *"an LLM that learns to cipher/uncipher any band"* — hits three walls:

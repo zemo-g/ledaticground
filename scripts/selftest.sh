@@ -108,4 +108,8 @@ ck "rfml edge characterizer (pure-python, rail weights)" "$o" "\"fsk\": [12][0-9
 $PY -c "import numpy as np,scripts.modnovelty_proto as N;r=np.random.default_rng(5);np.concatenate([N.novel_window('chirp',4096,r).astype('<i2') for _ in range(40)]).tofile('/tmp/chirp40.s16')"
 o=$($PY scripts/pi_characterize.py /tmp/chirp40.s16 models/audio_softmax.txt models/audio_novelty.txt 2>/dev/null)
 ck "rfml novelty flags a novel modulation UNKNOWN" "$o" "\"unknown_windows\": [23][0-9]"
+# RF-survey rung: attested RF-survey receipt (Ed25519 sign + self-verify + tamper) over a survey JSON
+printf '{"survey":"selftest","entries":[{"freq_mhz":161.975,"heard":"msk"}]}\n' > "$GD/data/rf_survey.json"
+o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/survey_attest.rail 2>/dev/null)
+ck "rf-survey attest verify=1" "$o" "own-sig accepted = 1"; ck "rf-survey attest tamper=0" "$o" "modified-msg accepted = 0"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]
