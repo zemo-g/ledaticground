@@ -23,7 +23,8 @@ commercial (Lakes), decode-floor-is-the-moat chain. **137 weather is its own nod
 
 | # | Item | ~$ | What it unlocks for us |
 |---|---|---|---|
-| 1 | **u-blox NEO-M8N GPS breakout (PPS/TIMEPULSE pin)** → Pi GPIO + `gpsd`/`chrony` | 22 | **#1 thesis win.** Real `geo=` (lat/lon) + GPS-locked time in every attestation receipt — the field that reads `PENDING_needs_GPS_PPS` becomes real. PPS-marks capture boundaries for coarse TDOA. *(NEO-M9N breakout is $40–70 + ~26-wk lead — overkill; M8N PPS suffices.)* |
+| 1 | **SparkFun GNSS L1/L5 Breakout — u-blox NEO-F10N, SMA** (PPS broken out to header) → Pi UART + GPIO, 3.3 V logic, `gpsd`/`chrony` | 40 | **#1 thesis win.** Real `geo=` (lat/lon) + GPS-locked time in every attestation receipt — the field that reads `PENDING_needs_GPS_PPS` becomes real. PPS-marks capture boundaries for coarse TDOA. *(ORDERED. L1/L5 dual-band → better fix in urban/roof multipath. The F10**N** is the nav variant; its PPS is plenty for us. The F10**T** is the timing-grade sibling — save that for the fine-TDOA/GPSDO tier.)* |
+| 1b | **Active GNSS antenna, SMA** — L1 (~$18) or L1/L5 (~$40) for the dual-band benefit | 18 | The F10N breakout needs an active antenna (not included); the SMA board biases it. L1 alone suffices for time+position; L1/L5 unlocks the multipath edge. |
 | 2 | **Uputronics 162 MHz Filtered Preamplifier** (PSA4-5043+, 20 dB @161 MHz, 161 MHz SAW 7.6 MHz BW + FM high-pass) | 48 | Mast LNA → pushes the **AIS decode floor down** (the moat). **FILTERED is essential here:** we decode the local USCG base, so we are *not* RF-quiet — a bare wideband LNA would overload the front-end and make reception *worse*. Bias-tee or USB-C powered. |
 | 3 | **162 MHz marine collinear** (AIS-tuned high-gain omni) | 45 | Dedicated AIS gain (the 137 halo is 25 MHz away and 137-tuned — it won't serve 162 well). |
 | 4 | **Bias-tee injector + 5 V feed** *(or power the preamp via USB-C)* | 12 | Carries the preamp's DC up the coax so it can live at the antenna, before coax loss. |
@@ -31,7 +32,7 @@ commercial (Lakes), decode-floor-is-the-moat chain. **137 weather is its own nod
 | 6 | **Weatherproof enclosure + self-amalgamating tape** | 25 | Roof-survivable; seal preamp + connectors. |
 | 7 | **30 W solar panel + LiFePO4 cell + MPPT charge controller** | 70 | **Autonomy.** Pi Zero 2 W + SDR draws ~2–3 W. *(30 W not 20 W: Detroit winter days are short — size the panel + battery generously or the node browns out in December.)* |
 | — | *(reuse)* Pi + RTL-SDR v5 | 0 | Decode-on-Pi: ship JSON, not samples. |
-| | **Total** | **~262** | under $300, ~$38 headroom (→ bigger battery for winter). |
+| | **Total** | **~298** | right at $300 with an L1 antenna; ~$320 with L1/L5 → trim 30 W→20 W solar (−$15) to stay under. |
 
 ## Architecture / wiring (single band, single SDR — clean)
 
@@ -41,7 +42,7 @@ commercial (Lakes), decode-floor-is-the-moat chain. **137 weather is its own nod
                          │                                                       ▼
    solar 30W ─ MPPT ─ LiFePO4 ─ 5V ─► Pi ◄── RTL-SDR v5 ◄── bias-tee injector ◄─ LMR-240
                                        │
-                           u-blox NEO-M8N (PPS) ─► Pi GPIO   (gpsd + chrony: real time + lat/lon)
+             NEO-F10N (PPS)+active GNSS ant ─► Pi UART+GPIO (3.3V; gpsd + chrony + pps-gpio: real time + lat/lon)
                                        │
                             rail_native decode + pi_characterize ──► attested JSON over WiFi
 ```
@@ -52,9 +53,10 @@ preamp sets the noise figure; the bias-tee powers it up the coax. One antenna, o
 
 ## Build / install order
 
-1. **Bench-first:** wire the u-blox to the Pi (UART + PPS→GPIO), `gpsd` + `chrony`, confirm a 3-D fix
-   + PPS lock. Write the real lat/lon to `data/station_geo.txt` (the attest scripts read it → real
-   receipts).
+1. **Bench-first:** wire the F10N to the Pi — 3.3 V logic so UART TX/RX go straight to the Pi UART,
+   PPS → a Pi GPIO (enable the `pps-gpio` device-tree overlay), then `gpsd` + `chrony`. Confirm a 3-D
+   fix + PPS lock (`ppstest`). Write the real lat/lon to `data/station_geo.txt` (the attest scripts
+   read it → real receipts). The SMA active antenna needs clear sky view; the board biases it.
 2. Mount the 162 collinear; preamp in the enclosure *at the antenna*; seal everything.
 3. Bias-tee at the SDR end; confirm the preamp powers up (DC continuity / current draw).
 4. Run `scripts/antenna_score.sh 162` + `ais_groundtruth.py` to **measure** the gain vs the recorded
@@ -97,3 +99,7 @@ fixes *provability*.
 - ⚠️ A bare wideband mast LNA can **overload** the RX near strong AIS/FM (our case) → must be filtered.
 - ❌ GPS "$25 NEO-M9N" — usable M9N breakout is $40–70 + 26-wk lead → ✅ NEO-M8N (~$22, has PPS).
 - ❌ Two bands merged onto one SDR/coax — needs a diplexer/switch → ✅ scope to one band per node.
+- 🛒 **2026-06-02: GPS part ordered = SparkFun NEO-F10N L1/L5 breakout ($40, PPS verified on the
+  header).** Upgrade from the budget M8N — better urban/roof fix. Needs an active SMA GNSS antenna
+  (+$18 L1 / +$40 L1/L5). Note it's the F10**N** (nav); the F10**T** is the timing-grade sibling for
+  the future fine-TDOA tier.
