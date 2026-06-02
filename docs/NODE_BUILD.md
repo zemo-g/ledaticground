@@ -63,6 +63,23 @@ preamp sets the noise figure; the bias-tee powers it up the coax. One antenna, o
    baseline (measure, don't claim) — and watch for *over*load (FPR / desense near the USCG base).
 5. Solar last; confirm a full night on battery, then it's autonomous.
 
+## Compute (the Pi) — keep the Zero 2 W, or Pi 4 *only* for Rail-native-on-node
+
+For a mostly-idle **solar** node, **idle power dominates the battery budget, not peak compute** (the
+node idles ~95% of the time between captures). Verified idle draw: **Zero 2 W ~0.4 W · Pi 4 ~1.0 W ·
+Pi 5 ~3.0 W** (3× the Pi 4, + active cooling). Load is similar and brief (~2 / 6 / 9 W).
+
+- **Keep the Pi Zero 2 W** (current, $15, lowest power) — it runs the pure-Python ports fine; ideal
+  for solar. Default choice.
+- **Pi 4 (4 GB, ~$80)** is the *only* worthwhile upgrade, and for *one* on-thesis reason: with 4 GB
+  the node runs the **actual `rail_native` binaries** instead of the `pi_*.py` reimplementations —
+  the substrate thesis to the edge — plus real-time characterization + USB3 for a future wideband
+  SDR. Still solar-friendly (~1 W idle). Adds ~$80 → breaks the $300 line (separate decision).
+- **Do NOT use a Pi 5 here.** Its 3× idle draw roughly triples overnight battery drain and forces a
+  ~50–60 W panel; its win is compute the node deliberately doesn't do (heavy ML lives on the Studio).
+- *(2026 DRAM shortage → 4 GB boards ~$80 + volatile; a Pi 4 2 GB ~$45 can still RUN cross-compiled
+  Rail ELFs, just not self-compile.)*
+
 ## Honest caveats
 
 - **Fine TDOA is NOT in this tier.** The RTL-SDR can't take an external 10 MHz reference, so the
