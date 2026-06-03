@@ -24,7 +24,7 @@ mast + clear-sky location is the asset; mount a purpose-built 137 antenna up the
 
 ## Deployment site: rooftop ~1 mile away (preferred)
 
-A roof beats the friend's HF antenna — unobstructed sky view is what 137 MHz wants.
+A roof beats the the operator's HF antenna — unobstructed sky view is what 137 MHz wants.
 1 mile is negligible for pass prediction (reuse the regional schedule from
 `passes.rail`). Rooftop practicalities:
 - **Power:** Pi Zero 2 W + SDR need ~5 V / 1.5 A. Roof outlet, or a long USB run from
@@ -34,7 +34,7 @@ A roof beats the friend's HF antenna — unobstructed sky view is what 137 MHz w
 - **WiFi + Tailscale:** confirm the building WiFi reaches the roof; Tailscale gives the
   Mini a stable path regardless of the local network.
 - **Baseline note:** a 1-mile site is for IMAGES, not TDOA. For the live two-station
-  TDOA/bundle, the *second* site (e.g. the friend's) must be ~10+ km away.
+  TDOA/bundle, the *second* site (e.g. the the operator's) must be ~10+ km away.
 
 ## Pi Zero 2 W setup (capture node)
 
@@ -60,7 +60,7 @@ Mini:  scripts/recv_decode.sh -> decode_real_pass.sh -> image + attested receipt
                                   (station label = this node)
 ```
 
-Pass times: compute on the Mini with `src/passes.rail` (the friend's lat/lon), tell the
+Pass times: compute on the Mini with `src/passes.rail` (the the operator's lat/lon), tell the
 Pi when to record (cron or a one-shot `at`). NOAA 15/19 + METEOR schedule is the same
 sky; only the observer coords change.
 

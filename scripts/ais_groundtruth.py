@@ -13,7 +13,7 @@ written to data/groundtruth_compare.json. Needs: pip install websockets.
 """
 import sys, json, os, asyncio, time, argparse
 
-BBOX = [[[41.7, -83.3], [42.7, -82.5]]]          # our roof coverage box (Detroit R. / L.St.Clair / W.L.Erie)
+BBOX = [[[0.0, 0.0], [0.0, 0.0]]]  # set your AIS coverage box (lat/lon SW + NE corners)
 DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 VESSEL_TYPES = {1, 2, 3, 18, 19}
 
