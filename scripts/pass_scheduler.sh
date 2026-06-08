@@ -88,7 +88,13 @@ capture_iq_pass(){      # $1=sat $2=freq(Hz) $3=dur(min) $4=elev $5=mode — RAW
   # independent cross-check: satdump (reference decoder) on the SAME bytes — non-fatal, off-radio.
   # outputs-match between our decoder and satdump = the external proof (raw-IQ-first thesis).
   bash "$GD/scripts/validate_external.sh" "$loc" >/tmp/iqval.log 2>&1 || true
-  log "satdump xcheck -> ${loc%.bin}.satdump/ $(grep -qiE 'no valid wedge|Couldn.t calibrate' /tmp/iqval.log && printf '[apt:no-wedge=noise]'; grep -qiE 'Viterbi|deframer|[1-9][0-9]+ frames' /tmp/iqval.log && printf '[lrpt:frames=signal]')"
+  # honest signal tell from satdump's OWN decode OUTPUT (not module names — those appear on noise too):
+  #   LRPT -> max MSU-MR image line count (>0 = real frames decoded); APT -> wedge calibration succeeded.
+  xl=$(grep -oE "Lines  : [0-9]+" /tmp/iqval.log 2>/dev/null | grep -oE "[0-9]+$" | sort -rn | head -1)
+  if [ -n "$xl" ]; then [ "$xl" -gt 0 ] && xtag="[satdump LRPT lines=$xl -> SIGNAL]" || xtag="[satdump LRPT lines=0 -> noise]"
+  elif grep -qiE "no valid wedge|Couldn.t calibrate" /tmp/iqval.log; then xtag="[satdump APT no-wedge -> noise]"
+  else xtag="[satdump APT wedge-ok -> SIGNAL?]"; fi
+  log "satdump xcheck -> ${loc%.bin}.satdump/ $xtag"
 }
 
 run_next(){
