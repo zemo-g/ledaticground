@@ -18,6 +18,13 @@ stream = np.array([v for i in sorted(rows) for v in rows[i]], float)
 LINE = 2080
 nfull = len(stream)//LINE - 1
 
+# A no-signal pass decodes to 0 (or <2 lines'-worth of) pixels. Bail cleanly instead of
+# indexing an empty/1-D array (was: IndexError on the chA = img[:,86:995] slice). No image
+# is written, so a prior good render is never clobbered by a noise pass.
+if nfull < 1:
+    print(f"NO DECODABLE IMAGE: {len(stream)} px (<2 full {LINE}px lines) — no render")
+    sys.exit(1)
+
 # sync template: high-contrast square over first ~39 px (matches synthetic;
 # for real NOAA-APT use the 1040 Hz / 2-px-period Sync-A pattern)
 synth = "synth" in sys.argv

@@ -29,6 +29,9 @@ echo "staged $(wc -c </tmp/apt_shift.s16) bytes -> /tmp/apt_shift.s16"
 # new antenna lands, this line jumps on its own -> the improvement is on record.
 echo "=== 137 reception quality (antenna figure-of-merit) ==="
 $PY "$GD/scripts/antenna_score.py" 137 /tmp/apt_shift.s16 "pass_$(date -u +%Y%m%dT%H%MZ)" 2>/dev/null || echo "  (score skipped)"
+RATIO=$(tail -1 "$GD/data/antenna_scores.jsonl" 2>/dev/null | $PY -c "import sys,json
+try: print(json.load(sys.stdin).get('subcarrier_2400_ratio',0))
+except Exception: print(0)" 2>/dev/null); RATIO=${RATIO:-0}
 
 echo "=== pure-Rail APT decode ==="
 perl -e 'alarm 600; exec @ARGV' "$RN" run "$GD/src/apt.rail" \
@@ -39,10 +42,23 @@ nrows=$(grep -c '^ROW' /tmp/apt_rail_real.out); echo "decoded $nrows lines"
 echo "=== host sync-lock + render (real NOAA Sync-A template) ==="
 $PY "$GD/scripts/apt_sync.py" /tmp/apt_rail_real.out "$GD/data/noaa15_real.png"
 
-echo "=== attest the real reception ==="
-cp /tmp/apt_rail_real.out /tmp/apt_rail.out   # attest.rail hashes this product
-printf 'NOAA-15\n' > "$GD/data/sat_label.txt"             # honest real label
-printf 'PENDING_needs_IQ\n' > "$GD/data/doppler_residual.txt"  # image pass, no IQ
-( cd "$RAIL" && perl -e 'alarm 120; exec @ARGV' "$RN" run "$GD/src/attest.rail" )
-echo "=== receipt ==="; cat "$GD/data/receipt.json"
-echo; echo "image -> $GD/data/noaa15_real.png"
+# HONEST SIGNAL GATE: only attest "reception" when there is actually a signal. The 2400Hz
+# subcarrier ratio is calibrated so noise reads ~4-5 and a real APT image needs WELL above
+# (>=6 here as a coarse floor; render+sync-lock is the definitive test). Signing a receipt
+# for a pure-noise capture is a FALSE attestation of reception — honest empty state wins
+# (see feedback_no_synthetic_evidence). Below the floor (or zero decoded rows), we record an
+# honest no-signal marker and do NOT sign.
+if awk "BEGIN{exit !($RATIO+0 >= 6)}" 2>/dev/null && [ "${nrows:-0}" -gt 0 ]; then
+  echo "=== attest the real reception (2400Hz ratio $RATIO >= 6, signal present) ==="
+  cp /tmp/apt_rail_real.out /tmp/apt_rail.out   # attest.rail hashes this product
+  printf 'NOAA-19\n' > "$GD/data/sat_label.txt"             # honest real label (tonight's bird)
+  printf 'PENDING_needs_IQ\n' > "$GD/data/doppler_residual.txt"  # image pass, no IQ
+  ( cd "$RAIL" && perl -e 'alarm 120; exec @ARGV' "$RN" run "$GD/src/attest.rail" )
+  echo "=== receipt ==="; cat "$GD/data/receipt.json"
+  echo; echo "image -> $GD/data/noaa15_real.png"
+else
+  echo "=== NO SIGNAL: 2400Hz ratio $RATIO < 6 (nrows=${nrows:-0}) — NOT attesting (honest no-signal) ==="
+  printf '{"status":"no_signal","band":"137","subcarrier_2400_ratio":%s,"nrows":%s,"ts":"%s"}\n' \
+    "$RATIO" "${nrows:-0}" "$(date -u +%FT%TZ)" > "$GD/data/last_no_signal.json"
+  echo "wrote honest no-signal marker -> $GD/data/last_no_signal.json"
+fi
