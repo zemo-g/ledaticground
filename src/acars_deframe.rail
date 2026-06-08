@@ -1,0 +1,158 @@
+-- ledaticground ACARS rungs 3-6: ARINC 618 deframe + parity + block-check + field parse.
+-- Reads the recovered CHARACTER stream (1 byte/char, 7 data + 1 odd-parity) from
+-- /tmp/acars_block.bytes — the output of the MSK bit recovery once bytes are framed.
+-- Pipeline (all pure Rail, loops carry int indices + array cells only):
+--   3 DEFRAME : skip pre-key, find SYN SYN (0x16 0x16) then SOH (0x01); locate STX (0x02)
+--               and ETX (0x03) / ETB (0x17); the trailing 2 bytes after ETX are the BCS,
+--               then DEL (0x7F).
+--   4 PARITY  : each char must have ODD total bits (7 data + parity). Count parity errors.
+--   5 BCS     : 16-bit CRC-CCITT (reflected poly 0x8408, init 0) over the 7-bit data of every
+--               char from the one after SOH through ETX inclusive; compare to the RX BCS
+--               (low byte first). DEL and the BCS bytes are excluded from the CRC.
+--   6 FIELDS  : mode(1) | registration/address(7) | ack(1) | label(2) | block-id(1) | text.
+-- Prints MODE/REG/ACK/LABEL/BLKID/TEXT/PARITY_ERRORS/BCS_RX/BCS_CALC/BCS_OK lines.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- 7-bit data of a char (strip the parity bit)
+data7 b = bit_and b 127
+
+-- popcount of an 8-bit value (cell accumulator; loop carries only k)
+pc_acc b k cell =
+  if k >= 8 then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (bit_and (shr b k) 1))
+    pc_acc b (k + 1) cell
+popcount b =
+  let cell = arr_new 1 0
+  let _ = pc_acc b 0 cell
+  arr_get cell 0
+-- odd parity OK if total set bits is odd
+parity_ok b = if (bit_and (popcount b) 1) == 1 then 1 else 0
+
+-- find first index >= start where bytes[i]==v AND bytes[i+1]==v (a doubled control char)
+find_double bytes n start v =
+  if (start + 1) >= n then (0 - 1)
+  else if ((data7 (arr_get bytes start)) == v) && ((data7 (arr_get bytes (start + 1))) == v) then start
+  else find_double bytes n (start + 1) v
+-- find first index >= start where bytes[i] (7-bit) == v
+find_one bytes n start v =
+  if start >= n then (0 - 1)
+  else if (data7 (arr_get bytes start)) == v then start
+  else find_one bytes n (start + 1) v
+-- find ETX(3) OR ETB(0x17=23) at/after start
+find_etx bytes n start =
+  if start >= n then (0 - 1)
+  else
+    let d = data7 (arr_get bytes start)
+    if (d == 3) || (d == 23) then start
+    else find_etx bytes n (start + 1)
+
+-- BCS: reflected CRC-CCITT over data7 of bytes[lo..hi] inclusive (init 0)
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+-- fold bytes[i..hi] (7-bit data each) into the crc cell; loop carries only the int index
+crc_acc bytes hi i cell =
+  if i > hi then 0
+  else
+    let c = bit_xor (arr_get cell 0) (data7 (arr_get bytes i))
+    let _ = arr_set cell 0 (crcbit c 0)
+    crc_acc bytes hi (i + 1) cell
+
+-- count parity errors over bytes[lo..hi] inclusive
+parity_errs bytes lo hi i cell =
+  if i > hi then arr_get cell 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (parity_ok (arr_get bytes i)) == 1 then 0 else 1))
+    parity_errs bytes lo hi (i + 1) cell
+
+-- emit chars [i..hi] as their 7-bit ASCII; caller seeds i=lo (the loop carries i + acc)
+emit_text bytes hi i acc =
+  if i > hi then acc
+  else emit_text bytes hi (i + 1) (cat [acc, char_from_int (data7 (arr_get bytes i))])
+
+main =
+  let bytes = read_bytes "/tmp/acars_block.bytes"
+  let n = arr_len bytes
+  if n < 12 then
+    let _ = print "NO_DATA"
+    0
+  else
+    -- 3 DEFRAME: find SYN SYN then SOH
+    let syn = find_double bytes n 0 22
+    if syn < 0 then
+      let _ = print "DEFRAME_FAIL no SYN SYN"
+      0
+    else
+      let soh = find_one bytes n (syn + 2) 1
+      if soh < 0 then
+        let _ = print "DEFRAME_FAIL no SOH"
+        0
+      else
+        -- header starts right after SOH
+        let h = soh + 1
+        let stx = find_one bytes n h 2
+        if stx < 0 then
+          let _ = print "DEFRAME_FAIL no STX"
+          0
+        else
+          let etx = find_etx bytes n (stx + 1)
+          if etx < 0 then
+            let _ = print "DEFRAME_FAIL no ETX/ETB"
+            0
+          else
+            -- 6 FIELDS: fixed-width header h..stx-1 = mode(1) reg(7) ack(1) label(2) blkid(1)
+            let modec = data7 (arr_get bytes h)
+            let ackc  = data7 (arr_get bytes (h + 8))
+            let blkid = data7 (arr_get bytes (h + 11))
+            let regs  = emit_text bytes (h + 7) (h + 1) ""
+            let labs  = emit_text bytes (h + 10) (h + 9) ""
+            let txt   = emit_text bytes (etx - 1) (stx + 1) ""
+            -- 5 BCS over h..etx inclusive (data after SOH up to & incl ETX)
+            let calcc = arr_new 1 0
+            let _ = arr_set calcc 0 0
+            let _ = crc_acc bytes etx h calcc
+            let bcs_calc = arr_get calcc 0
+            -- BCS bytes are RAW 8-bit (no parity, no 7-bit mask); low byte first on the wire
+            let bcs_rx_full = bit_or (arr_get bytes (etx + 1)) (shl (arr_get bytes (etx + 2)) 8)
+            -- 4 PARITY over the data chars h..etx (controls + body)
+            let perrc = arr_new 1 0
+            let _ = arr_set perrc 0 0
+            let perr = parity_errs bytes h etx h perrc
+            let _ = print (cat ["INFO chars=", show n, " syn@", show syn, " soh@", show soh, " stx@", show stx, " etx@", show etx])
+            let _ = print (cat ["MODE ", char_from_int modec])
+            let _ = print (cat ["REG ", regs])
+            let _ = print (cat ["ACK ", show ackc])
+            let _ = print (cat ["LABEL ", labs])
+            let _ = print (cat ["BLKID ", char_from_int blkid])
+            let _ = print (cat ["TEXT ", txt])
+            let _ = print (cat ["PARITY_ERRORS ", show perr])
+            let _ = print (cat ["BCS_RX ", show bcs_rx_full])
+            let _ = print (cat ["BCS_CALC ", show bcs_calc])
+            let _ = print (cat ["BCS_OK ", show (if bcs_calc == bcs_rx_full then 1 else 0)])
+            0

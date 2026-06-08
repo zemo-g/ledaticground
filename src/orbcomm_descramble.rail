@@ -1,0 +1,211 @@
+-- ledaticground Orbcomm rung: DESCRAMBLE + deframe -> packet bytes (pure Rail).
+--
+-- RUNG SPEC: "Descramble (Orbcomm self-synchronizing scrambler) + any FEC -> deframed
+-- packet bytes. Test: a scrambled known sequence descrambles back."
+--
+-- This is the END-TO-END link-layer rung: it takes the raw scrambled bitstream coming out
+-- of the differential demod and produces DEFRAMED PACKET BYTES, in four stages:
+--   (1) DESCRAMBLE  self-synchronizing (multiplicative) descrambler  x_hat[n] = y[n] ^ y[n-4] ^ y[n-7]
+--       (polynomial x^7 + x^4 + 1). It re-syncs from the received bits ALONE -- no shared
+--       seed -- which is exactly why a self-sync scrambler is correct downstream of a noisy
+--       phase-unknown LEO demod.
+--   (2) FRAME SYNC  slide a 16-bit unique word across the descrambled bits, lock the frame.
+--   (3) DEFRAME     pack the post-UW region MSB-first into PACKET BYTES (the deliverable).
+--   (4) INTEGRITY   recompute CRC-16/X-25 (poly 0x8408 reflected, init 0xFFFF, xorout 0xFFFF)
+--       over the framed (header+payload) byte region and check the trailing 16-bit FCS.
+--
+-- FEC NOTE (honest): public docs do NOT pin a citable Orbcomm convolutional/RS scheme, so no
+-- FEC stage is fabricated here. src/viterbi.rail (CCSDS r=1/2 K=7 soft Viterbi) is the drop-in
+-- reuse hook IF an Orbcomm convolutional layer is ever confirmed. The "+ any FEC" in the spec
+-- is satisfied by CRC-16 integrity (an error-DETECTING code), which IS public; an error-
+-- CORRECTING stage is documented as a hook, not invented.
+--
+-- PUBLIC vs PROPRIETARY: the descrambler taps, the unique-word value, and the header/payload
+-- field LAYOUT are illustrative synthetic stand-ins for the PUBLIC architecture (self-sync
+-- scrambler + UW frame sync + CRC integrity). The SEMANTIC meaning of header fields is NOT
+-- public and is NOT invented -- payload bytes are reported as OPAQUE packet bytes with a
+-- measured length + a recomputable CRC, never as a decoded "message".
+--
+-- Reads scrambled bits (1 byte/bit) from /tmp/orbcomm_descramble_in.bits.
+-- Prints: INFO | DESCRAM <bits> | SYNC uw_at=.. score=../16 | PKT <hex packet bytes>
+--         | CRC calc=.. rx=.. | CRC_OK=0/1 | MATCH=0/1 (descramble round-trips the known seq)
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- single-bit XOR
+xor1 a b = bit_xor a b
+
+-- tap-delayed received bit, 0 before the stream starts
+tapbit y i k = if (i - k) < 0 then 0 else arr_get y (i - k)
+
+-- ============================ STAGE 1: SELF-SYNC DESCRAMBLE ============================
+-- out[i] = y[i] ^ y[i-4] ^ y[i-7]  (received bits only; re-syncs with no seed)
+descram y n i out =
+  if i >= n then 0
+  else
+    let v = xor1 (xor1 (arr_get y i) (tapbit y i 4)) (tapbit y i 7)
+    let _ = arr_set out i v
+    descram y n (i + 1) out
+
+-- ============================ STAGE 2: UNIQUE-WORD FRAME SYNC ============================
+-- the 16-bit unique word (illustrative public-architecture stand-in)
+set_uw uw =
+  let _ = arr_set uw 0 0
+  let _ = arr_set uw 1 0
+  let _ = arr_set uw 2 1
+  let _ = arr_set uw 3 0
+  let _ = arr_set uw 4 0
+  let _ = arr_set uw 5 1
+  let _ = arr_set uw 6 1
+  let _ = arr_set uw 7 0
+  let _ = arr_set uw 8 1
+  let _ = arr_set uw 9 1
+  let _ = arr_set uw 10 1
+  let _ = arr_set uw 11 0
+  let _ = arr_set uw 12 1
+  let _ = arr_set uw 13 0
+  let _ = arr_set uw 14 0
+  let _ = arr_set uw 15 1
+  0
+
+match_cnt dec uw ulen start j cell =
+  if j >= ulen then arr_get cell 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get dec (start + j)) == (arr_get uw j) then 1 else 0))
+    match_cnt dec uw ulen start (j + 1) cell
+-- mutual recursion (best_uw/best_step) to dodge the self-loop cross-dep-arg miscompile
+best_step dec ndec uw ulen start bestcell poscell =
+  let c = arr_new 1 0
+  let sc = match_cnt dec uw ulen start 0 c
+  let _ = if sc > (arr_get bestcell 0) then
+            let _ = arr_set bestcell 0 sc
+            let _ = arr_set poscell 0 start
+            0
+          else 0
+  best_uw dec ndec uw ulen (start + 1) bestcell poscell
+best_uw dec ndec uw ulen start bestcell poscell =
+  if (start + ulen) > ndec then 0
+  else best_step dec ndec uw ulen start bestcell poscell
+
+-- ============================ STAGE 3: DEFRAME -> PACKET BYTES ============================
+-- pack 8 bits (MSB-first) from bits[base..base+8) into a byte value
+packbyte8 bits base =
+  bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (arr_get bits base) 1) (arr_get bits (base+1))) 1) (arr_get bits (base+2))) 1) (arr_get bits (base+3))) 1) (arr_get bits (base+4))) 1) (arr_get bits (base+5))) 1) (arr_get bits (base+6))) 1) (arr_get bits (base+7))
+
+-- mutual recursion to fold packed bytes into an output array (self-loop cross-dep-arg safe)
+pack_step bits nbytes b base out =
+  let _ = arr_set out b (packbyte8 bits base)
+  pack_loop bits nbytes (b + 1) (base + 8) out
+pack_loop bits nbytes b base out =
+  if b >= nbytes then 0
+  else pack_step bits nbytes b base out
+
+-- ============================ STAGE 4: CRC-16/X-25 INTEGRITY ============================
+-- reflected algorithm: poly 0x8408 = 33800, init 0xFFFF = 65535, xorout 0xFFFF
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+crcbyte crc b = crcbit (bit_xor crc b) 0
+crc_step bytes nbytes b cell =
+  let _ = arr_set cell 0 (crcbyte (arr_get cell 0) (arr_get bytes b))
+  crc_loop bytes nbytes (b + 1) cell
+crc_loop bytes nbytes b cell =
+  if b >= nbytes then arr_get cell 0
+  else crc_step bytes nbytes b cell
+crc16_x25 bytes nbytes =
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let r = crc_loop bytes nbytes 0 cell
+  bit_xor (arr_get cell 0) 65535
+
+-- read a 16-bit FCS (MSB-first) at bits[start..start+16) into an int
+fcs_read bits start j acc =
+  if j >= 16 then acc
+  else fcs_read bits start (j + 1) (bit_or (shl acc 1) (arr_get bits (start + j)))
+
+-- count differing positions across two bit arrays (descramble round-trip check)
+diff_step a b n i cell =
+  let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get a i) == (arr_get b i) then 0 else 1))
+  diffcnt a b n (i + 1) cell
+diffcnt a b n i cell =
+  if i >= n then arr_get cell 0
+  else diff_step a b n i cell
+
+-- string helpers
+bitstr out i n acc = if i >= n then acc else bitstr out (i + 1) n (cat [acc, show (arr_get out i)])
+hex1 v = let d = "0123456789abcdef" in cat [str_sub d (shr v 4) 1, str_sub d (bit_and v 15) 1]
+hexbytes bs i n acc = if i >= n then acc else hexbytes bs (i + 1) n (cat [acc, hex1 (arr_get bs i), " "])
+
+main =
+  -- ---- read scrambled bitstream + plaintext truth (to confirm the round-trip) ----
+  let y = read_bytes "/tmp/orbcomm_descramble_in.bits"
+  let n = arr_len y
+  let plain = read_bytes "/tmp/orbcomm_descramble_plain.bits"
+  let np = arr_len plain
+
+  -- ---- STAGE 1: descramble ----
+  let out = arr_new n 0
+  let _ = descram y n 0 out
+  let _ = print (cat ["INFO scrambled_bits=", show n, " taps=4,7 (x^7+x^4+1 self-sync)"])
+  let _ = print (cat ["DESCRAM ", bitstr out 0 n ""])
+
+  -- ---- descramble round-trip check vs known plaintext (the headline test) ----
+  -- the self-sync transient is the first 7 bits; compare from bit 7 onward.
+  let cell0 = arr_new 1 0
+  let nerr = diffcnt out plain (if np < n then np else n) 7 cell0
+  let _ = print (cat ["MATCH=", show (if nerr == 0 then 1 else 0), " mismatches=", show nerr])
+
+  -- ---- STAGE 2: frame sync on the descrambled bits ----
+  let uw = arr_new 16 0
+  let _ = set_uw uw
+  let bestcell = arr_new 1 0
+  let poscell = arr_new 1 0
+  let _ = best_uw out n uw 16 0 bestcell poscell
+  let uwpos = arr_get poscell 0
+  let uwsc = arr_get bestcell 0
+  let _ = print (cat ["SYNC uw_at=", show uwpos, " score=", show uwsc, " /16"])
+
+  -- ---- STAGE 3: deframe -> packet bytes ----
+  -- frame layout after the UW: [payload 144 bits OPAQUE][FCS 16 bits].
+  -- pack the (UW + payload) region into bytes; CRC covers UW..end of payload (per X.25).
+  let pay_start = uwpos + 16
+  let pay_bits = 144
+  let region_start = uwpos
+  let region_bits = 16 + pay_bits
+  let nbytes = region_bits / 8
+  let pkt = arr_new nbytes 0
+  let _ = pack_loop out nbytes 0 region_start pkt
+  let _ = print (cat ["PKT ", hexbytes pkt 0 nbytes ""])
+  let _ = print (cat ["PKT_LEN ", show nbytes, " bytes (payload semantics PROPRIETARY -- OPAQUE)"])
+
+  -- ---- STAGE 4: CRC-16/X-25 integrity over the framed region ----
+  let calc = crc16_x25 pkt nbytes
+  let fcs_start = pay_start + pay_bits
+  let rxfcs = fcs_read out fcs_start 0 0
+  let _ = print (cat ["CRC calc=", show calc, " rx=", show rxfcs])
+  let _ = print (cat ["CRC_OK=", show (if calc == rxfcs then 1 else 0)])
+  0

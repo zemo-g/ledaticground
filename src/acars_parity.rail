@@ -1,0 +1,116 @@
+-- ledaticground ACARS rung: acars_parity — per-character ODD parity + block-check (BCS).
+-- The focused integrity layer of ARINC 618, separated from the framing search. Given the
+-- run of MESSAGE characters (8-bit: 7 data + 1 odd-parity bit) followed by the 2 raw BCS
+-- bytes (low byte first), it verifies:
+--   PARITY : every char must have an ODD total bit count (popcount & 1 == 1).
+--   BCS    : 16-bit reflected CRC-CCITT (poly 0x8408, init 0) over the 7-bit DATA of every
+--            message char must equal the RX BCS (the 2 trailing bytes, low first). The BCS
+--            bytes themselves are raw 8-bit, NOT parity-protected, NOT part of the CRC.
+-- Reads TWO vectors so one run exercises both the clean and the single-bit-flip cases:
+--   /tmp/acars_parity_clean.bytes  (must pass: 0 parity errors, BCS_OK)
+--   /tmp/acars_parity_flip.bytes   (must be flagged: parity error AND BCS_OK 0)
+-- Prints, per case, lines prefixed CLEAN_ / FLIP_ so the checker can grep each.
+-- All loops carry int indices + array cells only (self-loop-safe). malloc/free are the
+-- builtins (declaring them foreign->int would corrupt the 64-bit pointer; the harmless
+-- "not defined" typecheck warnings are expected).
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+-- NUL-safe O(n) file reader -> int arr of raw bytes (arr_new 0 0 if missing).
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- 7-bit data of a char (strip the parity bit)
+data7 b = bit_and b 127
+
+-- popcount of an 8-bit value (cell accumulator; loop carries only k)
+pc_acc b k cell =
+  if k >= 8 then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (bit_and (shr b k) 1))
+    pc_acc b (k + 1) cell
+popcount b =
+  let cell = arr_new 1 0
+  let _ = pc_acc b 0 cell
+  arr_get cell 0
+-- odd-parity OK if the FULL 8-bit char has an odd number of set bits
+parity_ok b = if (bit_and (popcount b) 1) == 1 then 1 else 0
+
+-- count parity errors over bytes[0..hi] inclusive (the message chars only)
+parity_errs bytes hi i cell =
+  if i > hi then arr_get cell 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (parity_ok (arr_get bytes i)) == 1 then 0 else 1))
+    parity_errs bytes hi (i + 1) cell
+
+-- one reflected CRC bit step: crc depends only on crc + constants -> safe direct recursion
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+-- fold the 7-bit data of bytes[0..hi] into the crc cell; loop carries only the int index
+crc_acc bytes hi i cell =
+  if i > hi then 0
+  else
+    let c = bit_xor (arr_get cell 0) (data7 (arr_get bytes i))
+    let _ = arr_set cell 0 (crcbit c 0)
+    crc_acc bytes hi (i + 1) cell
+
+-- decode one vector: bytes = nmsg message chars + 2 raw BCS bytes (low first).
+-- prints "<tag>PARITY_ERRORS n", "<tag>BCS_RX v", "<tag>BCS_CALC v", "<tag>BCS_OK 0/1".
+-- returns 1 if the frame is wholly intact (0 parity errors AND BCS matches), else 0.
+decode_one bytes tag =
+  let n = arr_len bytes
+  if n < 3 then
+    let _ = print (cat [tag, "NO_DATA"])
+    0
+  else
+    -- the last 2 bytes are the BCS; everything before is the message
+    let hi = n - 3
+    -- 4 PARITY over the message chars 0..hi
+    let perrc = arr_new 1 0
+    let _ = arr_set perrc 0 0
+    let perr = parity_errs bytes hi 0 perrc
+    -- 5 BCS over the 7-bit data of message chars 0..hi
+    let calcc = arr_new 1 0
+    let _ = arr_set calcc 0 0
+    let _ = crc_acc bytes hi 0 calcc
+    let bcs_calc = arr_get calcc 0
+    -- RX BCS: raw 8-bit bytes, low byte first
+    let bcs_rx = bit_or (arr_get bytes (n - 2)) (shl (arr_get bytes (n - 1)) 8)
+    let bcs_ok = if bcs_calc == bcs_rx then 1 else 0
+    let _ = print (cat [tag, "CHARS ", show (hi + 1)])
+    let _ = print (cat [tag, "PARITY_ERRORS ", show perr])
+    let _ = print (cat [tag, "BCS_RX ", show bcs_rx])
+    let _ = print (cat [tag, "BCS_CALC ", show bcs_calc])
+    let _ = print (cat [tag, "BCS_OK ", show bcs_ok])
+    if (perr == 0) && (bcs_ok == 1) then 1 else 0
+
+main =
+  let clean = read_bytes "/tmp/acars_parity_clean.bytes"
+  let flip  = read_bytes "/tmp/acars_parity_flip.bytes"
+  let cok = decode_one clean "CLEAN_"
+  let fok = decode_one flip  "FLIP_"
+  -- the rung passes iff the clean frame is intact AND the flipped frame is rejected
+  let _ = print (cat ["RESULT clean_intact=", show cok, " flip_rejected=", show (if fok == 1 then 0 else 1)])
+  0

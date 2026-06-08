@@ -1,0 +1,234 @@
+-- ledaticground BEACON rung beacon_gen: END-TO-END CubeSat AX.25 AFSK beacon decoder.
+-- Reads the synthetic int8 IQ beacon from /tmp/beacon_in.s8 and runs the WHOLE chain:
+--   1. FM polar discriminator (atan2 of z[n]*conj(z[n-1])) -> recovered audio.
+--   2. Bell-202 AFSK bit slice: per sps-sample symbol, Goertzel-correlate the discriminator
+--      output against mark(1200Hz) & space(2200Hz); stronger tone -> channel bit (mark=1).
+--   3. NRZI decode the channel bits (no transition = 1, transition = 0).
+--   4. HDLC deframe: find 0x7E flags (LSB-first 0 1 1 1 1 1 1 0), skip leading flags,
+--      stop at next flag, de-stuff (drop 0 after five 1s), pack LSB-first into bytes.
+--   5. split trailing 2-byte FCS (low byte first), CRC-16/X-25 (poly 0x8408) check.
+--   6. print recovered HEX + ASCII payload + CRC_OK.
+-- Reuses idioms from src/beacon_fsk.rail (FM discriminator + AFSK Goertzel) and
+-- src/beacon_ax25.rail (NRZI + HDLC + CRC). All loops carry int indices + cells (self-loop-safe).
+-- SYNTHETIC TEST VECTOR ONLY.
+
+foreign sin x -> float
+foreign cos x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+pint_acc cs acc =
+  if cs == [] then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else pint_acc (tail cs) (acc * 10 + d)
+pint s = pint_acc (chars s) 0
+
+-- signed int8 at byte index k
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- ===== FM polar discriminator: aud[n] = angle(z[n] * conj(z[n-1])) =====
+-- = atan2(Q[n]*I[n-1] - I[n]*Q[n-1], I[n]*I[n-1] + Q[n]*Q[n-1]); proportional to inst. freq.
+fill_aud bytes nsamp aud n =
+  if n >= nsamp then 0
+  else
+    let in0 = isig bytes (2 * n)
+    let qn0 = isig bytes (2 * n + 1)
+    let ip = isig bytes (2 * (n - 1))
+    let qp = isig bytes (2 * (n - 1) + 1)
+    let im = qn0 * ip - in0 * qp
+    let re = in0 * ip + qn0 * qp
+    let _ = float_arr_set aud n (atan2 im re)
+    fill_aud bytes nsamp aud (n + 1)
+
+-- ===== AFSK Goertzel tone power over one bit window =====
+-- freq fi (Hz) & rate fsi (Hz) passed as INT params, converted with int_to_float INSIDE
+-- (multi-arg FLOAT user-fn scalar params segfault on this rail_native; keep boundary int).
+-- cell[0]=cosacc cell[1]=sinacc; loop carries only i.
+tone_corr aud start sps fsi fi cell i =
+  if i >= sps then 0
+  else
+    let s = float_arr_get aud (start + i)
+    let pi2 = 2.0 * (atan2 0.0 (0.0 - 1.0))
+    let ang = pi2 * (int_to_float fi) * (int_to_float i) / (int_to_float fsi)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + s * (cos ang))
+    let _ = float_arr_set cell 1 ((float_arr_get cell 1) + s * (sin ang))
+    tone_corr aud start sps fsi fi cell (i + 1)
+tone_power aud start sps fsi fi =
+  let cell = float_arr_new 2 0.0
+  let _ = tone_corr aud start sps fsi fi cell 0
+  let c = float_arr_get cell 0
+  let s = float_arr_get cell 1
+  c * c + s * s
+
+-- per-symbol mark-vs-space slice -> channel bit (mark=1). float compare via >. .
+afsk_syms aud nsym sps fsi mark space k outbits =
+  if k >= nsym then 0
+  else
+    let start = k * sps
+    let pm = tone_power aud start sps fsi mark
+    let ps = tone_power aud start sps fsi space
+    let _ = arr_set outbits k (if pm >. ps then 1 else 0)
+    afsk_syms aud nsym sps fsi mark space (k + 1) outbits
+
+-- ===== NRZI decode: D[i]=1 if level unchanged from i-1 (prev=0 at start) =====
+nrzi_dec n nn d i =
+  if i >= nn then 0
+  else
+    let prev = if i == 0 then 0 else arr_get n (i - 1)
+    let _ = arr_set d i (if (arr_get n i) == prev then 1 else 0)
+    nrzi_dec n nn d (i + 1)
+
+-- ===== HDLC flag (0x7E LSB-first = 0 1 1 1 1 1 1 0) =====
+flag_pat k = if k == 0 then 0 else (if k == 7 then 0 else 1)
+fm_acc d i k cell =
+  if k >= 8 then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get d (i + k)) == (flag_pat k) then 1 else 0))
+    fm_acc d i (k + 1) cell
+flagmatch d i =
+  let cell = arr_new 1 0
+  let _ = fm_acc d i 0 cell
+  if (arr_get cell 0) == 8 then 1 else 0
+find_flag d nn i =
+  if (i + 8) > nn then (0 - 1)
+  else if (flagmatch d i) == 1 then i else find_flag d nn (i + 1)
+skip_flags d nn i =
+  if (i + 8) > nn then i
+  else if (flagmatch d i) == 1 then skip_flags d nn (i + 8) else i
+next_flag d nn i =
+  if (i + 8) > nn then nn
+  else if (flagmatch d i) == 1 then i else next_flag d nn (i + 1)
+
+-- ===== de-stuff content d[start..end): drop the 0 after five consecutive 1s =====
+destuff d start end out onescell oicell i =
+  if i >= end then 0
+  else
+    let ones = arr_get onescell 0
+    if ones == 5 then
+      let _ = arr_set onescell 0 0
+      destuff d start end out onescell oicell (i + 1)
+    else
+      let b = arr_get d i
+      let oi = arr_get oicell 0
+      let _ = arr_set out oi b
+      let _ = arr_set oicell 0 (oi + 1)
+      let _ = arr_set onescell 0 (if b == 1 then ones + 1 else 0)
+      destuff d start end out onescell oicell (i + 1)
+
+-- ===== pack de-stuffed bits LSB-first into bytes =====
+pack_bits bits nbytes obytes j =
+  if j >= nbytes then 0
+  else
+    let _ = arr_set obytes j (pack_one bits (8 * j) 0 0)
+    pack_bits bits nbytes obytes (j + 1)
+pack_one bits base i acc =
+  if i >= 8 then acc
+  else pack_one bits base (i + 1) (bit_or acc (shl (arr_get bits (base + i)) i))
+
+-- ===== CRC-16/X-25 byte-wise (reflected, poly 0x8408 = 33800) =====
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+crcbyte crc b = crcbit (bit_xor crc b) 0
+crc_loop obytes n i cell =
+  if i >= n then 0
+  else
+    let _ = arr_set cell 0 (crcbyte (arr_get cell 0) (arr_get obytes i))
+    crc_loop obytes n (i + 1) cell
+crc16_x25 obytes n =
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let _ = crc_loop obytes n 0 cell
+  bit_xor (arr_get cell 0) 65535
+
+-- ===== printers =====
+hexd v = str_sub "0123456789abcdef" v 1
+hex8 v = cat [hexd (bit_and (shr v 4) 15), hexd (bit_and v 15)]
+hexdump obytes i n acc =
+  if i >= n then acc
+  else hexdump obytes (i + 1) n (cat [acc, hex8 (arr_get obytes i), " "])
+asc obytes i n acc =
+  if i >= n then acc
+  else
+    let b = arr_get obytes i
+    let c = if b >= 32 then (if b <= 126 then char_from_int b else ".") else "."
+    asc obytes (i + 1) n (cat [acc, c])
+bitstr outbits i n acc =
+  if i >= n then acc
+  else bitstr outbits (i + 1) n (cat [acc, show (arr_get outbits i)])
+
+main =
+  let sps = pint (field_or "/tmp/beacon_gen_sps.txt" "40")
+  let fsi = 48000
+  let mark = 1200
+  let space = 2200
+  -- 1. read IQ + FM-discriminate to recovered audio
+  let bytes = read_bytes "/tmp/beacon_in.s8"
+  let nsamp = (arr_len bytes) / 2
+  let aud = float_arr_new nsamp 0.0
+  let _ = fill_aud bytes nsamp aud 1
+  let nsym = nsamp / sps
+  let _ = print (cat ["INFO IQ_samples=", show nsamp, " sps=", show sps, " channel_symbols=", show nsym, " (AFSK Bell-202 over FM-discriminated IQ)"])
+  -- 2. AFSK bit slice -> channel bits
+  let chan = arr_new nsym 0
+  let _ = afsk_syms aud nsym sps fsi mark space 0 chan
+  let _ = print (cat ["CHAN ", bitstr chan 0 nsym ""])
+  -- 3. NRZI decode
+  let d = arr_new nsym 0
+  let _ = nrzi_dec chan nsym d 0
+  -- 4. HDLC deframe
+  let f0 = find_flag d nsym 0
+  let cstart = if f0 < 0 then nsym else skip_flags d nsym f0
+  let cend = next_flag d nsym cstart
+  let _ = print (cat ["FLAGS first=", show f0, " content=[", show cstart, ",", show cend, ")"])
+  let out = arr_new nsym 0
+  let onescell = arr_new 1 0
+  let oicell = arr_new 1 0
+  let _ = destuff d cstart cend out onescell oicell cstart
+  let totbits = arr_get oicell 0
+  let nbytes = totbits / 8
+  let obytes = arr_new nbytes 0
+  let _ = pack_bits out nbytes obytes 0
+  -- 5. split FCS + CRC
+  let framelen = nbytes - 2
+  let calc = crc16_x25 obytes framelen
+  let rxfcs = bit_or (arr_get obytes framelen) (shl (arr_get obytes (framelen + 1)) 8)
+  let _ = print (cat ["BYTES destuffed_bits=", show totbits, " bytes=", show nbytes, " frame=", show framelen])
+  let _ = print (cat ["FCS calc=0x", hex8 (bit_and (shr calc 8) 255), hex8 (bit_and calc 255), " rx=0x", hex8 (bit_and (shr rxfcs 8) 255), hex8 (bit_and rxfcs 255)])
+  let _ = print (cat ["CRC_OK=", show (if calc == rxfcs then 1 else 0)])
+  let _ = print (cat ["HEX ", hexdump obytes 0 nbytes ""])
+  let _ = print (cat ["ASCII ", asc obytes 0 framelen ""])
+  0

@@ -1,0 +1,194 @@
+-- ledaticground Orbcomm rung: orbcomm_gen — the INTEGRATED receive chain that consumes the
+-- end-to-end synthetic vector produced by scripts/gen_orbcomm_gen.py (the matching "gen" rung).
+--
+-- This rung ties the three Orbcomm sub-rungs together in ONE module so the full transmit chain
+-- (gen_orbcomm_gen.py: opaque frame -> CRC-16/X-25 -> self-sync scramble -> PRE+UW -> SD-PSK ->
+-- int8 IQ) is reversed start-to-finish from a single input file:
+--   SD-PSK differential decode  [orbcomm_demod]  -> UW frame sync  [orbcomm_demod]
+--     -> self-sync descramble    [orbcomm_descram]  -> CRC-16/X-25 integrity  [orbcomm_frame]
+--
+-- THE PUBLIC/PROPRIETARY BOUNDARY (the soul, kept honest): the header+payload recovered here are
+-- reported as OPAQUE bits with a measured length + a recomputable CRC. We NEVER emit a "message"
+-- with invented field semantics -- Orbcomm user data is a commercial, partly-encrypted system with
+-- no public message dictionary. The UW value, scrambler taps (x^7+x^4+1), and frame layout are
+-- illustrative synthetic stand-ins for the PUBLIC architecture; the mechanism is the public part.
+--
+-- Reads int8 IQ (1 sample/symbol) from /tmp/orbcomm_in.s8.
+-- Prints:  INFO ... | UW_AT <pos> score <sc> /16 | MSG_OPAQUE_LEN <bits> |
+--          HEADER_OPAQUE <bits> | CRC calc=.. rx=.. | CRC_OK=<0/1>
+--
+-- All recursions carry int indices + array cells, and every loop with cross-dependent computed
+-- tail args is split into MUTUAL RECURSION (documented Rail trap: self-loops with computed tail
+-- args + array cells segfault). best_uw/best_step, crc_loop/crc_step are the mutual-recursion pairs.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+-- NUL-safe O(n) byte reader. malloc/free used as BUILTINS (never declared foreign -> int,
+-- which would tag the 64-bit pointer as a 63-bit int and corrupt every byte read).
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 sample -> float (b in 0..255; 128..255 are negative)
+soft_at bytes k =
+  let b = arr_get bytes k
+  let s = if b < 128 then b else b - 256
+  int_to_float s
+
+-- ============================ SD-PSK differential decode ============================
+-- bit (k-1) = 1 if Re(z[k]*conj(z[k-1])) < 0 (phase flipped ~pi). Phase-invariant; no Costas.
+diffdec bytes nsym k outbits =
+  if k >= nsym then 0
+  else
+    let ik  = soft_at bytes (k * 2)
+    let qk  = soft_at bytes (k * 2 + 1)
+    let ik1 = soft_at bytes ((k - 1) * 2)
+    let qk1 = soft_at bytes ((k - 1) * 2 + 1)
+    let dot = ik * ik1 + qk * qk1
+    let _ = arr_set outbits (k - 1) (if dot <. 0.0 then 1 else 0)
+    diffdec bytes nsym (k + 1) outbits
+
+-- ============================ UW frame sync ============================
+-- 16-bit unique word (must match gen_orbcomm_gen.py UW). Illustrative synthetic pattern.
+set_uw uw =
+  let _ = arr_set uw 0 0
+  let _ = arr_set uw 1 0
+  let _ = arr_set uw 2 1
+  let _ = arr_set uw 3 0
+  let _ = arr_set uw 4 0
+  let _ = arr_set uw 5 1
+  let _ = arr_set uw 6 1
+  let _ = arr_set uw 7 0
+  let _ = arr_set uw 8 1
+  let _ = arr_set uw 9 1
+  let _ = arr_set uw 10 1
+  let _ = arr_set uw 11 0
+  let _ = arr_set uw 12 1
+  let _ = arr_set uw 13 0
+  let _ = arr_set uw 14 0
+  let _ = arr_set uw 15 1
+  0
+
+match_cnt dec uw ulen start j cell =
+  if j >= ulen then arr_get cell 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get dec (start + j)) == (arr_get uw j) then 1 else 0))
+    match_cnt dec uw ulen start (j + 1) cell
+-- mutual recursion best_uw/best_step to dodge the self-loop cross-dep-arg miscompile
+best_step dec ndec uw ulen start bestcell poscell =
+  let c = arr_new 1 0
+  let sc = match_cnt dec uw ulen start 0 c
+  let _ = if sc > (arr_get bestcell 0) then
+            let _ = arr_set bestcell 0 sc
+            let _ = arr_set poscell 0 start
+            0
+          else 0
+  best_uw dec ndec uw ulen (start + 1) bestcell poscell
+best_uw dec ndec uw ulen start bestcell poscell =
+  if (start + ulen) > ndec then 0
+  else best_step dec ndec uw ulen start bestcell poscell
+
+-- ============================ self-sync descramble ============================
+-- out[i] = y[i] ^ y[i-4] ^ y[i-7]  (taps 4,7 = x^7+x^4+1). y is the scrambled slice.
+tapbit y n i k = if (i - k) < 0 then 0 else arr_get y (i - k)
+-- descramble the slice scr[base..base+len) of the decoded array into out[0..len)
+descram dec base n i out =
+  if i >= n then 0
+  else
+    let yi  = arr_get dec (base + i)
+    let y4  = tapbit_slice dec base i 4
+    let y7  = tapbit_slice dec base i 7
+    let v = bit_xor (bit_xor yi y4) y7
+    let _ = arr_set out i v
+    descram dec base n (i + 1) out
+-- tap into the slice (relative index i-k; 0 before the slice start)
+tapbit_slice dec base i k = if (i - k) < 0 then 0 else arr_get dec (base + i - k)
+
+-- ============================ CRC-16/X-25 over header+payload ============================
+-- reflected CRC-16/X-25 (poly 0x8408 = 33800, init 0xFFFF, xorout 0xFFFF) over MSB-first bytes.
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+crcbyte crc b = crcbit (bit_xor crc b) 0
+-- pack 8 bits (MSB-first) from msg[base..base+8) into a byte value
+packbyte8 msg base =
+  bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (arr_get msg base) 1) (arr_get msg (base+1))) 1) (arr_get msg (base+2))) 1) (arr_get msg (base+3))) 1) (arr_get msg (base+4))) 1) (arr_get msg (base+5))) 1) (arr_get msg (base+6))) 1) (arr_get msg (base+7))
+-- byte loop folded via mutual recursion (self-loop cross-dep-arg safe)
+crc_step msg nbytes b base cell =
+  let _ = arr_set cell 0 (crcbyte (arr_get cell 0) (packbyte8 msg base))
+  crc_loop msg nbytes (b + 1) (base + 8) cell
+crc_loop msg nbytes b base cell =
+  if b >= nbytes then arr_get cell 0
+  else crc_step msg nbytes b base cell
+crc16_region msg start nbits =
+  let nbytes = nbits / 8
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let r = crc_loop msg nbytes 0 start cell
+  bit_xor (arr_get cell 0) 65535
+
+-- read a 16-bit FCS (MSB-first) at msg[start..start+16) into an int
+fcs_read msg start j acc =
+  if j >= 16 then acc
+  else fcs_read msg start (j + 1) (bit_or (shl acc 1) (arr_get msg (start + j)))
+
+bitstr out i n acc = if i >= n then acc else bitstr out (i + 1) n (cat [acc, show (arr_get out i)])
+
+main =
+  let bytes = read_bytes "/tmp/orbcomm_in.s8"
+  let len = arr_len bytes
+  let nsym = len / 2
+  let ndec = nsym - 1
+  let dec = arr_new ndec 0
+  let _ = diffdec bytes nsym 1 dec
+  let _ = print (cat ["INFO samples=", show len, " symbols=", show nsym, " decoded_bits=", show ndec])
+  let _ = print "SYMRATE 4800"
+
+  -- UW frame sync against the 16-bit unique word
+  let uw = arr_new 16 0
+  let _ = set_uw uw
+  let bestcell = arr_new 1 0
+  let poscell = arr_new 1 0
+  let _ = best_uw dec ndec uw 16 0 bestcell poscell
+  let uwpos = arr_get poscell 0
+  let uwsc = arr_get bestcell 0
+  let _ = print (cat ["UW_AT ", show uwpos, " score ", show uwsc, " /16"])
+
+  -- the scrambled message (header + payload + FCS) begins right after the UW
+  let hdr_len = 24
+  let pay_len = 144
+  let msg_len = hdr_len + pay_len + 16
+  let scr_start = uwpos + 16
+  -- self-sync descramble the message slice
+  let msg = arr_new msg_len 0
+  let _ = descram dec scr_start msg_len 0 msg
+  let _ = print (cat ["MSG_OPAQUE_LEN ", show (hdr_len + pay_len), " bits (header+payload; semantics PROPRIETARY -- not decoded)"])
+  let _ = print (cat ["HEADER_OPAQUE ", bitstr msg 0 hdr_len ""])
+
+  -- CRC-16/X-25 over the (header+payload) region; compare to the trailing 16-bit FCS
+  let region_bits = hdr_len + pay_len
+  let calc = crc16_region msg 0 region_bits
+  let rxfcs = fcs_read msg region_bits 0 0
+  let _ = print (cat ["CRC calc=", show calc, " rx=", show rxfcs])
+  let _ = print (cat ["CRC_OK=", show (if calc == rxfcs then 1 else 0)])
+  0

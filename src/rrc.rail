@@ -1,0 +1,192 @@
+-- ledaticground LRPT rung: rrc — root-raised-cosine matched filter (pure Rail).
+-- The FRONT of the Meteor-M2 LRPT QPSK receive chain. It applies a matched Rx-RRC FIR
+-- to the int8 IQ stream so the combined Tx-RRC * Rx-RRC response is a zero-ISI raised
+-- cosine (energy concentrated at symbol centers). Filtered IQ then feeds Gardner timing
+-- recovery -> qpsk.rail's Costas loop.
+--
+-- This is generic DSP (the canonical bare-name module). It is the CONFIGURABLE-sps rung:
+-- beta (~0.6) and sps are read from /tmp/rrc_cfg.txt ("sps beta span" on one line) with
+-- safe defaults, so the same binary serves Meteor's nominal oversampling and any
+-- decimation the front end picks.
+-- Taps use the standard RRC closed form: ntaps = 2*sps*span+1, computed in float at
+-- runtime (matches the numpy reference exactly, incl. the t=0 and 4*beta*t=1 limit cases).
+-- Filtering: per-channel 'same'-mode FIR convolution. Float taps + accumulators live in
+-- float arrays; every recursion carries ONLY int indices (dodges the float-accumulator
+-- self-loop miscompile, per qpsk.rail's NCO comment).
+--
+-- I/O: in /tmp/rrc_in.s8 (int8 interleaved IQ). Out (stdout):
+--   INFO sps=.. beta=.. span=.. ntaps=.. nin=..
+--   TAP0 <center tap>              -- center == 1-beta+4*beta/pi
+--   SYMOK <0|1>                    -- 1 if taps are symmetric h[k]==h[ntaps-1-k]
+--   YI <filtered I floats>
+--   YQ <filtered Q floats>
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+-- ---- file IO (verbatim shared boilerplate; malloc/free are BUILTINS, never foreign) ----
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- int8 sign decode -> float
+soft_at bytes k =
+  let b = arr_get bytes k
+  let s = if b < 128 then b else b - 256
+  int_to_float s
+
+absf x = if x <. 0.0 then (0.0 - x) else x
+pi = atan2 0.0 (0.0 - 1.0)
+
+-- ---- config parse: read "sps beta span" from one line, walk chars for ints/float ----
+-- char codes: '0'=48 '9'=57, ' '=32, '.'=46
+is_digit c = if c < 48 then 0 else (if c > 57 then 0 else 1)
+
+-- parse an unsigned int starting at index i; returns the int (stops at first non-digit).
+parse_uint bytes n i acc =
+  if i >= n then acc
+  else
+    let c = arr_get bytes i
+    if (is_digit c) == 1 then parse_uint bytes n (i + 1) (acc * 10 + (c - 48))
+    else acc
+
+-- advance index past digits
+skip_digits bytes n i =
+  if i >= n then i
+  else
+    let c = arr_get bytes i
+    if (is_digit c) == 1 then skip_digits bytes n (i + 1) else i
+
+-- advance index past spaces
+skip_spaces bytes n i =
+  if i >= n then i
+  else
+    let c = arr_get bytes i
+    if c == 32 then skip_spaces bytes n (i + 1) else i
+
+-- NOTE on cfg format: beta is carried as an INTEGER in hundredths (e.g. 0.6 -> 60) and
+-- divided by 100.0 at use. A decimal-point float token parser (int-part + frac-part) was
+-- tried first but miscompiled value-dependently on file-read bytes when the integer part
+-- was 0 (the int+frac add returned 0); all-integer cfg + a single divide sidesteps it.
+
+-- ---- RRC taps ----
+-- one RRC tap value at fractional symbol time ti (symbol units), roll-off beta.
+rrc_tap ti beta =
+  let at = absf ti
+  if at <. 0.00000001 then
+    1.0 - beta + 4.0 * beta / pi
+  else
+    let edge = absf (absf (4.0 * beta * ti) - 1.0)
+    if edge <. 0.00000001 then
+      (beta / (sqrt 2.0)) * ((1.0 + 2.0 / pi) * (sin (pi / (4.0 * beta))) + (1.0 - 2.0 / pi) * (cos (pi / (4.0 * beta))))
+    else
+      let num = (sin (pi * ti * (1.0 - beta))) + 4.0 * beta * ti * (cos (pi * ti * (1.0 + beta)))
+      let den = pi * ti * (1.0 - (4.0 * beta * ti) * (4.0 * beta * ti))
+      num / den
+
+-- fill taps[0..ntaps): ti = (k - (ntaps-1)/2)/sps
+fill_taps taps ntaps sps beta i =
+  if i >= ntaps then 0
+  else
+    let center = int_to_float (ntaps - 1) / 2.0
+    let ti = (int_to_float i - center) / (int_to_float sps)
+    let _ = float_arr_set taps i (rrc_tap ti beta)
+    fill_taps taps ntaps sps beta (i + 1)
+
+-- symmetry check: h[k] == h[ntaps-1-k] within tol; returns 1 if all symmetric else 0.
+sym_check taps ntaps i =
+  if i >= ntaps then 1
+  else
+    let a = float_arr_get taps i
+    let b = float_arr_get taps (ntaps - 1 - i)
+    let d = absf (a - b)
+    if d <. 0.0000001 then sym_check taps ntaps (i + 1) else 0
+
+-- ---- 'same'-mode convolution ----
+-- y[n] = sum_t x[n + (ntaps-1)/2 - t] * h[t], t in [0,ntaps); acc[0] is the float accum.
+conv_inner x nin taps ntaps n half t acc =
+  if t >= ntaps then 0
+  else
+    let xi = n + half - t
+    let xv = if xi < 0 then 0.0 else (if xi >= nin then 0.0 else float_arr_get x xi)
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + xv * (float_arr_get taps t))
+    conv_inner x nin taps ntaps n half (t + 1) acc
+
+conv x nin taps ntaps y n half acc =
+  if n >= nin then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = conv_inner x nin taps ntaps n half 0 acc
+    let _ = float_arr_set y n (float_arr_get acc 0)
+    conv x nin taps ntaps y (n + 1) half acc
+
+-- de-interleave int8 IQ -> per-channel float arrays
+deint bytes nin xi xq i =
+  if i >= nin then 0
+  else
+    let _ = float_arr_set xi i (soft_at bytes (i * 2))
+    let _ = float_arr_set xq i (soft_at bytes (i * 2 + 1))
+    deint bytes nin xi xq (i + 1)
+
+-- print floats rounded by show_float as space-separated tokens
+flts y i n acc = if i >= n then acc else flts y (i + 1) n (cat [acc, show_float (float_arr_get y i), " "])
+
+main =
+  -- config: "sps beta_x100 span" from /tmp/rrc_cfg.txt (all ints; safe defaults if
+  -- missing). beta is hundredths: 60 -> 0.60. Three plain parse_uint reads; no float token.
+  let cfg = read_bytes "/tmp/rrc_cfg.txt"
+  let cn = arr_len cfg
+  let p0 = skip_spaces cfg cn 0
+  let sps_raw = parse_uint cfg cn p0 0
+  let p1 = skip_spaces cfg cn (skip_digits cfg cn p0)
+  let beta100 = parse_uint cfg cn p1 0
+  let p2 = skip_spaces cfg cn (skip_digits cfg cn p1)
+  let span_raw = parse_uint cfg cn p2 0
+  let sps = if sps_raw == 0 then 4 else sps_raw
+  let beta_eff = if beta100 == 0 then 60 else beta100
+  let beta = (int_to_float beta_eff) / 100.0
+  let span = if span_raw == 0 then 4 else span_raw
+  let ntaps = 2 * sps * span + 1
+  let half = (ntaps - 1) / 2
+  let bytes = read_bytes "/tmp/rrc_in.s8"
+  let nin = (arr_len bytes) / 2
+  let xi = float_arr_new nin 0.0
+  let xq = float_arr_new nin 0.0
+  let _ = deint bytes nin xi xq 0
+  let taps = float_arr_new ntaps 0.0
+  let _ = fill_taps taps ntaps sps beta 0
+  let yi = float_arr_new nin 0.0
+  let yq = float_arr_new nin 0.0
+  let acc = float_arr_new 1 0.0
+  let _ = conv xi nin taps ntaps yi 0 half acc
+  let _ = conv xq nin taps ntaps yq 0 half acc
+  let symok = sym_check taps ntaps 0
+  let _ = print (cat ["INFO sps=", show sps, " beta=", show_float beta, " span=", show span, " ntaps=", show ntaps, " nin=", show nin])
+  let _ = print (cat ["TAP0 ", show_float (float_arr_get taps half)])
+  let _ = print (cat ["SYMOK ", show symok])
+  let _ = print (cat ["YI ", flts yi 0 nin ""])
+  let _ = print (cat ["YQ ", flts yq 0 nin ""])
+  0

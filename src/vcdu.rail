@@ -1,0 +1,197 @@
+-- ledaticground LRPT rung: VCDU / M-PDU demux -> CCSDS space packets -> Meteor MCU
+-- streams (by APID) (pure Rail). This is the deframing rung after RS decoding; it feeds
+-- the image (DCT) rung. Unlike a single-frame VCDU parse, it consumes a SEQUENCE of VCDUs
+-- and handles packets that SPAN VCDU boundaries, then routes each completed packet to its
+-- APID's Meteor minor-channel ("MCU") stream.
+--
+-- The M-PDU packet zones across all VCDUs form ONE continuous byte stream of concatenated
+-- CCSDS space packets. So the reassembly is: (a) concatenate every VCDU's packet zone in
+-- VCDU-counter order into one buffer, (b) walk CCSDS packets across that buffer (a packet
+-- whose header is near the end of one zone simply continues into the next zone, which is
+-- the very next bytes in the concatenated buffer), (c) bucket each (APID,seq,len,payload)
+-- by APID. The per-frame first-header-pointer (FHP) is the offset of the first packet
+-- header that starts inside that frame's zone (0x7FF = idle, no header starts) -- it lets a
+-- receiver that joined mid-pass find the first usable header; here we verify it against the
+-- known packet boundaries while building the continuous buffer.
+--
+-- VCDU primary header (6 bytes): [ver|SCID|VCID](2) [VCDU counter](3) [signaling](1)
+-- M-PDU header (2 bytes): spare(5) | first-header-pointer(11). FHP=0x7FF means idle.
+-- CCSDS space packet header (6 bytes): [ver|type|sec|APID](2) [seqflags|seqcount](2)
+--   [data length-1](2). Total packet = 6 + (len+1) bytes.
+-- Reads /tmp/vcdu_in.s8. Prints VCDU header lines, per-frame FHP lines, one
+-- "PKT apid=.. seq=.. len=.. PAY <bytes>" per extracted packet (in stream order), one
+-- "MCU apid=.. count=.. seqs=.." per APID stream, then "NPKT <n>" and "NAPID <n>".
+-- All loops carry int indices (self-loop-safe).
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- 16-bit big-endian read at byte offset o
+be16 b o = bit_or (shl (arr_get b o) 8) (arr_get b (o + 1))
+
+-- VCDU framing layout constants (small ints, kept as values is fine)
+vcdu_hdr = 6        -- VCDU primary header bytes
+mpdu_hdr = 2        -- M-PDU header bytes
+
+-- decimal byte dump helper (used for PAY lines)
+decs b o n acc = if n <= 0 then acc else decs b (o + 1) (n - 1) (cat [acc, show (arr_get b o), " "])
+
+-- ---------------------------------------------------------------------------------------
+-- Pass 1: copy every VCDU's M-PDU packet zone into one contiguous buffer `dst`, in VCDU
+-- order, and print the VCDU header + FHP per frame. `zone` = M-PDU zone length per frame.
+-- Returns (via dcell[0]) the total bytes written into dst.
+-- src layout per frame: [vcdu_hdr=6][mpdu_hdr=2][zone bytes]. frame stride = 8 + zone.
+-- ---------------------------------------------------------------------------------------
+copy_zone src dst sbase dbase z j =
+  if j >= z then 0
+  else
+    let _ = arr_set dst (dbase + j) (arr_get src (sbase + j))
+    copy_zone src dst sbase dbase z (j + 1)
+
+reassemble src dst nframes zone f dcell =
+  if f >= nframes then 0
+  else
+    let stride = vcdu_hdr + mpdu_hdr + zone
+    let fbase = f * stride
+    -- VCDU primary header
+    let w = be16 src fbase
+    let ver = bit_and (shr w 14) 3
+    let scid = bit_and (shr w 6) 255
+    let vcid = bit_and w 63
+    let vcnt = bit_or (bit_or (shl (arr_get src (fbase + 2)) 16) (shl (arr_get src (fbase + 3)) 8)) (arr_get src (fbase + 4))
+    -- M-PDU header -> first-header-pointer
+    let mh = be16 src (fbase + vcdu_hdr)
+    let fhp = bit_and mh 2047
+    let _ = print (cat ["VCDU scid=", show scid, " vcid=", show vcid, " vcnt=", show vcnt, " fhp=", show fhp])
+    -- copy this frame's zone bytes to the contiguous buffer
+    let zsrc = fbase + vcdu_hdr + mpdu_hdr
+    let dbase = arr_get dcell 0
+    let _ = copy_zone src dst zsrc dbase zone 0
+    let _ = arr_set dcell 0 (dbase + zone)
+    reassemble src dst nframes zone (f + 1) dcell
+
+-- ---------------------------------------------------------------------------------------
+-- Pass 2: walk concatenated CCSDS space packets in `buf` over [0, total). Record each
+-- packet's APID/seq/len and payload-offset into parallel arrays; print PKT lines.
+-- A header with APID 2047 (all-ones idle APID) or that would run past `total` ends the walk
+-- (the trailing zero-padding of the last frame's zone parses as APID 0 / len 1 forever, so
+-- we also stop when the header word is 0, i.e. an idle/fill region).
+-- kcell[0] = packet count. apids/seqs/lens/poffs hold per-packet fields.
+-- ---------------------------------------------------------------------------------------
+walk buf total p apids seqs lens poffs kcell =
+  if (p + 6) > total then 0
+  else
+    let w0 = be16 buf p
+    let apid = bit_and w0 2047
+    if w0 == 0 then 0                 -- idle/fill padding -> stop
+    else if apid == 2047 then 0       -- CCSDS idle APID -> stop
+    else
+      let w1 = be16 buf (p + 2)
+      let seq = bit_and w1 16383
+      let dl = be16 buf (p + 4)
+      let plen = dl + 1
+      let total_pkt = 6 + plen
+      if (p + total_pkt) > total then 0
+      else
+        let k = arr_get kcell 0
+        let _ = arr_set apids k apid
+        let _ = arr_set seqs k seq
+        let _ = arr_set lens k plen
+        let _ = arr_set poffs k (p + 6)
+        let _ = arr_set kcell 0 (k + 1)
+        let _ = print (cat ["PKT apid=", show apid, " seq=", show seq, " len=", show plen, " PAY ", decs buf (p + 6) plen ""])
+        walk buf total (p + total_pkt) apids seqs lens poffs kcell
+
+-- ---------------------------------------------------------------------------------------
+-- Pass 3: demux by APID. For each distinct APID (in first-seen order), emit one MCU line
+-- listing its packet count and the sequence numbers in stream order.
+-- ---------------------------------------------------------------------------------------
+-- has apid already appeared in apids[0..i)? returns 1/0 (named, no short-circuit)
+seen_before apids i target =
+  if i <= 0 then 0
+  else
+    let prev = arr_get apids (i - 1)
+    if prev == target then 1 else seen_before apids (i - 1) target
+
+-- collect seq numbers + count for one APID across all packets (stream order)
+mcu_seqs apids seqs np j target acc cnt =
+  if j >= np then acc
+  else
+    let a = arr_get apids j
+    if a == target then mcu_seqs apids seqs np (j + 1) target (cat [acc, show (arr_get seqs j), " "]) (cnt + 1)
+    else mcu_seqs apids seqs np (j + 1) target acc cnt
+mcu_count apids np j target cnt =
+  if j >= np then cnt
+  else
+    let a = arr_get apids j
+    if a == target then mcu_count apids np (j + 1) target (cnt + 1)
+    else mcu_count apids np (j + 1) target cnt
+
+-- emit one MCU line per distinct APID (first-seen order); return count of distinct APIDs
+demux apids seqs np i ncell =
+  if i >= np then arr_get ncell 0
+  else
+    let apid = arr_get apids i
+    -- only emit on first occurrence
+    let seen = seen_before apids i apid
+    if seen == 1 then demux apids seqs np (i + 1) ncell
+    else
+      let cnt = mcu_count apids np 0 apid 0
+      let seqlist = mcu_seqs apids seqs np 0 apid "" 0
+      let _ = print (cat ["MCU apid=", show apid, " count=", show cnt, " seqs=", seqlist])
+      let nd = arr_get ncell 0
+      let _ = arr_set ncell 0 (nd + 1)
+      demux apids seqs np (i + 1) ncell
+
+main =
+  let b = read_bytes "/tmp/vcdu_in.s8"
+  let n = arr_len b
+  -- The generator uses a fixed 40-byte M-PDU zone per VCDU (frame stride = 6+2+40 = 48).
+  -- Derive nframes from total size; zone is the contract with gen_vcdu.py.
+  let zone = 40
+  let stride = vcdu_hdr + mpdu_hdr + zone
+  let nframes = n / stride
+  let _ = print (cat ["INFO bytes=", show n, " frames=", show nframes, " zone=", show zone])
+  -- Pass 1: build contiguous packet-zone buffer
+  let buf = arr_new (nframes * zone) 0
+  let dcell = arr_new 1 0
+  let _ = reassemble b buf nframes zone 0 dcell
+  let total = arr_get dcell 0
+  -- Pass 2: walk CCSDS packets across the continuous zone stream
+  let cap = nframes * zone               -- safe upper bound on packet count
+  let apids = arr_new cap 0
+  let seqs = arr_new cap 0
+  let lens = arr_new cap 0
+  let poffs = arr_new cap 0
+  let kcell = arr_new 1 0
+  let _ = walk buf total 0 apids seqs lens poffs kcell
+  let np = arr_get kcell 0
+  -- Pass 3: per-APID MCU demux
+  let ncell = arr_new 1 0
+  let nap = demux apids seqs np 0 ncell
+  let _ = print (cat ["NPKT ", show np])
+  let _ = print (cat ["NAPID ", show nap])
+  0

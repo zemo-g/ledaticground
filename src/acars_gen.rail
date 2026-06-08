@@ -1,0 +1,78 @@
+-- ledaticground ACARS rung: acars_gen (Rail front-end for the synthetic gen chain).
+-- The acars_gen rung is fundamentally a PYTHON end-to-end transmit-chain generator
+-- (scripts/gen_acars_gen.py builds a full ARINC 618 ACARS message -> 7-bit+odd-parity
+-- chars -> BCS -> MSB-first bits -> 2400 bps MSK -> AM -> int8 IQ at /tmp/acars_in.s8).
+-- This Rail module proves the gen output is ingestible by the same toolkit front-end the
+-- decoder rungs use: it AM-envelope-demods /tmp/acars_in.s8 (a[n] = sqrt(I^2+Q^2) - DC)
+-- and prints the recovered MSK audio. scripts/check_acars_gen.py both (a) runs the FULL
+-- numpy inverse chain to confirm the generated signal decodes back to the original
+-- message + fields + BCS, and (b) correlates these "A <sample>" lines against the clean
+-- MSK truth. Self-loop-safe: loops carry int indices + array cells only (no float self-arg).
+-- Reuses the read_bytes / copy_bytes / isig idioms verbatim from acars_am.rail / gmsk.rail.
+
+foreign sqrt x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 sample at byte index k -> float
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- envelope a[n] = sqrt(I^2 + Q^2) into env[]
+fill_env bytes nsamp env n =
+  if n >= nsamp then 0
+  else
+    let iv = isig bytes (2 * n)
+    let qv = isig bytes (2 * n + 1)
+    let _ = float_arr_set env n (sqrt (iv * iv + qv * qv))
+    fill_env bytes nsamp env (n + 1)
+
+sum_env env nsamp i acc =
+  if i >= nsamp then acc
+  else sum_env env nsamp (i + 1) (acc + (float_arr_get env i))
+
+print_audio env nsamp mean i =
+  if i >= nsamp then 0
+  else
+    let _ = print (cat ["A ", show_float ((float_arr_get env i) - mean)])
+    print_audio env nsamp mean (i + 1)
+
+main =
+  let bytes = read_bytes "/tmp/acars_in.s8"
+  let len = arr_len bytes
+  let nsamp = len / 2
+  if nsamp < 10 then
+    let _ = print "NO_DATA"
+    0
+  else
+    let env = float_arr_new nsamp 0.0
+    let _ = fill_env bytes nsamp env 0
+    let sm = sum_env env nsamp 0 0.0
+    let mean = sm / (int_to_float nsamp)
+    let _ = print (cat ["INFO acars_gen front-end samples=", show nsamp, " dc_level=", show_float mean, " (= carrier amplitude)"])
+    let _ = print_audio env nsamp mean 0
+    0

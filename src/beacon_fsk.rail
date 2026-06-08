@@ -1,0 +1,155 @@
+-- ledaticground BEACON rung 2: FSK / AFSK demodulator (pure Rail).
+-- Two modes, selected by /tmp/beacon_fsk_params.npy-derived /tmp/beacon_fsk_mode.txt:
+--   mode 0 = AFSK1200 (Bell-202): mono s16 audio. Per bit window, correlate against the
+--            mark (1200Hz) and space (2200Hz) tones (Goertzel-style sin/cos power) and slice
+--            to the stronger tone -> bit=1 (mark) / 0 (space).
+--   mode 1 = FSK9600 : int8 IQ. Polar discriminator (reused from src/gmsk.rail):
+--            disc[n]=Q[n]*I[n-1]-I[n]*Q[n-1], integrate over each symbol window, sign-slice.
+-- Reads /tmp/beacon_fsk_in.s16 (mode 0) or /tmp/beacon_fsk_in.s8 (mode 1); prints BITS line.
+-- All loops carry int indices + float cells (self-loop-safe).
+
+foreign sin x -> float
+foreign cos x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- read first line of a text file, trimmed of trailing newline
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+-- string -> int by walking chars (canonical pattern from stdlib/socket.rail);
+-- `to_int` is float-only, so we walk digits ourselves.
+pint_acc cs acc =
+  if cs == [] then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else pint_acc (tail cs) (acc * 10 + d)
+pint s = pint_acc (chars s) 0
+
+-- signed int8 at byte index k
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- signed little-endian s16 sample #k (bytes 2k, 2k+1)
+s16at bytes k =
+  let lo = arr_get bytes (2 * k)
+  let hi = arr_get bytes (2 * k + 1)
+  let v = lo + hi * 256
+  int_to_float (if v < 32768 then v else v - 65536)
+
+-- ===== AFSK1200: Goertzel-style tone power over a bit window =====
+-- correlate audio[start..start+sps) with cos & sin at integer freq fi (Hz), integer
+-- rate fsi (Hz); return I^2+Q^2 in cell. NOTE: freq/rate are passed as INT params and
+-- converted with int_to_float INSIDE — multi-arg FLOAT user-fn params segfault on this
+-- rail_native (see memory feedback_rail_float_user_fn_args), so we keep the boundary int.
+-- cell[0]=cosacc cell[1]=sinacc ; loop carries only i.
+tone_corr bytes start sps fsi fi cell i =
+  if i >= sps then 0
+  else
+    let s = s16at bytes (start + i)
+    let pi2 = 2.0 * (atan2 0.0 (0.0 - 1.0))
+    let ang = pi2 * (int_to_float fi) * (int_to_float i) / (int_to_float fsi)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + s * (cos ang))
+    let _ = float_arr_set cell 1 ((float_arr_get cell 1) + s * (sin ang))
+    tone_corr bytes start sps fsi fi cell (i + 1)
+tone_power bytes start sps fsi fi =
+  let cell = float_arr_new 2 0.0
+  let _ = tone_corr bytes start sps fsi fi cell 0
+  let c = float_arr_get cell 0
+  let s = float_arr_get cell 1
+  c * c + s * s
+
+-- compare mark vs space tone power for one symbol -> bit. Uses dotted float compare
+-- (>.) on float locals, NOT poly == / > (see memory rail-bug-poly-eq-on-float).
+afsk_syms bytes nsym sps fsi mark space k outbits =
+  if k >= nsym then 0
+  else
+    let start = k * sps
+    let pm = tone_power bytes start sps fsi mark
+    let ps = tone_power bytes start sps fsi space
+    let _ = arr_set outbits k (if pm >. ps then 1 else 0)
+    afsk_syms bytes nsym sps fsi mark space (k + 1) outbits
+
+-- ===== FSK9600: polar discriminator over IQ (reused from gmsk.rail) =====
+fill_disc bytes nsamp disc n =
+  if n >= nsamp then 0
+  else
+    let in0 = isig bytes (2 * n)
+    let qn0 = isig bytes (2 * n + 1)
+    let ip = isig bytes (2 * (n - 1))
+    let qp = isig bytes (2 * (n - 1) + 1)
+    let _ = float_arr_set disc n (qn0 * ip - in0 * qp)
+    fill_disc bytes nsamp disc (n + 1)
+sum_win disc start n i acc =
+  if i >= n then 0
+  else
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get disc (start + i)))
+    sum_win disc start n (i + 1) acc
+fsk_syms disc nsym sps k acc outbits =
+  if k >= nsym then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = sum_win disc (k * sps) sps 0 acc
+    let s = float_arr_get acc 0
+    let _ = arr_set outbits k (if s > 0.0 then 1 else 0)
+    fsk_syms disc nsym sps (k + 1) acc outbits
+
+bitstr outbits i n acc =
+  if i >= n then acc
+  else bitstr outbits (i + 1) n (cat [acc, show (arr_get outbits i)])
+
+main =
+  let mode = pint (field_or "/tmp/beacon_fsk_mode.txt" "0")
+  let sps = pint (field_or "/tmp/beacon_fsk_sps.txt" "40")
+  if mode == 0 then
+    let bytes = read_bytes "/tmp/beacon_fsk_in.s16"
+    let nsamp = (arr_len bytes) / 2
+    let nsym = nsamp / sps
+    let fsi = 48000
+    let mark = 1200
+    let space = 2200
+    let outbits = arr_new nsym 0
+    let _ = print (cat ["INFO mode=AFSK1200 samples=", show nsamp, " sps=", show sps, " symbols=", show nsym])
+    let _ = afsk_syms bytes nsym sps fsi mark space 0 outbits
+    let _ = print (cat ["BITS ", bitstr outbits 0 nsym ""])
+    0
+  else
+    let bytes = read_bytes "/tmp/beacon_fsk_in.s8"
+    let nsamp = (arr_len bytes) / 2
+    let disc = float_arr_new nsamp 0.0
+    let _ = fill_disc bytes nsamp disc 1
+    let nsym = nsamp / sps
+    let outbits = arr_new nsym 0
+    let acc = float_arr_new 1 0.0
+    let _ = print (cat ["INFO mode=FSK9600 samples=", show nsamp, " sps=", show sps, " symbols=", show nsym])
+    let _ = fsk_syms disc nsym sps 0 acc outbits
+    let _ = print (cat ["BITS ", bitstr outbits 0 nsym ""])
+    0

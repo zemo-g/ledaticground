@@ -1,0 +1,89 @@
+-- ledaticground ACARS rung: acars_amdemod — AM envelope demodulator (pure Rail).
+-- ACARS (ARINC 618, airband 136.7-136.975 MHz) is AM: a VHF carrier amplitude-modulated
+-- by a 2400-baud MSK subcarrier (bit 1 = 1200 Hz, bit 0 = 2400 Hz tones). The capture is
+-- downconverted to baseband IQ. ENVELOPE DETECT recovers the modulation with no carrier
+-- lock needed (robust at low SNR — important because a horizontal antenna on this terrestrial
+-- VERTICALLY-polarized signal costs 15-20 dB cross-pol loss):
+--   a[n] = |z[n]| = sqrt(I[n]^2 + Q[n]^2)      ->  (1 + m*msk) * carrier_amplitude
+--   audio[n] = a[n] - mean(a)                   ->  m*msk * carrier_amplitude   (DC removed)
+-- The DC term is the unmodulated carrier level; subtracting it yields the MSK audio that
+-- the downstream MSK bit-recovery rung slices, with the 1200/2400 Hz tones intact.
+-- Reads int8 IQ from /tmp/acars_in.s8. Prints "INFO ..." + "A <sample>" audio lines.
+-- Self-loop-safe discipline: every recursive loop carries only int indices; float results
+-- live in float-array cells, never as cross-dependent self-loop args.
+
+foreign sqrt x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+-- NUL-safe O(n) file reader -> int arr of raw bytes. malloc/free are BUILTINS (never
+-- declared foreign->int; that would tag the 64-bit pointer as a 63-bit int and corrupt it).
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 sample at byte index k -> float
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- envelope a[n] = sqrt(I^2 + Q^2) into env[] (loop carries only the int index n)
+fill_env bytes nsamp env n =
+  if n >= nsamp then 0
+  else
+    let iv = isig bytes (2 * n)
+    let qv = isig bytes (2 * n + 1)
+    let mag = sqrt (iv * iv + qv * qv)
+    let _ = float_arr_set env n mag
+    fill_env bytes nsamp env (n + 1)
+
+-- sum env into a float-array cell (recursion carries only int index i; float in acc[0])
+sum_env env nsamp i acc =
+  if i >= nsamp then 0
+  else
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get env i))
+    sum_env env nsamp (i + 1) acc
+
+-- print DC-removed audio: A <sample> per line
+print_audio env nsamp mean i =
+  if i >= nsamp then 0
+  else
+    let _ = print (cat ["A ", show_float ((float_arr_get env i) - mean)])
+    print_audio env nsamp mean (i + 1)
+
+main =
+  let bytes = read_bytes "/tmp/acars_in.s8"
+  let len = arr_len bytes
+  let nsamp = len / 2
+  if nsamp < 10 then
+    let _ = print "NO_DATA"
+    0
+  else
+    let env = float_arr_new nsamp 0.0
+    let _ = fill_env bytes nsamp env 0
+    let acc = float_arr_new 1 0.0
+    let _ = sum_env env nsamp 0 acc
+    let sm = float_arr_get acc 0
+    let mean = sm / (int_to_float nsamp)
+    let _ = print (cat ["INFO samples=", show nsamp, " dc_level=", show_float mean, " (= carrier amplitude)"])
+    let _ = print_audio env nsamp mean 0
+    0

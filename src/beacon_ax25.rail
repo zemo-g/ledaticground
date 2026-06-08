@@ -1,0 +1,154 @@
+-- ledaticground BEACON rung 3: AX.25 HDLC deframe (pure Rail).
+-- Reuses the NRZI + HDLC + CRC idioms from src/ais_deframe.rail and src/crc16.rail,
+-- specialized for AX.25 packet beacons (APRS-style). Steps:
+--   1. NRZI-decode the channel bits (no transition = 1, transition = 0).
+--   2. find the leading/trailing 0x7E flags (LSB-first: 0 1 1 1 1 1 1 0).
+--   3. de-stuff the content (drop the 0 inserted after five consecutive 1s).
+--   4. pack the de-stuffed bits LSB-first into bytes (AX.25 wire bit order).
+--   5. CRC-16/X-25 (poly 0x8408, init 0xFFFF, xorout 0xFFFF) over frame bytes vs the
+--      trailing 2-byte FCS (low byte first).
+-- Reads NRZI channel bits (1 byte/bit) from /tmp/beacon_ax25_in.bits.
+-- Prints flags, byte count, FCS calc/rx, CRC_OK, and the recovered bytes (hex + ascii).
+-- All loops carry int indices + array cells (self-loop-safe).
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- NRZI decode: D[i]=1 if level unchanged from i-1 (prev=0 at start), else 0
+nrzi_dec n nn d i =
+  if i >= nn then 0
+  else
+    let prev = if i == 0 then 0 else arr_get n (i - 1)
+    let _ = arr_set d i (if (arr_get n i) == prev then 1 else 0)
+    nrzi_dec n nn d (i + 1)
+
+-- flag 0x7E LSB-first = 0 1 1 1 1 1 1 0: bit 0 and bit 7 are 0, middle six are 1
+flag_pat k = if k == 0 then 0 else (if k == 7 then 0 else 1)
+fm_acc d i k cell =
+  if k >= 8 then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get d (i + k)) == (flag_pat k) then 1 else 0))
+    fm_acc d i (k + 1) cell
+flagmatch d i =
+  let cell = arr_new 1 0
+  let _ = fm_acc d i 0 cell
+  if (arr_get cell 0) == 8 then 1 else 0
+find_flag d nn i =
+  if (i + 8) > nn then (0 - 1)
+  else if (flagmatch d i) == 1 then i else find_flag d nn (i + 1)
+-- skip consecutive 0x7E flags forward (each flag is 8 bits) to reach content start
+skip_flags d nn i =
+  if (i + 8) > nn then i
+  else if (flagmatch d i) == 1 then skip_flags d nn (i + 8) else i
+-- next flag start at/after `i` (terminates the frame content)
+next_flag d nn i =
+  if (i + 8) > nn then nn
+  else if (flagmatch d i) == 1 then i else next_flag d nn (i + 1)
+
+-- de-stuff content d[start..end) into out; drop the 0 after five consecutive 1s
+destuff d start end out onescell oicell i =
+  if i >= end then 0
+  else
+    let ones = arr_get onescell 0
+    if ones == 5 then
+      let _ = arr_set onescell 0 0
+      destuff d start end out onescell oicell (i + 1)
+    else
+      let b = arr_get d i
+      let oi = arr_get oicell 0
+      let _ = arr_set out oi b
+      let _ = arr_set oicell 0 (oi + 1)
+      let _ = arr_set onescell 0 (if b == 1 then ones + 1 else 0)
+      destuff d start end out onescell oicell (i + 1)
+
+-- pack de-stuffed bits (LSB-first) into bytes: out_bytes[j] = bits[8j..8j+8)
+pack_bits bits nbytes obytes j =
+  if j >= nbytes then 0
+  else
+    let _ = arr_set obytes j (pack_one bits (8 * j) 0 0)
+    pack_bits bits nbytes obytes (j + 1)
+pack_one bits base i acc =
+  if i >= 8 then acc
+  else pack_one bits base (i + 1) (bit_or acc (shl (arr_get bits (base + i)) i))
+
+-- CRC-16/X-25 byte-wise (reflected; poly 0x8408 = 33800). State in a cell.
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+crcbyte crc b = crcbit (bit_xor crc b) 0
+crc_loop obytes n i cell =
+  if i >= n then 0
+  else
+    let _ = arr_set cell 0 (crcbyte (arr_get cell 0) (arr_get obytes i))
+    crc_loop obytes n (i + 1) cell
+crc16_x25 obytes n =
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let _ = crc_loop obytes n 0 cell
+  bit_xor (arr_get cell 0) 65535
+
+-- printers
+hexd v = str_sub "0123456789abcdef" v 1
+hex8 v = cat [hexd (bit_and (shr v 4) 15), hexd (bit_and v 15)]
+hexdump obytes i n acc =
+  if i >= n then acc
+  else hexdump obytes (i + 1) n (cat [acc, hex8 (arr_get obytes i), " "])
+-- ascii: printable 32..126, else '.'
+asc obytes i n acc =
+  if i >= n then acc
+  else
+    let b = arr_get obytes i
+    let c = if b >= 32 then (if b <= 126 then char_from_int b else ".") else "."
+    asc obytes (i + 1) n (cat [acc, c])
+
+main =
+  let n = read_bytes "/tmp/beacon_ax25_in.bits"
+  let nn = arr_len n
+  let d = arr_new nn 0
+  let _ = nrzi_dec n nn d 0
+  let f0 = find_flag d nn 0
+  -- content starts after ALL consecutive leading flags; ends at the next flag
+  let cstart = if f0 < 0 then nn else skip_flags d nn f0
+  let cend = next_flag d nn cstart
+  let _ = print (cat ["FLAGS first=", show f0, " content=[", show cstart, ",", show cend, ") (channel bits=", show nn, ")"])
+  let out = arr_new nn 0
+  let onescell = arr_new 1 0
+  let oicell = arr_new 1 0
+  let _ = destuff d cstart cend out onescell oicell cstart
+  let totbits = arr_get oicell 0
+  let nbytes = totbits / 8
+  let obytes = arr_new nbytes 0
+  let _ = pack_bits out nbytes obytes 0
+  -- split: last 2 bytes are the FCS (low byte first), rest is the frame
+  let framelen = nbytes - 2
+  let calc = crc16_x25 obytes framelen
+  let rxfcs = bit_or (arr_get obytes framelen) (shl (arr_get obytes (framelen + 1)) 8)
+  let _ = print (cat ["BYTES destuffed_bits=", show totbits, " bytes=", show nbytes, " frame=", show framelen])
+  let _ = print (cat ["FCS calc=0x", hex8 (bit_and (shr calc 8) 255), hex8 (bit_and calc 255), " rx=0x", hex8 (bit_and (shr rxfcs 8) 255), hex8 (bit_and rxfcs 255)])
+  let _ = print (cat ["CRC_OK=", show (if calc == rxfcs then 1 else 0)])
+  let _ = print (cat ["HEX ", hexdump obytes 0 nbytes ""])
+  let _ = print (cat ["ASCII ", asc obytes 0 framelen ""])
+  0

@@ -1,0 +1,234 @@
+-- ledaticground Orbcomm rung: HONEST CHARACTERIZATION fallback (pure Rail).
+--
+-- THE SOUL OF THIS RUNG:
+--   Where full payload DECODE is NOT possible from public specs (Orbcomm user data is a
+--   commercial, partly-encrypted system with NO public message dictionary), an honest
+--   receiver MUST NOT invent payload content. It reports only what it can physically
+--   MEASURE from the off-air IQ:
+--     - carrier present?         (in-burst SNR above a detection floor)
+--     - carrier offset (Hz)      (squared-symbol differential-product angle / 4pi)
+--     - symbol rate (sym/s)      (autocorrelation peak of per-sample transition energy)
+--     - packet timing (samples)  (6x-noise-floor power thresholding: start / length / gap)
+--     - SNR (dB)                 (in-burst mean power over the noise floor)
+--   It emits an explicit "PAYLOAD=NONE" line: NO bits, NO message fields are fabricated.
+--
+-- PUBLIC-KNOWLEDGE BASIS: Orbcomm downlink 137.2-137.8 MHz, ~25 kHz channels, SD-PSK
+--   ~4800 sym/s (FCC filings + SDR reverse-engineering). The PHY class + sym rate are
+--   public; payload semantics are not, and are NOT invented here.
+--
+-- I/O: reads an int8 IQ burst from /tmp/orbcomm_char_in.s8 ; prints CHAR / PAYLOAD lines.
+--
+-- Float accumulators always live in size-1 cells so loops carry only int indices
+-- (dodges the float-accumulator self-loop miscompile). malloc/free are builtins, never
+-- declared foreign (declaring them tags the 64-bit pointer as a 63-bit int and corrupts
+-- every byte read). && / || are written as nested if/then/else (no short-circuit in Rail).
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign log x -> float
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 -> float
+soft_at bytes k =
+  let b = arr_get bytes k
+  let s = if b < 128 then b else b - 256
+  int_to_float s
+
+-- ===================== power / burst timing (packet timing) =====================
+
+-- sum of instantaneous power over IQ samples [a, b) -> into cell[0]
+pow_acc bytes a b i cell =
+  if i >= b then 0
+  else
+    let ii = soft_at bytes (i * 2)
+    let qq = soft_at bytes (i * 2 + 1)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + ii * ii + qq * qq)
+    pow_acc bytes a b (i + 1) cell
+
+-- mean power over the W-sample window [i, i+W) -> float. Windowed (not single-sample) so
+-- isolated noise spikes in the inter-burst gap don't extend the detected burst boundaries.
+winpow bytes i w =
+  let c = float_arr_new 1 0.0
+  let _ = pow_acc bytes i (i + w) i c
+  (float_arr_get c 0) /. (int_to_float w)
+-- first index in [0, n-w) whose windowed mean power exceeds thr; -1 if none
+burst_start bytes n thr w i =
+  if i >= (n - w) then (0 - 1)
+  else
+    if (winpow bytes i w) >. thr then i
+    else burst_start bytes n thr w (i + 1)
+-- last index (scanning down) whose windowed mean power exceeds thr; returns i+w-1; -1 if none
+burst_end bytes thr w i =
+  if i < 0 then (0 - 1)
+  else
+    if (winpow bytes i w) >. thr then (i + w - 1)
+    else burst_end bytes thr w (i - 1)
+
+-- ===================== carrier offset (squared-symbol diff product) =====================
+-- z^2 removes the +/-pi BPSK data, leaving 2x carrier phase. The angle of
+-- sum(z[k]^2 * conj(z[k-1]^2)) = 2*(2pi*fc_per_samp), so fc_per_samp = angle/(4pi).
+sqprod_acc bytes a b i racc iacc =
+  if i >= b then 0
+  else
+    let i0 = soft_at bytes (i * 2)
+    let q0 = soft_at bytes (i * 2 + 1)
+    let i1 = soft_at bytes ((i - 1) * 2)
+    let q1 = soft_at bytes ((i - 1) * 2 + 1)
+    let zr0 = i0 * i0 - q0 * q0
+    let zi0 = 2.0 * i0 * q0
+    let zr1 = i1 * i1 - q1 * q1
+    let zi1 = 2.0 * i1 * q1
+    let pr = zr0 * zr1 + zi0 * zi1
+    let pii = zi0 * zr1 - zr0 * zi1
+    let _ = float_arr_set racc 0 ((float_arr_get racc 0) + pr)
+    let _ = float_arr_set iacc 0 ((float_arr_get iacc 0) + pii)
+    sqprod_acc bytes a b (i + 1) racc iacc
+
+-- ===================== symbol rate (transition-energy autocorrelation) =====================
+-- Build a per-sample transition-energy signal te[i] = |z[i] - z[i-1]|^2 over the burst.
+-- For oversampled PSK, te spikes every SPS samples (at symbol boundaries), so its
+-- autocorrelation has a clear peak at lag = SPS. We measure SPS as the lag in [lo,hi]
+-- maximizing the (mean-removed) autocorrelation -> sym_rate = FS / SPS. This is a GENUINE
+-- measurement from the IQ; the symbol rate is never handed in.
+fill_te bytes te a b i =
+  if i >= b then 0
+  else
+    let i0 = soft_at bytes (i * 2)
+    let q0 = soft_at bytes (i * 2 + 1)
+    let i1 = soft_at bytes ((i - 1) * 2)
+    let q1 = soft_at bytes ((i - 1) * 2 + 1)
+    let dr = i0 - i1
+    let di = q0 - q1
+    let _ = float_arr_set te (i - a) (dr * dr + di * di)
+    fill_te bytes te a b (i + 1)
+
+-- mean of te[0..m) -> into cell[0]
+te_mean te m i cell =
+  if i >= m then 0
+  else
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get te i))
+    te_mean te m (i + 1) cell
+
+-- autocorrelation of (te - mean) at lag L, summed over the valid overlap -> into cell[0]
+ac_at te mean m L i cell =
+  if i >= (m - L) then float_arr_get cell 0
+  else
+    let a = (float_arr_get te i) - mean
+    let b = (float_arr_get te (i + L)) - mean
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + a * b)
+    ac_at te mean m L (i + 1) cell
+
+-- PASS 1: scan lags [lo,hi], track the MAX autocorr value into bestval[0].
+-- mutual recursion to dodge the self-loop cross-dep-arg miscompile.
+max_step te mean m lo hi L bestval =
+  let c = float_arr_new 1 0.0
+  let v = ac_at te mean m L 0 c
+  let _ = if v >. (float_arr_get bestval 0) then float_arr_set bestval 0 v else 0
+  max_scan te mean m lo hi (L + 1) bestval
+max_scan te mean m lo hi L bestval =
+  if L > hi then 0
+  else max_step te mean m lo hi L bestval
+
+-- PASS 2: the symbol period is the FUNDAMENTAL, i.e. the SMALLEST lag whose autocorr
+-- clears a high fraction of the global peak. Transition-energy autocorr has peaks at every
+-- multiple of SPS (8,16,24,...) and the global max can land on a harmonic; taking the
+-- smallest prominent lag recovers the true samples/symbol. thr = 0.5 * peak.
+fund_step te mean m lo hi L thrv =
+  let c = float_arr_new 1 0.0
+  let v = ac_at te mean m L 0 c
+  if v >. thrv then L
+  else fund_scan te mean m lo hi (L + 1) thrv
+fund_scan te mean m lo hi L thrv =
+  if L > hi then 0
+  else fund_step te mean m lo hi L thrv
+
+main =
+  let iq = read_bytes "/tmp/orbcomm_char_in.s8"
+  let nsamp = (arr_len iq) / 2
+  let _ = print (cat ["INFO iq_samples=", show nsamp])
+
+  -- noise-floor power from the leading 200 samples (the inter-burst gap)
+  let nfcell = float_arr_new 1 0.0
+  let _ = pow_acc iq 0 200 0 nfcell
+  let nfloor = (float_arr_get nfcell 0) / 200.0
+
+  -- packet timing via a 6x-noise-floor power threshold over an 8-sample window
+  -- (windowed so isolated gap-noise spikes don't extend the burst boundaries)
+  let thr = 6.0 *. nfloor
+  let win = 8
+  let bstart = burst_start iq nsamp thr win 0
+  let bend = burst_end iq thr win (nsamp - win)
+  let blen = bend - bstart
+  let gap = bstart
+
+  -- in-burst mean power + SNR (dB) over the noise floor
+  let pcell = float_arr_new 1 0.0
+  let _ = pow_acc iq bstart bend bstart pcell
+  let pmean = (float_arr_get pcell 0) /. ((int_to_float (bend - bstart)) +. 0.000001)
+  let ln10 = log 10.0
+  let snr = 10.0 *. ((log (((pmean -. nfloor) /. (nfloor +. 0.000001)) +. 0.000001)) /. ln10)
+  -- carrier present iff SNR clears a 3 dB detection floor (nested if -> 0/1 flag, no &&)
+  let carrier_present = if snr >. 3.0 then 1 else 0
+
+  -- carrier offset from squared-symbol differential product
+  let racc = float_arr_new 1 0.0
+  let iacc = float_arr_new 1 0.0
+  let _ = sqprod_acc iq (bstart + 1) bend (bstart + 1) racc iacc
+  let ang = atan2 (float_arr_get iacc 0) (float_arr_get racc 0)
+  let twopi = (atan2 0.0 (0.0 - 1.0)) *. 2.0
+  let fc_cyc = ang /. (2.0 *. twopi)
+  let fs = 38400.0
+  let foff_hz = fc_cyc *. fs
+
+  -- symbol rate via transition-energy autocorrelation over the burst.
+  let m = blen
+  let te = float_arr_new (m + 1) 0.0
+  let _ = fill_te iq te bstart bend (bstart + 1)
+  let mlen = m - 1
+  let mc = float_arr_new 1 0.0
+  let _ = te_mean te mlen 0 mc
+  let tmean = (float_arr_get mc 0) /. ((int_to_float mlen) +. 0.000001)
+  -- search lags [3,32]: pass1 finds the peak autocorr value, pass2 returns the SMALLEST
+  -- lag clearing 0.5*peak (the fundamental samples/symbol, not a harmonic).
+  let bestval = float_arr_new 1 (0.0 -. 1000000000.0)
+  let _ = max_scan te tmean mlen 3 32 3 bestval
+  let peak = float_arr_get bestval 0
+  let thrv = 0.5 *. peak
+  let sps = fund_scan te tmean mlen 3 32 3 thrv
+  let symrate = if sps == 0 then 0.0 else fs /. (int_to_float sps)
+
+  -- ---- report ONLY measured observables; NEVER fabricate payload ----
+  let _ = print (cat ["CHAR noise_floor=", show_float nfloor, " thr=", show_float thr])
+  let _ = print (cat ["CHAR carrier_present=", show carrier_present])
+  let _ = print (cat ["CHAR burst_start=", show bstart, " burst_len=", show blen, " gap=", show gap, " samples"])
+  let _ = print (cat ["CHAR snr_db=", show_float snr])
+  let _ = print (cat ["CHAR carrier_offset_hz=", show_float foff_hz, " (fs=", show_float fs, ")"])
+  let _ = print (cat ["CHAR sps=", show sps, " sym_rate_hz=", show_float symrate, " (documented Orbcomm ~4800 sym/s)"])
+  -- the honesty line: payload semantics are PROPRIETARY and NOT publicly specified, so we
+  -- decode NOTHING above the link layer. No bits, no message fields are invented.
+  let _ = print "PAYLOAD=NONE semantics PROPRIETARY -- not publicly specified, not decoded"
+  0

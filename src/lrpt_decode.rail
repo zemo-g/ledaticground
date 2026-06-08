@@ -1,0 +1,690 @@
+-- ledaticground: END-TO-END LRPT decoder — the full Meteor-M2 LRPT receive chain
+-- wired into ONE pure-Rail pipeline. It runs the complete reverse chain on the
+-- synthetic full-chain IQ vector (gen via scripts/gen_lrpt_decode.py) and
+-- self-checks the reconstructed image against an independent numpy ground truth.
+--
+-- CHAIN (each stage mirrors its standalone rung, same params):
+--   raw int8 IQ  /tmp/lrpt_chain.s8
+--    -> RRC matched filter (beta=0.6 sps=4 span=4, 'same' conv)          [rrc.rail]
+--    -> decimate at the max-power phase -> QPSK soft pairs (I,Q)/symbol   [gardner/qpsk]
+--    -> soft-decision Viterbi r=1/2 K=7 (G1=121 G2=91), terminated        [viterbi.rail]
+--    -> strip the 32-bit ASM 0x1ACFFC1D at the front                      [framesync.rail]
+--    -> regroup body bits MSB-first into 1020 randomized RS bytes
+--    -> CCSDS derandomize (PN XOR, LFSR 0xFF, h=x^8+x^7+x^5+x^3+1)        [derand.rail]
+--    -> I=4 de-interleave -> 4x RS(255,223) decode (GF(256) 0x11D)        [rs.rail]
+--    -> assemble the 892-byte frame -> VCDU/M-PDU demux + packet walk     [vcdu.rail]
+--    -> per packet: int16 LE coeffs -> inverse zig-zag + dequant + IDCT   [dct.rail]
+--    -> reconstructed 8x8 pixel blocks == the source image.
+--
+-- HONESTY: synthetic numpy vector, no real Meteor pass, no attestation. The RS
+-- uses the conventional (Berlekamp) field, NOT the CCSDS dual-basis byte
+-- representation. The DCT rung carries raw int16 coeffs (the JPEG entropy stage
+-- is upstream and not modeled). This wires the per-rung CORES into one stream.
+--
+-- Rail-trap discipline (see CLAUDE.md): every recursion carries only int indices,
+-- all float accumulators/loop-state live in float-array cells, float compares use
+-- the dotted ops (<. >=.), the big ASM literal is held as 4 small byte constants,
+-- and 0x11D appears only as an operand (285), never in a branch-value position.
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+-- ============================================================ file IO (reused verbatim)
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- int8 (signed) sample at byte index k, as float (reused from qpsk.rail)
+soft_at bytes k =
+  let b = arr_get bytes k
+  let s = if b < 128 then b else b - 256
+  int_to_float s
+
+absf x = if x <. 0.0 then (0.0 - x) else x
+pi = atan2 0.0 (0.0 - 1.0)
+
+-- ============================================================ STAGE 1: RRC matched filter
+-- closed-form RRC tap (reused from rrc.rail)
+rrc_tap ti beta =
+  let at = absf ti
+  if at <. 0.00000001 then
+    1.0 - beta + 4.0 * beta / pi
+  else
+    let edge = absf (absf (4.0 * beta * ti) - 1.0)
+    if edge <. 0.00000001 then
+      (beta / (sqrt 2.0)) * ((1.0 + 2.0 / pi) * (sin (pi / (4.0 * beta))) + (1.0 - 2.0 / pi) * (cos (pi / (4.0 * beta))))
+    else
+      let num = (sin (pi * ti * (1.0 - beta))) + 4.0 * beta * ti * (cos (pi * ti * (1.0 + beta)))
+      let den = pi * ti * (1.0 - (4.0 * beta * ti) * (4.0 * beta * ti))
+      num / den
+fill_taps taps ntaps sps beta i =
+  if i >= ntaps then 0
+  else
+    let center = int_to_float (ntaps - 1) / 2.0
+    let ti = (int_to_float i - center) / (int_to_float sps)
+    let _ = float_arr_set taps i (rrc_tap ti beta)
+    fill_taps taps ntaps sps beta (i + 1)
+-- de-interleave int8 IQ to per-channel float arrays
+deint bytes nin xi xq i =
+  if i >= nin then 0
+  else
+    let _ = float_arr_set xi i (soft_at bytes (i * 2))
+    let _ = float_arr_set xq i (soft_at bytes (i * 2 + 1))
+    deint bytes nin xi xq (i + 1)
+-- 'same'-mode convolution (reused from rrc.rail); accumulator in acc[0]
+conv_inner x nin taps ntaps n half t acc =
+  if t >= ntaps then 0
+  else
+    let xi = n + half - t
+    let xv = if xi < 0 then 0.0 else (if xi >= nin then 0.0 else float_arr_get x xi)
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + xv * (float_arr_get taps t))
+    conv_inner x nin taps ntaps n half (t + 1) acc
+conv x nin taps ntaps y n half acc =
+  if n >= nin then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = conv_inner x nin taps ntaps n half 0 acc
+    let _ = float_arr_set y n (float_arr_get acc 0)
+    conv x nin taps ntaps y (n + 1) half acc
+
+-- ============================================================ STAGE 2: timing / decimation
+-- pick the decimation phase whose decimated symbols carry max average power
+-- (the RRC matched-filter peak; matches the gardner lock target on a static clock).
+phase_pow yi yq nin sps ph i acc =
+  if (ph + i * sps) >= nin then float_arr_get acc 0
+  else
+    let k = ph + i * sps
+    let vi = float_arr_get yi k
+    let vq = float_arr_get yq k
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + vi * vi + vq * vq)
+    phase_pow yi yq nin sps ph (i + 1) acc
+best_phase yi yq nin sps ph bestph bestpw acc =
+  if ph >= sps then arr_get bestph 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let pw = phase_pow yi yq nin sps ph 0 acc
+    let _ = if pw >. (float_arr_get bestpw 0) then
+              let _ = float_arr_set bestpw 0 pw
+              let _ = arr_set bestph 0 ph
+              0
+            else 0
+    best_phase yi yq nin sps (ph + 1) bestph bestpw acc
+-- decimate at phase ph -> soft I/Q per symbol into si[],sq[]
+decimate yi yq nin sps ph nsym si sq i =
+  if i >= nsym then 0
+  else
+    let k = ph + i * sps
+    let vi = if k < nin then float_arr_get yi k else 0.0
+    let vq = if k < nin then float_arr_get yq k else 0.0
+    let _ = float_arr_set si i vi
+    let _ = float_arr_set sq i vq
+    decimate yi yq nin sps ph nsym si sq (i + 1)
+
+-- ============================================================ STAGE 3: Viterbi r=1/2 K=7
+-- soft pairs are (si,sq): +value correlates with coded bit 0, - with bit 1 (Gray QPSK
+-- map from the generator). Float path metrics in pm/npm (64), per-step max-normalized.
+popc r = if r == 0 then 0 else (bit_and r 1) + popc (shr r 1)
+parity r = bit_and (popc r) 1
+fill_tab reg o1 o2 g1 g2 =
+  if reg > 127 then 0
+  else
+    let _ = arr_set o1 reg (parity (bit_and reg g1))
+    let _ = arr_set o2 reg (parity (bit_and reg g2))
+    fill_tab (reg + 1) o1 o2 g1 g2
+init_pm pm i =
+  if i > 63 then 0
+  else
+    let _ = float_arr_set pm i (if i == 0 then 0.0 else (0.0 - 1000000000.0))
+    init_pm pm (i + 1)
+-- branch metric for an expected output bit e against soft s: +s if e=0 else -s
+-- add-compare-select over all 64 next states (float metrics)
+acs ns pm npm o1 o2 s1 s2 tb tbase =
+  if ns > 63 then 0
+  else
+    let bit = bit_and ns 1
+    let p0 = shr ns 1
+    let p1 = bit_or p0 32
+    let reg0 = bit_or (shl p0 1) bit
+    let reg1 = bit_or reg0 64
+    let bm0 = (if (arr_get o1 reg0) == 0 then s1 else (0.0 - s1)) + (if (arr_get o2 reg0) == 0 then s2 else (0.0 - s2))
+    let bm1 = (if (arr_get o1 reg1) == 0 then s1 else (0.0 - s1)) + (if (arr_get o2 reg1) == 0 then s2 else (0.0 - s2))
+    let c0 = (float_arr_get pm p0) + bm0
+    let c1 = (float_arr_get pm p1) + bm1
+    let _ = if c0 >=. c1 then
+              let _ = float_arr_set npm ns c0
+              let _ = arr_set tb (tbase + ns) p0
+              0
+            else
+              let _ = float_arr_set npm ns c1
+              let _ = arr_set tb (tbase + ns) p1
+              0
+    acs (ns + 1) pm npm o1 o2 s1 s2 tb tbase
+fmax a i n best =
+  if i >= n then best
+  else
+    let v = float_arr_get a i
+    fmax a (i + 1) n (if v >. best then v else best)
+fsub_all a i n d =
+  if i >= n then 0
+  else
+    let _ = float_arr_set a i ((float_arr_get a i) - d)
+    fsub_all a (i + 1) n d
+fcopy src dst i n =
+  if i >= n then 0
+  else
+    let _ = float_arr_set dst i (float_arr_get src i)
+    fcopy src dst (i + 1) n
+vit_steps si sq nsteps t pm npm o1 o2 tb =
+  if t >= nsteps then 0
+  else
+    let s1 = float_arr_get si t
+    let s2 = float_arr_get sq t
+    let _ = acs 0 pm npm o1 o2 s1 s2 tb (t * 64)
+    let mx = fmax npm 0 64 (0.0 - 1000000000.0)
+    let _ = fsub_all npm 0 64 mx
+    let _ = fcopy npm pm 0 64
+    vit_steps si sq nsteps (t + 1) pm npm o1 o2 tb
+-- traceback from terminated state 0; decoded bit per step into outbits
+vit_trace tb t scell outbits =
+  if t < 0 then 0
+  else
+    let st = arr_get scell 0
+    let _ = arr_set outbits t (bit_and st 1)
+    let _ = arr_set scell 0 (arr_get tb (t * 64 + st))
+    vit_trace tb (t - 1) scell outbits
+
+-- ============================================================ STAGE 4: frame sync (strip ASM)
+-- ASM 0x1ACFFC1D held as 4 small bytes (big-literal trap); bit k = bit (7-k%8) of byte k/8
+asm_byte j = if j == 0 then 26 else (if j == 1 then 207 else (if j == 2 then 252 else 29))
+asm_bit k =
+  let j = k / 8
+  let b = k - j * 8
+  bit_and (shr (asm_byte j) (7 - b)) 1
+-- bit-error count of the 32-bit window at offset off against the ASM
+asm_err bits off k cell =
+  if k >= 32 then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get bits (off + k)) == (asm_bit k) then 0 else 1))
+    asm_err bits off (k + 1) cell
+-- slide offset (step 2, symbol-aligned), accept first <=thresh-error window. -1 = none.
+hunt bits n off thresh ocell =
+  if (off + 32) > n then 0
+  else if (arr_get ocell 0) >= 0 then 0
+  else
+    let cell = arr_new 1 0
+    let _ = asm_err bits off 0 cell
+    let _ = if (arr_get cell 0) <= thresh then
+              let _ = arr_set ocell 0 off
+              0
+            else 0
+    hunt bits n (off + 2) thresh ocell
+
+-- ============================================================ STAGE 5: bits -> bytes
+-- pack `nbytes` bytes MSB-first from bit stream starting at bit offset `boff`
+pack_bytes bits boff nbytes out =
+  pack_loop bits boff nbytes out 0
+pack_loop bits boff nbytes out i =
+  if i >= nbytes then 0
+  else
+    let v = pack_one bits (boff + i * 8) 0 0
+    let _ = arr_set out i v
+    pack_loop bits boff nbytes out (i + 1)
+pack_one bits base k acc =
+  if k >= 8 then acc
+  else pack_one bits base (k + 1) (bit_or (shl acc 1) (arr_get bits (base + k)))
+
+-- ============================================================ STAGE 6: CCSDS derand (PN XOR)
+xor8 a b = (bit_or a b) - (bit_and a b)
+pn_byte scell j acc =
+  if j >= 8 then acc
+  else
+    let st = arr_get scell 0
+    let out = bit_and (shr st 7) 1
+    let fb = xor8 (xor8 (bit_and st 1) (bit_and (shr st 2) 1)) (xor8 (bit_and (shr st 4) 1) (bit_and (shr st 7) 1))
+    let _ = arr_set scell 0 (bit_and (bit_or (shl st 1) fb) 255)
+    pn_byte scell (j + 1) (bit_or (shl acc 1) out)
+fill_pn scell i count pn =
+  if i >= count then 0
+  else
+    let _ = arr_set pn i (pn_byte scell 0 0)
+    fill_pn scell (i + 1) count pn
+derand_inplace block n i pn =
+  if i >= n then 0
+  else
+    let _ = arr_set block i (xor8 (arr_get block i) (arr_get pn (i % 255)))
+    derand_inplace block n (i + 1) pn
+
+-- ============================================================ STAGE 7: RS(255,223) decode
+-- GF(256) tables (reused from rs.rail)
+build_gf exp lg i x =
+  if i >= 255 then 0
+  else
+    let _ = arr_set exp i x
+    let _ = arr_set lg x i
+    let nx0 = shl x 1
+    let nx = if nx0 >= 256 then bit_xor nx0 285 else nx0
+    build_gf exp lg (i + 1) nx
+ext_exp exp i = if i >= 512 then 0 else let _ = arr_set exp i (arr_get exp (i - 255)) in ext_exp exp (i + 1)
+gmul exp lg a b =
+  if a == 0 then 0
+  else if b == 0 then 0
+  else arr_get exp (((arr_get lg a) + (arr_get lg b)) % 255)
+gdiv exp lg a b =
+  if a == 0 then 0
+  else arr_get exp (((arr_get lg a) - (arr_get lg b) + 255) % 255)
+gpow exp p = arr_get exp (p % 255)
+-- de-interleave: codeword k byte i = cadu[i*I + k]
+deinter cadu cw ii k i =
+  if i >= 255 then 0
+  else
+    let _ = arr_set cw i (arr_get cadu (i * ii + k))
+    deinter cadu cw ii k (i + 1)
+syn_horner exp lg cw root i scell =
+  if i >= 255 then 0
+  else
+    let _ = arr_set scell 0 (bit_xor (gmul exp lg (arr_get scell 0) root) (arr_get cw i))
+    syn_horner exp lg cw root (i + 1) scell
+calc_syn exp lg cw synd npar j =
+  if j >= npar then 0
+  else
+    let root = gpow exp (1 + j)
+    let sc = arr_new 1 0
+    let _ = syn_horner exp lg cw root 0 sc
+    let _ = arr_set synd j (arr_get sc 0)
+    calc_syn exp lg cw synd npar (j + 1)
+syn_nz synd npar j = if j >= npar then 0 else (if (arr_get synd j) != 0 then 1 else syn_nz synd npar (j + 1))
+poly_copy src dst n i = if i > n then 0 else let _ = arr_set dst i (arr_get src i) in poly_copy src dst n (i + 1)
+poly_zero a n i = if i > n then 0 else let _ = arr_set a i 0 in poly_zero a n (i + 1)
+bm_disc exp lg lam synd r ll i dcell =
+  if i > ll then 0
+  else
+    let _ = arr_set dcell 0 (bit_xor (arr_get dcell 0) (gmul exp lg (arr_get lam i) (arr_get synd (r - i))))
+    bm_disc exp lg lam synd r ll (i + 1) dcell
+bm_shift_update exp lg lam b t coef m npar i =
+  if i > npar then 0
+  else
+    let bsh = if (i - m) < 0 then 0 else arr_get b (i - m)
+    let _ = arr_set t i (bit_xor (arr_get lam i) (gmul exp lg coef bsh))
+    bm_shift_update exp lg lam b t coef m npar (i + 1)
+berlekamp exp lg synd npar lam b t lcell mcell =
+  let _ = poly_zero lam npar 0
+  let _ = poly_zero b npar 0
+  let _ = arr_set lam 0 1
+  let _ = arr_set b 0 1
+  let _ = arr_set lcell 0 0
+  let _ = arr_set mcell 0 1
+  let bdc = arr_new 1 1
+  let _ = bm_loop exp lg synd npar lam b t lcell mcell bdc 0
+  0
+bm_loop exp lg synd npar lam b t lcell mcell bdc r =
+  if r >= npar then 0
+  else
+    let ll = arr_get lcell 0
+    let dc = arr_new 1 0
+    let _ = arr_set dc 0 (arr_get synd r)
+    let _ = bm_disc exp lg lam synd r ll 1 dc
+    let d = arr_get dc 0
+    let m = arr_get mcell 0
+    let _ = if d == 0 then
+              let _ = arr_set mcell 0 (m + 1)
+              0
+            else
+              let coef = gdiv exp lg d (arr_get bdc 0)
+              let _ = poly_copy lam t npar 0
+              let _ = bm_shift_update exp lg lam b t coef m npar 0
+              let _ = if (2 * ll) <= r then
+                        let _ = poly_copy lam b npar 0
+                        let _ = poly_copy t lam npar 0
+                        let _ = arr_set lcell 0 (r + 1 - ll)
+                        let _ = arr_set bdc 0 d
+                        let _ = arr_set mcell 0 1
+                        0
+                      else
+                        let _ = poly_copy t lam npar 0
+                        let _ = arr_set mcell 0 (m + 1)
+                        0
+              0
+    bm_loop exp lg synd npar lam b t lcell mcell bdc (r + 1)
+lam_eval exp lg lam ll x j acc =
+  if j > ll then acc
+  else lam_eval exp lg lam ll x (j + 1) (bit_xor acc (gmul exp lg (arr_get lam j) (gpow exp (((arr_get lg x) * j) % 255))))
+chien exp lg lam ll epos ecell i =
+  if i >= 255 then 0
+  else
+    let x = gpow exp ((255 - i) % 255)
+    let v = lam_eval exp lg lam ll x 0 0
+    let _ = if v == 0 then
+              let n = arr_get ecell 0
+              let _ = arr_set epos n i
+              let _ = arr_set ecell 0 (n + 1)
+              0
+            else 0
+    chien exp lg lam ll epos ecell (i + 1)
+calc_omega exp lg synd lam npar ll omega d =
+  if d >= npar then 0
+  else
+    let oc = arr_new 1 0
+    let _ = omega_inner exp lg synd lam d 0 oc
+    let _ = arr_set omega d (arr_get oc 0)
+    calc_omega exp lg synd lam npar ll omega (d + 1)
+omega_inner exp lg synd lam d j oc =
+  if j > d then 0
+  else
+    let _ = arr_set oc 0 (bit_xor (arr_get oc 0) (gmul exp lg (arr_get synd j) (arr_get lam (d - j))))
+    omega_inner exp lg synd lam d (j + 1) oc
+poly_eval exp lg p deg x j acc =
+  if j > deg then acc
+  else poly_eval exp lg p deg x (j + 1) (bit_xor acc (gmul exp lg (arr_get p j) (gpow exp (((arr_get lg x) * j) % 255))))
+lamprime_eval exp lg lam ll x j acc =
+  if j > ll then acc
+  else
+    let term = if (bit_and j 1) == 1 then gmul exp lg (arr_get lam j) (gpow exp (((arr_get lg x) * (j - 1)) % 255)) else 0
+    lamprime_eval exp lg lam ll x (j + 1) (bit_xor acc term)
+forney_fix exp lg cw synd lam omega npar ll epos nerr k =
+  if k >= nerr then 0
+  else
+    let i = arr_get epos k
+    let xinv = gpow exp ((255 - i) % 255)
+    let om = poly_eval exp lg omega (npar - 1) xinv 0 0
+    let lp = lamprime_eval exp lg lam ll xinv 1 0
+    let mag = if lp == 0 then 0 else gdiv exp lg om lp
+    let bidx = 254 - i
+    let _ = arr_set cw bidx (bit_xor (arr_get cw bidx) mag)
+    forney_fix exp lg cw synd lam omega npar ll epos nerr (k + 1)
+-- decode codeword cw (255), write 223 data bytes into frame at frameoff. ok->okcell+1.
+decode_cw exp lg cw npar frame frameoff okcell =
+  let synd = arr_new npar 0
+  let _ = calc_syn exp lg cw synd npar 0
+  if (syn_nz synd npar 0) == 0 then
+    let _ = copy_data cw frame frameoff 0
+    let _ = arr_set okcell 0 ((arr_get okcell 0) + 1)
+    0
+  else
+    let lam = arr_new (npar + 1) 0
+    let b = arr_new (npar + 1) 0
+    let t = arr_new (npar + 1) 0
+    let lcell = arr_new 1 0
+    let mcell = arr_new 1 0
+    let _ = berlekamp exp lg synd npar lam b t lcell mcell
+    let ll = arr_get lcell 0
+    let epos = arr_new 255 0
+    let ecell = arr_new 1 0
+    let _ = chien exp lg lam ll epos ecell 0
+    let nerr = arr_get ecell 0
+    let omega = arr_new npar 0
+    let _ = calc_omega exp lg synd lam npar ll omega 0
+    let _ = forney_fix exp lg cw synd lam omega npar ll epos nerr 0
+    let synd2 = arr_new npar 0
+    let _ = calc_syn exp lg cw synd2 npar 0
+    let _ = if (syn_nz synd2 npar 0) == 0 then arr_set okcell 0 ((arr_get okcell 0) + 1) else 0
+    let _ = copy_data cw frame frameoff 0
+    0
+copy_data cw frame frameoff i =
+  if i >= 223 then 0
+  else
+    let _ = arr_set frame (frameoff + i) (arr_get cw i)
+    copy_data cw frame frameoff (i + 1)
+-- decode all I codewords, lay 4*223 data bytes contiguously into frame
+decode_all exp lg cadu ii npar frame okcell k =
+  if k >= ii then 0
+  else
+    let cw = arr_new 255 0
+    let _ = deinter cadu cw ii k 0
+    let _ = decode_cw exp lg cw npar frame (k * 223) okcell
+    decode_all exp lg cadu ii npar frame okcell (k + 1)
+
+-- ============================================================ STAGE 8: VCDU / M-PDU demux
+be16 b o = bit_or (shl (arr_get b o) 8) (arr_get b (o + 1))
+-- walk packets from offset p; store each payload start offset into payoffs[],
+-- payload length into paylens[], count in kcell. apid filter stops at non-image.
+walk b p plen_total apid_want payoffs paylens kcell =
+  if (p + 6) > plen_total then 0
+  else
+    let w0 = be16 b p
+    let apid = bit_and w0 2047
+    let dl = be16 b (p + 4)
+    let plen = dl + 1
+    let total = 6 + plen
+    if (p + total) > plen_total then 0
+    else if apid != apid_want then 0
+    else
+      let k = arr_get kcell 0
+      let _ = arr_set payoffs k (p + 6)
+      let _ = arr_set paylens k plen
+      let _ = arr_set kcell 0 (k + 1)
+      walk b (p + total) plen_total apid_want payoffs paylens kcell
+
+-- ============================================================ STAGE 9: DCT decompress
+-- read signed int16 LE from frame at byte offset (base + c*2)
+s16_at b base c =
+  let lo = arr_get b (base + c * 2)
+  let hi = arr_get b (base + c * 2 + 1)
+  let u = bit_or (shl hi 8) lo
+  if u >= 32768 then u - 65536 else u
+qtbl j =
+  if j < 8 then (if j==0 then 16 else if j==1 then 11 else if j==2 then 10 else if j==3 then 16 else if j==4 then 24 else if j==5 then 40 else if j==6 then 51 else 61)
+  else if j < 16 then (if j==8 then 12 else if j==9 then 12 else if j==10 then 14 else if j==11 then 19 else if j==12 then 26 else if j==13 then 58 else if j==14 then 60 else 55)
+  else if j < 24 then (if j==16 then 14 else if j==17 then 13 else if j==18 then 16 else if j==19 then 24 else if j==20 then 40 else if j==21 then 57 else if j==22 then 69 else 56)
+  else if j < 32 then (if j==24 then 14 else if j==25 then 17 else if j==26 then 22 else if j==27 then 29 else if j==28 then 51 else if j==29 then 87 else if j==30 then 80 else 62)
+  else if j < 40 then (if j==32 then 18 else if j==33 then 22 else if j==34 then 37 else if j==35 then 56 else if j==36 then 68 else if j==37 then 109 else if j==38 then 103 else 77)
+  else if j < 48 then (if j==40 then 24 else if j==41 then 35 else if j==42 then 55 else if j==43 then 64 else if j==44 then 81 else if j==45 then 104 else if j==46 then 113 else 92)
+  else if j < 56 then (if j==48 then 49 else if j==49 then 64 else if j==50 then 78 else if j==51 then 87 else if j==52 then 103 else if j==53 then 121 else if j==54 then 120 else 101)
+  else (if j==56 then 72 else if j==57 then 92 else if j==58 then 95 else if j==59 then 98 else if j==60 then 112 else if j==61 then 100 else if j==62 then 103 else 99)
+fill_zz zz =
+  let s = "0 1 8 16 9 2 3 10 17 24 32 25 18 11 4 5 12 19 26 33 40 48 41 34 27 20 13 6 7 14 21 28 35 42 49 56 57 50 43 36 29 22 15 23 30 37 44 51 58 59 52 45 38 31 39 46 53 60 61 54 47 55 62 63 "
+  let _ = zz_parse zz s 0 0 0
+  0
+zz_parse zz s pos idx acc =
+  if idx >= 64 then 0
+  else
+    let ch = str_sub s pos 1
+    if ch == " " then
+      let _ = arr_set zz idx acc
+      zz_parse zz s (pos + 1) (idx + 1) 0
+    else
+      let d = char_to_int ch - 48
+      zz_parse zz s (pos + 1) idx (acc * 10 + d)
+cscale u = if u == 0 then sqrt (1.0 / 8.0) else sqrt (2.0 / 8.0)
+cbasis x u = cos ((int_to_float (2 * x + 1)) * (int_to_float u) * pi / 16.0)
+-- dequant into natural-order float array D from int16 LE coeffs at byte base
+deq_fill D b base zz j =
+  if j >= 64 then 0
+  else
+    let nat = arr_get zz j
+    let q = s16_at b base j
+    let _ = float_arr_set D nat (int_to_float (q * (qtbl nat)))
+    deq_fill D b base zz (j + 1)
+idct_inner D x y u v acc =
+  if u >= 8 then 0
+  else if v >= 8 then idct_inner D x y (u + 1) 0 acc
+  else
+    let term = (cscale u) * (cscale v) * (float_arr_get D (u * 8 + v)) * (cbasis x u) * (cbasis y v)
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + term)
+    idct_inner D x y u (v + 1) acc
+idct_block D out x y acc =
+  if x >= 8 then 0
+  else if y >= 8 then idct_block D out (x + 1) 0 acc
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = idct_inner D x y 0 0 acc
+    let v = (float_arr_get acc 0) + 128.0
+    let r = v + 0.5
+    let ri = float_to_int r
+    let cl = if ri < 0 then 0 else (if ri > 255 then 255 else ri)
+    let _ = arr_set out (x * 8 + y) cl
+    idct_block D out x (y + 1) acc
+
+-- ============================================================ output / self-check helpers
+pixs out i acc = if i >= 64 then acc else pixs out (i + 1) (cat [acc, show (arr_get out i), " "])
+-- compare decoded 64-pixel block (out) to expected[expbase..expbase+64); count mismatches
+cmp_block out expect expbase i cell =
+  if i >= 64 then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get out i) == (arr_get expect (expbase + i)) then 0 else 1))
+    cmp_block out expect expbase (i + 1) cell
+
+-- ============================================================ MAIN: wire the whole chain
+main =
+  -- ---- stage 1: read IQ + RRC matched filter --------------------------------
+  let sps = 4
+  let beta = 0.6
+  let span = 4
+  let ntaps = 2 * sps * span + 1
+  let half = (ntaps - 1) / 2
+  let bytes = read_bytes "/tmp/lrpt_chain.s8"
+  let nbytes_iq = arr_len bytes
+  let nin = nbytes_iq / 2
+  let _ = print (cat ["[1] RRC: iq_bytes=", show nbytes_iq, " samples=", show nin, " ntaps=", show ntaps])
+  let xi = float_arr_new nin 0.0
+  let xq = float_arr_new nin 0.0
+  let _ = deint bytes nin xi xq 0
+  let taps = float_arr_new ntaps 0.0
+  let _ = fill_taps taps ntaps sps beta 0
+  let yi = float_arr_new nin 0.0
+  let yq = float_arr_new nin 0.0
+  let acc = float_arr_new 1 0.0
+  let _ = conv xi nin taps ntaps yi 0 half acc
+  let _ = conv xq nin taps ntaps yq 0 half acc
+
+  -- ---- stage 2: best decimation phase -> soft QPSK pairs --------------------
+  let bestph = arr_new 1 0
+  let bestpw = float_arr_new 1 0.0
+  let _ = float_arr_set bestpw 0 (0.0 - 1.0)
+  let _ = best_phase yi yq nin sps 0 bestph bestpw acc
+  let ph = arr_get bestph 0
+  let nsym = nin / sps
+  let si = float_arr_new nsym 0.0
+  let sq = float_arr_new nsym 0.0
+  let _ = decimate yi yq nin sps ph nsym si sq 0
+  let _ = print (cat ["[2] timing: phase=", show ph, " symbols=", show nsym])
+
+  -- ---- stage 3: soft Viterbi r=1/2 K=7 (G1=121 G2=91) -----------------------
+  let o1 = arr_new 128 0
+  let o2 = arr_new 128 0
+  let _ = fill_tab 0 o1 o2 121 91
+  let pm = float_arr_new 64 0.0
+  let npm = float_arr_new 64 0.0
+  let _ = init_pm pm 0
+  let nsteps = nsym
+  let tb = arr_new (nsteps * 64) 0
+  let _ = vit_steps si sq nsteps 0 pm npm o1 o2 tb
+  let decbits = arr_new nsteps 0
+  let scell = arr_new 1 0
+  let _ = arr_set scell 0 0
+  let _ = vit_trace tb (nsteps - 1) scell decbits
+  let _ = print (cat ["[3] viterbi: trellis_steps=", show nsteps, " decoded_bits=", show nsteps])
+
+  -- ---- stage 4: frame sync (find + strip ASM) ------------------------------
+  let ocell = arr_new 1 0
+  let _ = arr_set ocell 0 (0 - 1)
+  let _ = hunt decbits nsteps 0 2 ocell
+  let asmoff = arr_get ocell 0
+  let _ = print (cat ["[4] framesync: asm_offset=", show asmoff])
+  -- proceed with body even if asm not found at 0 (report it); body starts after ASM
+  let bodyoff = if asmoff < 0 then 32 else (asmoff + 32)
+
+  -- ---- stage 5: regroup body bits -> 1020 randomized RS bytes ---------------
+  let ii = 4
+  let nrsbytes = ii * 255
+  let randblk = arr_new nrsbytes 0
+  let _ = pack_bytes decbits bodyoff nrsbytes randblk
+  let _ = print (cat ["[5] regroup: rs_bytes=", show nrsbytes])
+
+  -- ---- stage 6: CCSDS derandomize (PN XOR, in place) -----------------------
+  let pnscell = arr_new 1 0
+  let _ = arr_set pnscell 0 255
+  let pn = arr_new 256 0
+  let _ = fill_pn pnscell 0 256 pn
+  let _ = derand_inplace randblk nrsbytes 0 pn
+  let _ = print (cat ["[6] derand: PN0=", show (arr_get pn 0), " (expect 255)"])
+
+  -- ---- stage 7: RS(255,223) I=4 decode -> 892-byte frame -------------------
+  let exptab = arr_new 512 0
+  let lg = arr_new 256 0
+  let _ = build_gf exptab lg 0 1
+  let _ = ext_exp exptab 255
+  let npar = 32
+  let frame = arr_new (ii * 223) 0
+  let okcell = arr_new 1 0
+  let _ = decode_all exptab lg randblk ii npar frame okcell 0
+  let rsok = arr_get okcell 0
+  let _ = print (cat ["[7] reed-solomon: codewords_ok=", show rsok, "/", show ii, " frame_bytes=", show (ii * 223)])
+
+  -- ---- stage 8: VCDU / M-PDU demux -> packet list --------------------------
+  let vw = be16 frame 0
+  let scid = bit_and (shr vw 6) 255
+  let vcid = bit_and vw 63
+  let vcnt = bit_or (bit_or (shl (arr_get frame 2) 16) (shl (arr_get frame 3) 8)) (arr_get frame 4)
+  let mh = be16 frame 6
+  let fhp = bit_and mh 2047
+  let _ = print (cat ["[8] vcdu: scid=", show scid, " vcid=", show vcid, " vcnt=", show vcnt, " fhp=", show fhp])
+  let framelen = ii * 223
+  let pstart = 8 + fhp
+  let payoffs = arr_new 64 0
+  let paylens = arr_new 64 0
+  let kcell = arr_new 1 0
+  let apid_want = 64
+  let _ = walk frame pstart framelen apid_want payoffs paylens kcell
+  let npkt = arr_get kcell 0
+  let _ = print (cat ["    packets=", show npkt])
+
+  -- ---- stage 9: DCT decompress each packet -> pixels + self-check -----------
+  let expect = read_bytes "/tmp/lrpt_decode_expect.s8"
+  let nexp = arr_len expect
+  let nbexp = nexp / 64
+  let zz = arr_new 64 0
+  let _ = fill_zz zz
+  let totalmis = arr_new 1 0
+  let _ = decode_and_check frame payoffs paylens npkt zz expect nbexp totalmis 0
+
+  -- ---- final self-check verdict --------------------------------------------
+  let mism = arr_get totalmis 0
+  let blocksok = if npkt < nbexp then npkt else nbexp
+  let chain_full = if rsok == ii then (if npkt == nbexp then 1 else 0) else 0
+  let _ = print (cat ["[9] image: blocks_decoded=", show npkt, " expected=", show nbexp, " total_pixel_mismatches=", show mism])
+  let pass = if chain_full == 1 then (if mism == 0 then 1 else 0) else 0
+  let _ = print (if pass == 1 then "SELFCHECK PASS" else "SELFCHECK FAIL")
+  let _ = print (if pass == 1 then "PASS" else "FAIL")
+  0
+
+-- per-packet decode + compare-to-expected (carries int index; mismatch count in cell)
+decode_and_check frame payoffs paylens npkt zz expect nbexp totalmis k =
+  if k >= npkt then 0
+  else
+    let base = arr_get payoffs k
+    let D = float_arr_new 64 0.0
+    let _ = deq_fill D frame base zz 0
+    let out = arr_new 64 0
+    let acc = float_arr_new 1 0.0
+    let _ = idct_block D out 0 0 acc
+    let _ = print (cat ["    BLK", show k, " PIX ", pixs out 0 ""])
+    let _ = if k < nbexp then
+              let cell = arr_new 1 0
+              let _ = cmp_block out expect (k * 64) 0 cell
+              let _ = arr_set totalmis 0 ((arr_get totalmis 0) + (arr_get cell 0))
+              0
+            else 0
+    decode_and_check frame payoffs paylens npkt zz expect nbexp totalmis (k + 1)

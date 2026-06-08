@@ -1,0 +1,78 @@
+-- ledaticground BEACON rung: beacon_por -- proof-of-reception RECEIPT (pure Rail).
+-- Binds a detected beacon {freq, pulse, snr, payload-hash} to the receiving node under
+-- an Ed25519 signature, with round-trip self-verify + tamper detection. This is the
+-- proof-of-reception soul of the BEACON chain: "this node received exactly this beacon,
+-- at this frequency, with this SNR, carrying this payload, at this pulse." Reuses the
+-- receipt pattern from src/ais_attest.rail
+--   (string receipt -> sha256 chain -> ed25519 sign -> own-sig verify + tamper reject).
+--
+-- *** HONESTY ***: this is a SYNTHETIC_TEST receipt over a SYNTHETIC test detection,
+-- NOT a real satellite/beacon reception. The receipt string carries an explicit
+-- "kind=SYNTHETIC_TEST" tag and is signed with a DEV signing key, so it can never be
+-- mistaken for a real attestation. Receiver geolocation is labeled PENDING until the
+-- node has GPS-PPS (the same honest-pending pattern ais_attest.rail / attest.rail use).
+--
+-- Run from the rail repo dir so stdlib crypto's nested relative imports resolve:
+--   bash scripts/railrun.sh <ledaticground>/src/beacon_por.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+-- read one config line, strip newline, fall back to a safe default (verbatim idiom).
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+main =
+  -- DEV signing key (NOT a production attestation authority -- clearly labeled).
+  let seed = hex_to_bytes "9012345678901234567890123456789012345678901234567890123456789000"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- detection facts staged by scripts/gen_beacon_por.py (a SYNTHETIC beacon detection)
+  let freq = field_or "/tmp/beacon_por_freq.txt" "PENDING_no_freq"
+  let snr = field_or "/tmp/beacon_por_snr.txt" "PENDING_no_snr"
+  let pulse = field_or "/tmp/beacon_por_pulse.txt" "PENDING_no_pulse"
+
+  -- payload carried as a lowercase hex STRING; we sha256 THE HEX (avoids NUL-in-string
+  -- drops -- char_from_int 0 returns "" so binary-as-string would lose 0x00 bytes).
+  let payload_hex = field_or "/tmp/beacon_por_payload_hex.txt" "00"
+  let payload_hash = sha256_hex payload_hex
+
+  let prev = "GENESIS"
+  -- node identity is file-driven (defaults to the roof node). Precise lat/lon is PENDING
+  -- until GPS-PPS -- receiver geolocation is NOT asserted, only node identity + band.
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let band = "VHF-137-138MHz-beacon"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  -- the receipt: an honest, explicitly-synthetic test record over {freq,pulse,snr,hash}.
+  let receipt = join "|" ["BEACON_POR_RECEIPT", "kind=SYNTHETIC_TEST", cat ["station=", sta], cat ["band=", band], cat ["freqMHz=", freq], cat ["snr_dB=", snr], cat ["geo=", geo], cat ["pulse=", pulse], cat ["payload_sha256=", payload_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sig = ed25519_sign seed msg mlen
+  let sig_hex = bytes_to_hex sig 64
+
+  -- round-trip: own signature must verify (=1); a tampered message must NOT verify (=0)
+  let verify_ok = ed25519_verify pk msg mlen sig
+  let tstr = cat [receipt, "X"]
+  let tmsg = string_to_bytes tstr
+  let tlen = string_length_bytes tstr
+  let tamper_ok = ed25519_verify pk tmsg tlen sig
+  let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+  let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["PAYLOAD_SHA256 ", payload_hash])
+  let _ = print (cat ["SIG      ", sig_hex])
+  let _ = print (cat ["CHAIN    ", chain_hash])
+  let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+  let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+  let jrec = join "\n" ["{", "  \"kind\": \"SYNTHETIC_TEST\",", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"freqMHz\": \"", freq, "\","], cat ["  \"snr_dB\": \"", snr, "\","], cat ["  \"pulse\": \"", pulse, "\","], cat ["  \"geo\": \"", geo, "\","], cat ["  \"payload_sha256\": \"", payload_hash, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/beacon_por_receipt.json" jrec
+  let _ = print "WROTE data/beacon_por_receipt.json (SYNTHETIC_TEST)"
+  0

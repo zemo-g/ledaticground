@@ -1,0 +1,140 @@
+-- ledaticground ACARS rung 2: MSK bit recovery + bit sync (pure Rail).
+-- The ACARS audio (from rung 1) is 2400 bps MSK: bit 1 = a 1200 Hz tone (one half-cycle
+-- per bit), bit 0 = a 2400 Hz tone (two half-cycles per bit). We discriminate per bit by
+-- correlating each bit window against a 1200 Hz and a 2400 Hz reference (Goertzel-style
+-- energy), and slice: E(1200) > E(2400) -> bit 1, else bit 0.
+-- BIT SYNC: sweep all sps candidate sample phases, score each by the summed decision
+-- margin |E1200 - E2400| over the record, and keep the phase with the largest margin
+-- (that is the on-bit-boundary alignment). Reads mono s16 LE @48kHz from /tmp/acars_msk.s16.
+-- Prints the best phase, then "SYM <bits>". Loops carry int indices + array cells only.
+
+foreign sin x -> float
+foreign cos x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+s16_at bytes i =
+  let lo = arr_get bytes (2 * i)
+  let hi = arr_get bytes (2 * i + 1)
+  let u = bit_or lo (shl hi 8)
+  if u >= 32768 then u - 65536 else u
+load_s16 bytes nb samp i =
+  if i >= nb then 0
+  else
+    let _ = float_arr_set samp i (int_to_float (s16_at bytes i))
+    load_s16 bytes nb samp (i + 1)
+
+SPS = 20
+FS = 48000.0
+
+-- Goertzel-ish energy of a tone at frequency f over samp[base..base+SPS): I and Q
+-- accumulators (sum samp*cos, sum samp*sin), energy = I^2 + Q^2. The float accumulators
+-- live in a 2-cell array so the loop carries only the int index (self-loop-safe).
+tone_acc samp base f j acc =
+  if j >= SPS then 0
+  else
+    let n = base + j
+    let ang = 2.0 * 3.14159265358979 * f * (int_to_float j) / FS
+    let v = float_arr_get samp n
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + v * (cos ang))
+    let _ = float_arr_set acc 1 ((float_arr_get acc 1) + v * (sin ang))
+    tone_acc samp base f (j + 1) acc
+tone_energy samp base f acc =
+  let _ = float_arr_set acc 0 0.0
+  let _ = float_arr_set acc 1 0.0
+  let _ = tone_acc samp base f 0 acc
+  let ir = float_arr_get acc 0
+  let qr = float_arr_get acc 1
+  ir * ir + qr * qr
+
+-- score a candidate phase: sum |E1200 - E2400| over all whole bits at this phase.
+-- The two tone_energy results are sunk straight into ecell[0],ecell[1] — carrying float
+-- LOCALS across two consecutive float-returning calls in a self-loop clobbers callee-saved
+-- float regs (rail-bug-callee-saved-float-regs); array cells dodge it.
+score_phase samp ns phase nsym acc k scell ecell =
+  if k >= nsym then float_arr_get scell 0
+  else
+    let base = phase + k * SPS
+    let _ = float_arr_set ecell 0 (tone_energy samp base 1200.0 acc)
+    let _ = float_arr_set ecell 1 (tone_energy samp base 2400.0 acc)
+    let e1 = float_arr_get ecell 0
+    let e0 = float_arr_get ecell 1
+    let m = if e1 > e0 then e1 - e0 else e0 - e1
+    let _ = float_arr_set scell 0 ((float_arr_get scell 0) + m)
+    score_phase samp ns phase nsym acc (k + 1) scell ecell
+
+-- bestcell[0] = best score (float), bpcell[0] = best phase (int). Carrying the running
+-- best in array cells (not tail args) sidesteps the self-loop cross-dependent-args
+-- miscompile. The loop tail carries only the int `phase`.
+best_phase samp ns acc phase nsym scell bestcell bpcell ecell =
+  if phase >= SPS then arr_get bpcell 0
+  else
+    let _ = float_arr_set scell 0 0.0
+    let v = score_phase samp ns phase nsym acc 0 scell ecell
+    let _ = if v > (float_arr_get bestcell 0) then
+              let _ = float_arr_set bestcell 0 v
+              let _ = arr_set bpcell 0 phase
+              0
+            else 0
+    best_phase samp ns acc (phase + 1) nsym scell bestcell bpcell ecell
+
+-- slice all bits at the chosen phase into outbits[] (same float-cell discipline)
+slice_all samp phase nsym acc k outbits ecell =
+  if k >= nsym then 0
+  else
+    let base = phase + k * SPS
+    let _ = float_arr_set ecell 0 (tone_energy samp base 1200.0 acc)
+    let _ = float_arr_set ecell 1 (tone_energy samp base 2400.0 acc)
+    let e1 = float_arr_get ecell 0
+    let e0 = float_arr_get ecell 1
+    let _ = arr_set outbits k (if e1 > e0 then 1 else 0)
+    slice_all samp phase nsym acc (k + 1) outbits ecell
+
+bitstr outbits i n acc =
+  if i >= n then acc
+  else bitstr outbits (i + 1) n (cat [acc, show (arr_get outbits i)])
+
+main =
+  let bytes = read_bytes "/tmp/acars_msk.s16"
+  let nb = (arr_len bytes) / 2
+  if nb < SPS * 4 then
+    let _ = print "NO_DATA"
+    0
+  else
+    let samp = float_arr_new nb 0.0
+    let _ = load_s16 bytes nb samp 0
+    let nsym = (nb / SPS) - 2          -- leave a guard bit at each end for phase slack
+    let acc = float_arr_new 2 0.0
+    let scell = float_arr_new 1 0.0
+    let ecell = float_arr_new 2 0.0
+    let bestcell = float_arr_new 1 (0.0 - 1.0)
+    let bpcell = arr_new 1 0
+    let phase = best_phase samp nb acc 0 nsym scell bestcell bpcell ecell
+    let outbits = arr_new nsym 0
+    let _ = slice_all samp phase nsym acc 0 outbits ecell
+    let _ = print (cat ["INFO samples=", show nb, " sps=", show SPS, " bestphase=", show phase, " symbols=", show nsym])
+    let _ = print (cat ["SYM ", bitstr outbits 0 nsym ""])
+    0

@@ -1,0 +1,68 @@
+-- ledaticground: attested ACARS reception receipt (pure Rail).
+-- Binds a decoded ACARS message (mode/reg/label/blkid/text + BCS verdict) to the receiving
+-- node under an Ed25519 signature, hash-chained, with round-trip verify + tamper detection.
+-- The proof-of-reception soul applied to aircraft VHF data: "this node received exactly this
+-- ACARS block at this time, and its block-check passed."
+-- Run from the rail repo dir so stdlib crypto's nested relative imports resolve:
+--   cd ~/projects/rail && ./rail_native run <ledaticground>/src/acars_attest.rail
+--
+-- The product = the pure-Rail deframe output (/tmp/acars_deframe_out.txt). Precise receiver
+-- geolocation is a labeled-PENDING field until the node has GPS-PPS — same honest-pending
+-- pattern ais_attest.rail / attest.rail use. Cross-pol caveat: a horizontal antenna on this
+-- vertical terrestrial signal means low SNR, so the receipt records SNR honesty, not a claim
+-- of perfect copy — the BCS verdict is what is attested.
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+main =
+  -- DEV signing key (NOT a production attestation authority — clearly labeled).
+  let seed = hex_to_bytes "ac3a5ac3a5ac3a5ac3a5ac3a5ac3a5ac3a5ac3a5ac3a5ac3a5ac3a5ac3a5ac00"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- product = the pure-Rail ACARS deframe output (parsed fields + BCS verdict)
+  let product = read_file "/tmp/acars_deframe_out.txt"
+  let product_hash = sha256_hex product
+
+  -- capture pulse (unix time stand-in; should anchor to ledatic.org/entropy in prod)
+  let pulse = field_or "/tmp/acars_pulse.txt" "PENDING_no_pulse"
+  let prev = "GENESIS"
+
+  -- node identity is file-driven (defaults to the roof node). Precise lat/lon is PENDING
+  -- until GPS-PPS — receiver geolocation is not asserted, only node identity + band.
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let band = "ACARS-136.975MHz"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  let receipt = join "|" ["ACARS_RECEIPT", cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse=", pulse], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sig = ed25519_sign seed msg mlen
+  let sig_hex = bytes_to_hex sig 64
+
+  let verify_ok = ed25519_verify pk msg mlen sig
+  let tstr = cat [receipt, "X"]
+  let tmsg = string_to_bytes tstr
+  let tlen = string_length_bytes tstr
+  let tamper_ok = ed25519_verify pk tmsg tlen sig
+  let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+  let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["SIG      ", sig_hex])
+  let _ = print (cat ["CHAIN    ", chain_hash])
+  let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+  let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+  let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/acars_receipt.json" jrec
+  let _ = print "WROTE data/acars_receipt.json"
+  0

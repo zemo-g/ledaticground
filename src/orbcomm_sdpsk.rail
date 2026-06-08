@@ -1,0 +1,140 @@
+-- ledaticground Orbcomm rung: orbcomm_sdpsk — Symmetric Differential PSK demod (~4800 sym/s)
+-- with differential decode + unique-word frame sync (pure Rail).
+--
+-- PUBLIC-KNOWLEDGE BASIS: Orbcomm subscriber/gateway DOWNLINK is 137.2-137.8 MHz, ~25 kHz
+-- channels, Symmetric Differential PSK (SD-PSK) at ~4800 sym/s. SD-PSK == differential BPSK
+-- in the symmetric (antipodal) convention: the BIT rides the phase TRANSITION between
+-- consecutive symbols (0 = no change, 1 = pi flip). The differential-coherent receiver
+-- recovers bits from the sign of Re(z[k] * conj(z[k-1])), which is INVARIANT to the absolute
+-- carrier phase. That phase invariance is the whole reason differential PSK is used on a LEO
+-- downlink whose carrier phase is unknown and Doppler-smeared: no Costas/PLL is needed, and a
+-- small residual frequency offset is tolerated. This rung is thus phase-blind by construction.
+--
+-- Above the symbol/bit layer the Orbcomm USER PAYLOAD is proprietary (no public message
+-- dictionary), so this rung recovers BITS only — it does NOT emit message semantics. Frame
+-- sync is done by sliding a known 16-bit unique word across the decoded bit stream and
+-- reporting the best (offset, score).
+--
+-- Reads int8 IQ (1 sample/symbol) from /tmp/orbcomm_in.s8.
+-- Prints:  INFO ... | SYMRATE 4800 | UW_AT <idx> <score> /16 | BITS <decoded bit string>
+-- All recursions carry int indices + array cells (self-loop-safe per repo Rail traps:
+-- frame-sync slide is split into mutual recursion best_uw/best_step to dodge the
+-- self-loop cross-dependent-tail-arg miscompile).
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+-- NUL-safe O(n) byte reader. malloc/free used as BUILTINS (never declared foreign -> int,
+-- which would tag the 64-bit pointer as a 63-bit int and corrupt every byte read).
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 sample -> float (b in 0..255; 128..255 are negative)
+soft_at bytes k =
+  let b = arr_get bytes k
+  let s = if b < 128 then b else b - 256
+  int_to_float s
+
+-- Differential (SD-PSK) decode over the IQ symbol stream. For symbol k (>=1):
+--   dot = Re(z[k] * conj(z[k-1])) = ik*ik1 + qk*qk1
+--   bit = 1 if dot < 0 (phase flipped ~pi between k-1 and k) else 0
+-- Emits decoded bit (k-1) into outbits[k-1]. nsym = total symbols; decoded count = nsym-1.
+-- This is a clean accumulator-free loop carrying only the int index k.
+diffdec bytes nsym k outbits =
+  if k >= nsym then 0
+  else
+    let ik  = soft_at bytes (k * 2)
+    let qk  = soft_at bytes (k * 2 + 1)
+    let ik1 = soft_at bytes ((k - 1) * 2)
+    let qk1 = soft_at bytes ((k - 1) * 2 + 1)
+    let dot = ik * ik1 + qk * qk1
+    let _ = arr_set outbits (k - 1) (if dot <. 0.0 then 1 else 0)
+    diffdec bytes nsym (k + 1) outbits
+
+-- --- frame sync: correlate decoded bits against the known 16-bit unique word ---
+-- count matches of uw[0..ulen) starting at decoded[start]; accumulator lives in a cell.
+match_cnt dec uw ulen start j cell =
+  if j >= ulen then arr_get cell 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get dec (start + j)) == (arr_get uw j) then 1 else 0))
+    match_cnt dec uw ulen start (j + 1) cell
+
+-- Slide the UW across the decoded stream; track best (score,pos) in cell pair.
+-- best_uw/best_step are MUTUALLY recursive to dodge the self-loop cross-dependent
+-- tail-arg miscompile (documented Rail trap: self-loops with computed tail args +
+-- array cells segfault). best_uw advances the index; best_step does the body.
+best_step dec ndec uw ulen start bestcell poscell =
+  let c = arr_new 1 0
+  let sc = match_cnt dec uw ulen start 0 c
+  let _ = if sc > (arr_get bestcell 0) then
+            let _ = arr_set bestcell 0 sc
+            let _ = arr_set poscell 0 start
+            0
+          else 0
+  best_uw dec ndec uw ulen (start + 1) bestcell poscell
+best_uw dec ndec uw ulen start bestcell poscell =
+  if (start + ulen) > ndec then 0
+  else best_step dec ndec uw ulen start bestcell poscell
+
+-- build the 16-bit unique word array (must match scripts/gen_orbcomm_sdpsk.py UW).
+-- Value is an illustrative synthetic sync pattern (good autocorrelation), NOT the
+-- proprietary real Orbcomm unique word.
+set_uw uw =
+  let _ = arr_set uw 0 1
+  let _ = arr_set uw 1 0
+  let _ = arr_set uw 2 1
+  let _ = arr_set uw 3 1
+  let _ = arr_set uw 4 0
+  let _ = arr_set uw 5 0
+  let _ = arr_set uw 6 1
+  let _ = arr_set uw 7 0
+  let _ = arr_set uw 8 0
+  let _ = arr_set uw 9 1
+  let _ = arr_set uw 10 1
+  let _ = arr_set uw 11 1
+  let _ = arr_set uw 12 0
+  let _ = arr_set uw 13 0
+  let _ = arr_set uw 14 0
+  let _ = arr_set uw 15 1
+  0
+
+bitstr out i n acc = if i >= n then acc else bitstr out (i + 1) n (cat [acc, show (arr_get out i)])
+
+main =
+  let bytes = read_bytes "/tmp/orbcomm_in.s8"
+  let len = arr_len bytes
+  let nsym = len / 2
+  let ndec = nsym - 1
+  let dec = arr_new ndec 0
+  let _ = diffdec bytes nsym 1 dec
+  let _ = print (cat ["INFO samples=", show len, " symbols=", show nsym, " decoded_bits=", show ndec])
+  let _ = print "SYMRATE 4800"
+  -- frame sync against the 16-bit unique word
+  let uw = arr_new 16 0
+  let _ = set_uw uw
+  let bestcell = arr_new 1 0
+  let poscell = arr_new 1 0
+  let _ = best_uw dec ndec uw 16 0 bestcell poscell
+  let _ = print (cat ["UW_AT ", show (arr_get poscell 0), " score ", show (arr_get bestcell 0), " /16"])
+  let _ = print (cat ["BITS ", bitstr dec 0 ndec ""])
+  0

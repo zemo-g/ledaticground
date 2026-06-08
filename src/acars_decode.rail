@@ -1,0 +1,373 @@
+-- ledaticground ACARS: END-TO-END pure-Rail decoder (the chain).
+-- One Rail program that ingests the synthetic full-chain vector produced by
+-- scripts/gen_acars_gen.py (int8 baseband IQ at /tmp/acars_in.s8) and runs every
+-- receive rung IN MEMORY, with no intermediate /tmp hand-off between stages:
+--
+--   /tmp/acars_in.s8 (int8 IQ)
+--     1 AM ENVELOPE DEMOD   a[n] = sqrt(I^2+Q^2) - mean  (recovers m*MSK audio)   [acars_am]
+--       then drop the 2*SPS-sample unmodulated pre-key so bit 0 is byte-aligned
+--     2 MSK BIT RECOVERY    per-bit Goertzel energy at 1200/2400 Hz, slice,        [acars_msk]
+--       with a max-margin bit-sync phase sweep over all SPS candidate phases
+--     -- SEAM -- bit -> byte pack, MSB-first, 8 bits/char  (links rung 2 -> rung 3)
+--     3 DEFRAME             find SYN SYN -> SOH -> STX -> ETX/ETB                   [acars_deframe]
+--     4 PARITY              per-char odd-parity error count                        [acars_deframe]
+--     5 BCS                 reflected CRC-CCITT (poly 0x8408, init 0) after-SOH..ETX[acars_deframe]
+--     6 FIELDS              fixed-width header: mode|reg|ack|label|blkid|text       [acars_deframe]
+--
+-- Then SELF-CHECK: extract the ground-truth fields from /tmp/acars_gen_truth.json
+-- (written by the generator) and compare the Rail-decoded fields against them.
+-- This is a REAL comparison vs the generator's truth, not hardcoded constants.
+--
+-- Rail compiler discipline followed throughout (these miscompile/segfault silently):
+--   - loops carry int indices + array CELLS only; never float locals across two
+--     consecutive float-returning calls in a self-loop (callee-saved-float-reg bug),
+--     and never cross-dependent tail args (self-loop cross-dep bug). Running best/
+--     accumulators live in array cells.
+--   - no &&/|| short-circuit assumed; control chars are searched 7-bit-masked.
+--   - char_from_int for 7-bit ASCII emission; binary never carried in a string.
+-- Run via: bash scripts/railrun.sh src/acars_decode.rail
+-- (railrun cds into ~/projects/rail so stdlib relative imports resolve; this module
+--  uses no stdlib import — only builtins — so it also runs standalone.)
+
+foreign sqrt x -> float
+foreign sin x -> float
+foreign cos x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+-- ----------------------------------------------------------------- file read
+-- read_bytes / copy_bytes: the verbatim idiom from acars_am.rail / gmsk.rail.
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 sample at byte index k -> float (from gmsk.rail / acars_am.rail)
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- ============================================================ RUNG 1: AM demod
+-- envelope a[n] = sqrt(I^2 + Q^2) into env[] (loop carries int index only)
+fill_env bytes nsamp env n =
+  if n >= nsamp then 0
+  else
+    let iv = isig bytes (2 * n)
+    let qv = isig bytes (2 * n + 1)
+    let _ = float_arr_set env n (sqrt (iv * iv + qv * qv))
+    fill_env bytes nsamp env (n + 1)
+
+sum_env env nsamp i acc =
+  if i >= nsamp then acc
+  else sum_env env nsamp (i + 1) (acc + (float_arr_get env i))
+
+-- subtract the DC mean from the envelope -> m*MSK audio, in place
+demean env nsamp mean i =
+  if i >= nsamp then 0
+  else
+    let _ = float_arr_set env i ((float_arr_get env i) - mean)
+    demean env nsamp mean (i + 1)
+
+-- ===================================================== RUNG 2: MSK bit recovery
+SPS = 20
+FS = 48000.0
+
+-- Goertzel-ish tone energy at frequency f over aud[base..base+SPS), windowed angle
+-- in [0,SPS). Float I/Q accumulators live in a 2-cell array so the loop carries only
+-- the int index (self-loop-safe). Same as acars_msk.rail tone_acc/tone_energy.
+tone_acc aud base f j acc =
+  if j >= SPS then 0
+  else
+    let n = base + j
+    let ang = 2.0 * 3.14159265358979 * f * (int_to_float j) / FS
+    let v = float_arr_get aud n
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + v * (cos ang))
+    let _ = float_arr_set acc 1 ((float_arr_get acc 1) + v * (sin ang))
+    tone_acc aud base f (j + 1) acc
+tone_energy aud base f acc =
+  let _ = float_arr_set acc 0 0.0
+  let _ = float_arr_set acc 1 0.0
+  let _ = tone_acc aud base f 0 acc
+  let ir = float_arr_get acc 0
+  let qr = float_arr_get acc 1
+  ir * ir + qr * qr
+
+-- score a candidate phase by summed decision margin |E1200-E2400|. Both tone_energy
+-- results are sunk straight into ecell[0],ecell[1] before being read (callee-saved-
+-- float-reg discipline). scell[0] carries the running float score.
+score_phase aud phase nsym acc k scell ecell =
+  if k >= nsym then float_arr_get scell 0
+  else
+    let base = phase + k * SPS
+    let _ = float_arr_set ecell 0 (tone_energy aud base 1200.0 acc)
+    let _ = float_arr_set ecell 1 (tone_energy aud base 2400.0 acc)
+    let e1 = float_arr_get ecell 0
+    let e0 = float_arr_get ecell 1
+    let m = if e1 > e0 then e1 - e0 else e0 - e1
+    let _ = float_arr_set scell 0 ((float_arr_get scell 0) + m)
+    score_phase aud phase nsym acc (k + 1) scell ecell
+
+-- max-margin phase: bestcell[0]=best score (float), bpcell[0]=best phase (int). The
+-- running best lives in cells, not in mutually-dependent tail args (self-loop cross-
+-- dep bug). The loop tail carries only the int `phase`.
+best_phase aud acc phase nsym scell bestcell bpcell ecell =
+  if phase >= SPS then arr_get bpcell 0
+  else
+    let _ = float_arr_set scell 0 0.0
+    let v = score_phase aud phase nsym acc 0 scell ecell
+    let _ = if v > (float_arr_get bestcell 0) then
+              let _ = float_arr_set bestcell 0 v
+              let _ = arr_set bpcell 0 phase
+              0
+            else 0
+    best_phase aud acc (phase + 1) nsym scell bestcell bpcell ecell
+
+-- slice all bits at the chosen phase into outbits[] (same float-cell discipline)
+slice_all aud phase nsym acc k outbits ecell =
+  if k >= nsym then 0
+  else
+    let base = phase + k * SPS
+    let _ = float_arr_set ecell 0 (tone_energy aud base 1200.0 acc)
+    let _ = float_arr_set ecell 1 (tone_energy aud base 2400.0 acc)
+    let e1 = float_arr_get ecell 0
+    let e0 = float_arr_get ecell 1
+    let _ = arr_set outbits k (if e1 > e0 then 1 else 0)
+    slice_all aud phase nsym acc (k + 1) outbits ecell
+
+-- =============================================== SEAM: bit -> byte (MSB-first)
+-- pack outbits[0..] into chars[0..nby-1], 8 bits/char, bit7 first. `inv` selects
+-- polarity: FSK tone->bit can come out inverted, so we can pack the complement.
+pack_one outbits inv base k acc =
+  if k >= 8 then acc
+  else
+    let b0 = arr_get outbits (base + k)
+    let b = if inv == 1 then (1 - b0) else b0
+    pack_one outbits inv base (k + 1) (bit_or (shl acc 1) b)
+pack_bytes outbits nbits inv chars i =
+  if (i * 8 + 8) > nbits then i
+  else
+    let _ = arr_set chars i (pack_one outbits inv (i * 8) 0 0)
+    pack_bytes outbits nbits inv chars (i + 1)
+
+-- ================================================ RUNGS 3-6: deframe + checks
+-- (these are the acars_deframe.rail helpers, operating on the in-memory char arr)
+data7 b = bit_and b 127
+
+pc_acc b k cell =
+  if k >= 8 then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (bit_and (shr b k) 1))
+    pc_acc b (k + 1) cell
+popcount b =
+  let cell = arr_new 1 0
+  let _ = pc_acc b 0 cell
+  arr_get cell 0
+parity_ok b = if (bit_and (popcount b) 1) == 1 then 1 else 0
+
+-- find first index >= start where chars[i]==v AND chars[i+1]==v (7-bit-masked).
+-- Note: NO &&-short-circuit in Rail; both sides always evaluate. start+1 is in range
+-- because the guard `(start+1) >= n` returns first.
+find_double chars n start v =
+  if (start + 1) >= n then (0 - 1)
+  else if ((data7 (arr_get chars start)) == v) && ((data7 (arr_get chars (start + 1))) == v) then start
+  else find_double chars n (start + 1) v
+find_one chars n start v =
+  if start >= n then (0 - 1)
+  else if (data7 (arr_get chars start)) == v then start
+  else find_one chars n (start + 1) v
+find_etx chars n start =
+  if start >= n then (0 - 1)
+  else
+    let d = data7 (arr_get chars start)
+    if (d == 3) || (d == 23) then start
+    else find_etx chars n (start + 1)
+
+-- BCS: reflected CRC-CCITT (poly 0x8408 = 33800), init 0, over data7 of chars[lo..hi]
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+crc_acc chars hi i cell =
+  if i > hi then 0
+  else
+    let c = bit_xor (arr_get cell 0) (data7 (arr_get chars i))
+    let _ = arr_set cell 0 (crcbit c 0)
+    crc_acc chars hi (i + 1) cell
+
+parity_errs chars lo hi i cell =
+  if i > hi then arr_get cell 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (parity_ok (arr_get chars i)) == 1 then 0 else 1))
+    parity_errs chars lo hi (i + 1) cell
+
+-- emit chars[i..hi] as 7-bit ASCII (caller seeds i=lo)
+emit_text chars hi i acc =
+  if i > hi then acc
+  else emit_text chars hi (i + 1) (cat [acc, char_from_int (data7 (arr_get chars i))])
+
+-- ---------------------------------------------------------- truth extraction
+-- pull a JSON string value: find `"<key>": "` then read to the next quote. Honest
+-- ground-truth read from the generator's file (str_sub uses byte offsets).
+qchar = char_from_int 34          -- a double-quote character
+json_str key j =
+  let marker = cat [qchar, key, qchar, ": ", qchar]
+  let i = str_find marker j
+  if i < 0 then "??"
+  else
+    let start = i + (length marker)
+    let rest = str_sub j start ((length j) - start)
+    let e = str_find qchar rest
+    if e < 0 then rest else str_sub rest 0 e
+
+-- ----------------------------------------------------------------- main chain
+main =
+  let bytes = read_bytes "/tmp/acars_in.s8"
+  let blen = arr_len bytes
+  let nsamp = blen / 2
+  if nsamp < 200 then
+    let _ = print "BLOCKED no input at /tmp/acars_in.s8 — run scripts/gen_acars_gen.py first"
+    0
+  else
+    -- RUNG 1: envelope + DC removal -> m*MSK audio in env[]
+    let env = float_arr_new nsamp 0.0
+    let _ = fill_env bytes nsamp env 0
+    let sm = sum_env env nsamp 0 0.0
+    let mean = sm / (int_to_float nsamp)
+    let _ = demean env nsamp mean 0
+    -- drop the unmodulated pre-key (2*SPS samples) so bit 0 is byte-aligned. The
+    -- generator emits exactly 2*SPS carrier-only samples before modulation; this is
+    -- a fixed protocol constant of the transmit chain, not message-dependent.
+    let pre = 2 * SPS
+    let naud = nsamp - pre
+    let aud = float_arr_new naud 0.0
+    let _ = copy_floats env pre aud 0 naud
+    let _ = print (cat ["RUNG1 AM-demod: samples=", show nsamp, " dc_level=", show_float mean, " prekey_dropped=", show pre, " audio=", show naud])
+
+    -- RUNG 2: bit-sync phase sweep + MSK slice
+    let nsym = (naud / SPS) - 1          -- leave a guard bit for phase slack
+    let acc = float_arr_new 2 0.0
+    let scell = float_arr_new 1 0.0
+    let ecell = float_arr_new 2 0.0
+    let bestcell = float_arr_new 1 (0.0 - 1.0)
+    let bpcell = arr_new 1 0
+    let phase = best_phase aud acc 0 nsym scell bestcell bpcell ecell
+    let outbits = arr_new nsym 0
+    let _ = slice_all aud phase nsym acc 0 outbits ecell
+    let _ = print (cat ["RUNG2 MSK: bestphase=", show phase, " symbols=", show nsym])
+
+    -- SEAM: pack bits -> chars (try direct polarity; fall back to inverted if the
+    -- frame does not parse). No &&-short-circuit: nested if/then/else gates it.
+    let nby0 = nsym / 8
+    let chars = arr_new nby0 0
+    let nby = pack_bytes outbits nsym 0 chars 0
+    let syn0 = find_double chars nby 0 22
+    let inv = if syn0 < 0 then 1 else 0
+    let _ = if inv == 1 then
+              let nb2 = pack_bytes outbits nsym 1 chars 0
+              0
+            else 0
+    let _ = print (cat ["SEAM bit->byte: bytes=", show nby, " polarity=", (if inv == 1 then "inverted" else "direct")])
+
+    -- RUNGS 3-6: deframe
+    let syn = find_double chars nby 0 22
+    if syn < 0 then
+      let _ = print "BLOCKED deframe: no SYN SYN"
+      0
+    else
+      let soh = find_one chars nby (syn + 2) 1
+      if soh < 0 then
+        let _ = print "BLOCKED deframe: no SOH"
+        0
+      else
+        let h = soh + 1
+        let stx = find_one chars nby h 2
+        if stx < 0 then
+          let _ = print "BLOCKED deframe: no STX"
+          0
+        else
+          let etx = find_etx chars nby (stx + 1)
+          if etx < 0 then
+            let _ = print "BLOCKED deframe: no ETX/ETB"
+            0
+          else
+            -- fields (fixed-width header h..stx-1)
+            let modec = data7 (arr_get chars h)
+            let ackc  = data7 (arr_get chars (h + 8))
+            let blkid = data7 (arr_get chars (h + 11))
+            let regs  = emit_text chars (h + 7) (h + 1) ""
+            let labs  = emit_text chars (h + 10) (h + 9) ""
+            let txt   = emit_text chars (etx - 1) (stx + 1) ""
+            -- BCS over h..etx inclusive (after-SOH .. ETX)
+            let calcc = arr_new 1 0
+            let _ = arr_set calcc 0 0
+            let _ = crc_acc chars etx h calcc
+            let bcs_calc = arr_get calcc 0
+            let bcs_rx = bit_or (arr_get chars (etx + 1)) (shl (arr_get chars (etx + 2)) 8)
+            -- parity over h..etx
+            let perrc = arr_new 1 0
+            let _ = arr_set perrc 0 0
+            let perr = parity_errs chars h etx h perrc
+            let bcs_ok = if bcs_calc == bcs_rx then 1 else 0
+
+            let _ = print (cat ["DEFRAME syn@", show syn, " soh@", show soh, " stx@", show stx, " etx@", show etx])
+            let _ = print (cat ["MODE ", char_from_int modec])
+            let _ = print (cat ["REG ", regs])
+            let _ = print (cat ["ACK ", show ackc])
+            let _ = print (cat ["LABEL ", labs])
+            let _ = print (cat ["BLKID ", char_from_int blkid])
+            let _ = print (cat ["TEXT ", txt])
+            let _ = print (cat ["PARITY_ERRORS ", show perr])
+            let _ = print (cat ["BCS_RX ", show bcs_rx])
+            let _ = print (cat ["BCS_CALC ", show bcs_calc])
+            let _ = print (cat ["BCS_OK ", show bcs_ok])
+
+            -- ---------------------------------------------- SELF-CHECK vs truth
+            let tj = read_file "/tmp/acars_gen_truth.json"
+            if tj == "" then
+              let _ = print "SELFCHECK SKIPPED no /tmp/acars_gen_truth.json"
+              0
+            else
+              let t_mode  = json_str "mode" tj
+              let t_reg   = json_str "reg" tj
+              let t_label = json_str "label" tj
+              let t_blkid = json_str "blkid" tj
+              let t_text  = json_str "text" tj
+              let g_mode = char_from_int modec
+              let g_blk  = char_from_int blkid
+              let ok_mode  = if g_mode == t_mode then 1 else 0
+              let ok_reg   = if regs == t_reg then 1 else 0
+              let ok_label = if labs == t_label then 1 else 0
+              let ok_blkid = if g_blk == t_blkid then 1 else 0
+              let ok_text  = if txt == t_text then 1 else 0
+              let ok_par   = if perr == 0 then 1 else 0
+              let allok = ok_mode * ok_reg * ok_label * ok_blkid * ok_text * ok_par * bcs_ok
+              let _ = print (cat ["SELFCHECK mode=", show ok_mode, " reg=", show ok_reg, " label=", show ok_label, " blkid=", show ok_blkid, " text=", show ok_text, " parity=", show ok_par, " bcs=", show bcs_ok])
+              let _ = if allok == 1 then
+                        print (cat ["PASS  acars end-to-end: mode=", g_mode, " reg=", regs, " label=", labs, " blkid=", g_blk, " text=", qchar, txt, qchar, " BCS_OK parity_errs=0 (matches /tmp/acars_gen_truth.json)"])
+                      else
+                        print (cat ["FAIL  decoded fields do not match truth: got reg=", regs, " want ", t_reg, " | text=", txt, " want ", t_text])
+              0
+
+-- copy floats env[from..from+n) -> dst[0..n) ; loop carries int index `to` only
+copy_floats env from dst to n =
+  if to >= n then 0
+  else
+    let _ = float_arr_set dst to (float_arr_get env (from + to))
+    copy_floats env from dst (to + 1) n

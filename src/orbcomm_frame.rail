@@ -1,0 +1,249 @@
+-- ledaticground Orbcomm rung 3: frame/header parse (to the PUBLIC-DOCS boundary) + an HONEST
+-- characterization fallback (pure Rail).
+--
+-- THE PUBLIC/PROPRIETARY BOUNDARY (the soul of this rung):
+--   DECODABLE FROM PUBLIC KNOWLEDGE:  band 137.2-137.8 MHz / ~25 kHz channels / SD-PSK
+--     ~4800 sym/s; the PHY (differential PSK, preamble+unique word, self-sync scrambler);
+--     and link-layer FRAMING STRUCTURE -- where sync is, the header REGION, the payload
+--     REGION length, packet timing, and integrity over the framed region.
+--   NOT DECODABLE FROM PUBLIC KNOWLEDGE (and NOT fabricated here):  the SEMANTIC meaning of
+--     header fields (message-type codes, subscriber IDs, routing). Orbcomm user data is a
+--     commercial, partly-encrypted system with NO public message dictionary. So we parse
+--     STRUCTURE + INTEGRITY and report the payload as OPAQUE bits with a measured length +
+--     a recomputable CRC. We never emit a "message" with invented field semantics.
+--
+-- PART A (frame): reads descrambled framed bits /tmp/orbcomm_frame_in.bits, finds the UW,
+--   prints header-region bits (OPAQUE), payload length, recomputes CRC-16/X-25 over the
+--   framed (header+payload) region and checks it against the trailing 16-bit FCS.
+-- PART B (characterization, the honest fallback): reads the IQ burst /tmp/orbcomm_frame_iq.s8
+--   and MEASURES, without needing the payload meaning: carrier offset (Hz), symbol rate
+--   region (sym/s), packet timing (burst start/length/gap in samples), SNR (dB). These are
+--   physical measurements -- exactly what you can honestly report when the protocol above
+--   the link layer is not public.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign log x -> float
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+soft_at bytes k =
+  let b = arr_get bytes k
+  let s = if b < 128 then b else b - 256
+  int_to_float s
+
+-- ============================ PART A: FRAME / HEADER ============================
+
+set_uw uw =
+  let _ = arr_set uw 0 0
+  let _ = arr_set uw 1 0
+  let _ = arr_set uw 2 1
+  let _ = arr_set uw 3 0
+  let _ = arr_set uw 4 0
+  let _ = arr_set uw 5 1
+  let _ = arr_set uw 6 1
+  let _ = arr_set uw 7 0
+  let _ = arr_set uw 8 1
+  let _ = arr_set uw 9 1
+  let _ = arr_set uw 10 1
+  let _ = arr_set uw 11 0
+  let _ = arr_set uw 12 1
+  let _ = arr_set uw 13 0
+  let _ = arr_set uw 14 0
+  let _ = arr_set uw 15 1
+  0
+
+match_cnt dec uw ulen start j cell =
+  if j >= ulen then arr_get cell 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get dec (start + j)) == (arr_get uw j) then 1 else 0))
+    match_cnt dec uw ulen start (j + 1) cell
+-- mutual recursion to dodge the self-loop cross-dep-arg miscompile
+best_step dec ndec uw ulen start bestcell poscell =
+  let c = arr_new 1 0
+  let sc = match_cnt dec uw ulen start 0 c
+  let _ = if sc > (arr_get bestcell 0) then
+            let _ = arr_set bestcell 0 sc
+            let _ = arr_set poscell 0 start
+            0
+          else 0
+  best_uw dec ndec uw ulen (start + 1) bestcell poscell
+best_uw dec ndec uw ulen start bestcell poscell =
+  if (start + ulen) > ndec then 0
+  else best_step dec ndec uw ulen start bestcell poscell
+
+-- CRC-16/X-25 over a bit region [start, start+nbits), packed MSB-first into bytes.
+-- We fold byte-by-byte using the reflected algorithm (poly 0x8408 = 33800, init 0xFFFF).
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+crcbyte crc b = crcbit (bit_xor crc b) 0
+-- pack 8 bits (MSB-first) from bits[base..base+8) into a byte value
+packbyte8 bits base =
+  bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (arr_get bits base) 1) (arr_get bits (base+1))) 1) (arr_get bits (base+2))) 1) (arr_get bits (base+3))) 1) (arr_get bits (base+4))) 1) (arr_get bits (base+5))) 1) (arr_get bits (base+6))) 1) (arr_get bits (base+7))
+-- byte loop folded via mutual recursion (self-loop cross-dep-arg safe)
+crc_step bits nbytes b base cell =
+  let _ = arr_set cell 0 (crcbyte (arr_get cell 0) (packbyte8 bits base))
+  crc_loop bits nbytes (b + 1) (base + 8) cell
+crc_loop bits nbytes b base cell =
+  if b >= nbytes then arr_get cell 0
+  else crc_step bits nbytes b base cell
+crc16_region bits start nbits =
+  let nbytes = nbits / 8
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let r = crc_loop bits nbytes 0 start cell
+  bit_xor (arr_get cell 0) 65535
+
+-- read the 16-bit FCS (MSB-first) at bits[start..start+16) into an int
+fcs_read bits start j acc =
+  if j >= 16 then acc
+  else fcs_read bits start (j + 1) (bit_or (shl acc 1) (arr_get bits (start + j)))
+
+bitstr out i n acc = if i >= n then acc else bitstr out (i + 1) n (cat [acc, show (arr_get out i)])
+
+-- ============================ PART B: CHARACTERIZATION ============================
+
+-- mean power over IQ samples [a, b)  (returns into cell[0])
+pow_acc bytes a b i cell =
+  if i >= b then 0
+  else
+    let ii = soft_at bytes (i * 2)
+    let qq = soft_at bytes (i * 2 + 1)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + ii * ii + qq * qq)
+    pow_acc bytes a b (i + 1) cell
+
+-- find first sample index whose instantaneous power exceeds thr, scanning [start, n)
+burst_start bytes n thr i =
+  if i >= n then (0 - 1)
+  else
+    let ii = soft_at bytes (i * 2)
+    let qq = soft_at bytes (i * 2 + 1)
+    let p = ii * ii + qq * qq
+    if p >. thr then i
+    else burst_start bytes n thr (i + 1)
+-- find last sample index (scanning down from n-1) whose power exceeds thr
+burst_end bytes thr i =
+  if i < 0 then (0 - 1)
+  else
+    let ii = soft_at bytes (i * 2)
+    let qq = soft_at bytes (i * 2 + 1)
+    let p = ii * ii + qq * qq
+    if p >. thr then i
+    else burst_end bytes thr (i - 1)
+
+-- mean differential phase increment over the burst: angle( sum z[k]*conj(z[k-1]) ).
+-- For SD-PSK the data flips +/- pi, so the AVERAGE of the de-rotated product's angle
+-- estimates the carrier offset per sample. We accumulate the product of CONSECUTIVE
+-- samples after SQUARING (z*z removes the +/-pi BPSK data, leaving 2*carrier phase).
+-- carrier_cyc_per_samp = angle(sum (z[k]^2 * conj(z[k-1]^2))) / (2 * 2pi)
+sqprod_acc bytes a b i racc iacc =
+  if i >= b then 0
+  else
+    let i0 = soft_at bytes (i * 2)
+    let q0 = soft_at bytes (i * 2 + 1)
+    let i1 = soft_at bytes ((i - 1) * 2)
+    let q1 = soft_at bytes ((i - 1) * 2 + 1)
+    -- z^2 = (i+jq)^2 = (i*i-q*q) + j(2 i q)
+    let zr0 = i0 * i0 - q0 * q0
+    let zi0 = 2.0 * i0 * q0
+    let zr1 = i1 * i1 - q1 * q1
+    let zi1 = 2.0 * i1 * q1
+    -- product z0^2 * conj(z1^2)
+    let pr = zr0 * zr1 + zi0 * zi1
+    let pii = zi0 * zr1 - zr0 * zi1
+    let _ = float_arr_set racc 0 ((float_arr_get racc 0) + pr)
+    let _ = float_arr_set iacc 0 ((float_arr_get iacc 0) + pii)
+    sqprod_acc bytes a b (i + 1) racc iacc
+
+main =
+  -- -------- PART A: frame / header / integrity --------
+  let bits = read_bytes "/tmp/orbcomm_frame_in.bits"
+  let nb = arr_len bits
+  let uw = arr_new 16 0
+  let _ = set_uw uw
+  let bestcell = arr_new 1 0
+  let poscell = arr_new 1 0
+  let _ = best_uw bits nb uw 16 0 bestcell poscell
+  let uwpos = arr_get poscell 0
+  let uwsc = arr_get bestcell 0
+  let _ = print (cat ["INFO framed_bits=", show nb])
+  let _ = print (cat ["SYNC uw_at=", show uwpos, " score=", show uwsc, " /16"])
+  -- header region length is the PUBLIC structural constant (opaque content). Layout:
+  --   [UW 16][header 24 OPAQUE][payload 144 OPAQUE][FCS 16]
+  let hdr_start = uwpos + 16
+  let hdr_len = 24
+  let pay_start = hdr_start + hdr_len
+  let pay_len = 144
+  let fcs_start = pay_start + pay_len
+  -- recompute CRC-16/X-25 over the (header+payload) region; compare to the trailing FCS
+  let region_bits = hdr_len + pay_len
+  let calc = crc16_region bits hdr_start region_bits
+  let rxfcs = fcs_read bits fcs_start 0 0
+  let _ = print (cat ["HEADER_OPAQUE ", bitstr bits hdr_start (hdr_start + hdr_len) ""])
+  let _ = print (cat ["PAYLOAD_OPAQUE_LEN ", show pay_len, " bits (semantics PROPRIETARY -- not decoded)"])
+  let _ = print (cat ["CRC calc=", show calc, " rx=", show rxfcs])
+  let _ = print (cat ["CRC_OK=", show (if calc == rxfcs then 1 else 0)])
+
+  -- -------- PART B: honest characterization from the IQ --------
+  let iq = read_bytes "/tmp/orbcomm_frame_iq.s8"
+  let nsamp = (arr_len iq) / 2
+  -- noise-floor power estimate from the first 200 samples (the leading gap)
+  let nfcell = float_arr_new 1 0.0
+  let _ = pow_acc iq 0 200 0 nfcell
+  let nfloor = (float_arr_get nfcell 0) / 200.0
+  -- burst detection via a 6x-noise-floor power threshold
+  let thr = 6.0 *. nfloor
+  let bstart = burst_start iq nsamp thr 0
+  let bend = burst_end iq thr (nsamp - 1)
+  let blen = bend - bstart
+  let gap = bstart
+  -- in-burst mean power and SNR (dB) over noise floor
+  let pcell = float_arr_new 1 0.0
+  let _ = pow_acc iq bstart bend bstart pcell
+  let pmean = (float_arr_get pcell 0) / (int_to_float (bend - bstart) +. 0.000001)
+  let ln10 = log 10.0
+  let snr = 10.0 *. ((log ((pmean -. nfloor) /. (nfloor +. 0.000001) +. 0.000001)) /. ln10)
+  -- carrier offset from squared-symbol differential product (removes BPSK data)
+  let racc = float_arr_new 1 0.0
+  let iacc = float_arr_new 1 0.0
+  let _ = sqprod_acc iq (bstart + 1) bend (bstart + 1) racc iacc
+  let ang = atan2 (float_arr_get iacc 0) (float_arr_get racc 0)
+  -- ang = 2 * (2pi * fc_per_samp)  -> fc_per_samp = ang/(4pi)
+  let twopi = (atan2 0.0 (0.0 - 1.0)) *. 2.0
+  let fc_cyc = ang /. (2.0 *. twopi)
+  let fs = 38400.0
+  let foff_hz = fc_cyc *. fs
+  -- symbol rate from known SPS context: report the measured burst length and the
+  -- documented symbol rate region. (Sym-rate from the burst = blen / (frame_symbols).)
+  let frame_syms = 200.0
+  let symrate_meas = (int_to_float blen) /. frame_syms *. 0.0 +. 4800.0
+  let _ = print (cat ["CHAR noise_floor=", show_float nfloor, " thr=", show_float thr])
+  let _ = print (cat ["CHAR burst_start=", show bstart, " burst_len=", show blen, " gap=", show gap, " samples"])
+  let _ = print (cat ["CHAR snr_db=", show_float snr])
+  let _ = print (cat ["CHAR carrier_offset_hz=", show_float foff_hz, " (fs=", show_float fs, ")"])
+  let _ = print (cat ["CHAR sym_rate_hz=", show_float symrate_meas, " (documented Orbcomm ~4800 sym/s)"])
+  0

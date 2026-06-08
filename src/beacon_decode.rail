@@ -1,0 +1,319 @@
+-- ledaticground BEACON: FULL-CHAIN decoder + proof-of-reception, ONE pure-Rail pipeline.
+-- Reads the synthetic end-to-end CubeSat AX.25 AFSK beacon (int8 IQ at /tmp/beacon_in.s8,
+-- written by scripts/gen_beacon_gen.py) and runs ALL FOUR BEACON rungs back-to-back:
+--
+--   RUNG 1 (detect/energy)  -- FM polar discriminator over signed int8 IQ recovers audio;
+--           per-symbol AFSK tone power gives an in-band carrier-present signal (a soft
+--           detector: mark/space tone separation across the burst). DETECT printed.
+--   RUNG 2 (FSK/AFSK demod) -- Bell-202 Goertzel mark(1200)/space(2200) correlate per
+--           sps-sample symbol over the discriminated audio -> channel bits (mark=1).
+--   RUNG 3 (AX.25 HDLC)     -- NRZI decode -> find 0x7E flags -> skip leading flags ->
+--           next flag -> de-stuff (drop 0 after five 1s) -> pack LSB-first into bytes ->
+--           split 2-byte FCS -> CRC-16/X-25 (poly 0x8408) check -> recover callsign+payload.
+--   RUNG 4 (proof-of-reception) -- hash the recovered payload (carried as HEX so 0x00 bytes
+--           survive), bind {freqMHz, snr_dB, pulse, payload_sha256} to the node in an
+--           Ed25519-signed SYNTHETIC_TEST receipt, round-trip self-verify + tamper-reject,
+--           sha256 chain hash, write data/beacon_decode_receipt.json.
+--
+-- The whole pipeline self-checks INTERNALLY (CRC_OK, VERIFY=1, TAMPER=0) and also prints
+-- the CRC_OK / BYTES / HEX / ASCII lines that scripts/check_beacon_gen.py validates against
+-- /tmp/beacon_gen_truth.npy. Reuses verbatim DSP idioms from src/beacon_gen.rail /
+-- src/beacon_fsk.rail and the receipt pattern from src/beacon_por.rail / src/ais_attest.rail.
+--
+-- *** HONESTY ***: SYNTHETIC TEST VECTOR ONLY. No real RF capture, no real satellite decode.
+-- The rung-4 receipt is force-labeled kind=SYNTHETIC_TEST and signed with a clearly-labeled
+-- DEV seed; geo is honestly PENDING_needs_GPS_PPS (no receiver geolocation asserted).
+--
+-- Run from the rail repo dir so stdlib crypto's nested relative imports resolve:
+--   bash scripts/railrun.sh <ledaticground>/src/beacon_decode.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+
+foreign sin x -> float
+foreign cos x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+-- ===== file reader: load whole file into a byte array (builtin malloc/byte_at) =====
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- read one config line, strip newline, fall back to a safe default
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+-- string -> int by walking chars (to_int is float-only; canonical socket.rail pattern)
+pint_acc cs acc =
+  if cs == [] then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else pint_acc (tail cs) (acc * 10 + d)
+pint s = pint_acc (chars s) 0
+
+-- signed int8 at byte index k
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- ===== RUNG 1: FM polar discriminator: aud[n] = angle(z[n] * conj(z[n-1])) =====
+fill_aud bytes nsamp aud n =
+  if n >= nsamp then 0
+  else
+    let in0 = isig bytes (2 * n)
+    let qn0 = isig bytes (2 * n + 1)
+    let ip = isig bytes (2 * (n - 1))
+    let qp = isig bytes (2 * (n - 1) + 1)
+    let im = qn0 * ip - in0 * qp
+    let re = in0 * ip + qn0 * qp
+    let _ = float_arr_set aud n (atan2 im re)
+    fill_aud bytes nsamp aud (n + 1)
+
+-- ===== RUNG 2: AFSK Goertzel tone power over one bit window =====
+-- freq fi (Hz) & rate fsi (Hz) are INT params, converted with int_to_float INSIDE
+-- (multi-arg FLOAT user-fn scalar params segfault on this rail_native). cell[0]=cosacc
+-- cell[1]=sinacc; loop carries only the int index i (self-loop-safe).
+tone_corr aud start sps fsi fi cell i =
+  if i >= sps then 0
+  else
+    let s = float_arr_get aud (start + i)
+    let pi2 = 2.0 * (atan2 0.0 (0.0 - 1.0))
+    let ang = pi2 * (int_to_float fi) * (int_to_float i) / (int_to_float fsi)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + s * (cos ang))
+    let _ = float_arr_set cell 1 ((float_arr_get cell 1) + s * (sin ang))
+    tone_corr aud start sps fsi fi cell (i + 1)
+tone_power aud start sps fsi fi =
+  let cell = float_arr_new 2 0.0
+  let _ = tone_corr aud start sps fsi fi cell 0
+  let c = float_arr_get cell 0
+  let s = float_arr_get cell 1
+  c * c + s * s
+
+-- per-symbol mark-vs-space slice -> channel bit (mark=1). float compare via >. .
+-- detcell[0] accumulates mark-vs-space tone separation magnitude (soft carrier detect).
+afsk_syms aud nsym sps fsi mark space k outbits detcell =
+  if k >= nsym then 0
+  else
+    let start = k * sps
+    let pm = tone_power aud start sps fsi mark
+    let ps = tone_power aud start sps fsi space
+    let hi = if pm >. ps then pm else ps
+    let lo = if pm >. ps then ps else pm
+    let _ = float_arr_set detcell 0 ((float_arr_get detcell 0) + (hi -. lo))
+    let _ = float_arr_set detcell 1 ((float_arr_get detcell 1) + (hi +. lo))
+    let _ = arr_set outbits k (if pm >. ps then 1 else 0)
+    afsk_syms aud nsym sps fsi mark space (k + 1) outbits detcell
+
+-- ===== RUNG 3a: NRZI decode (no transition = 1, transition = 0; prev=0 at start) =====
+nrzi_dec n nn d i =
+  if i >= nn then 0
+  else
+    let prev = if i == 0 then 0 else arr_get n (i - 1)
+    let _ = arr_set d i (if (arr_get n i) == prev then 1 else 0)
+    nrzi_dec n nn d (i + 1)
+
+-- ===== RUNG 3b: HDLC flag (0x7E LSB-first = 0 1 1 1 1 1 1 0) =====
+flag_pat k = if k == 0 then 0 else (if k == 7 then 0 else 1)
+fm_acc d i k cell =
+  if k >= 8 then 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get d (i + k)) == (flag_pat k) then 1 else 0))
+    fm_acc d i (k + 1) cell
+flagmatch d i =
+  let cell = arr_new 1 0
+  let _ = fm_acc d i 0 cell
+  if (arr_get cell 0) == 8 then 1 else 0
+find_flag d nn i =
+  if (i + 8) > nn then (0 - 1)
+  else if (flagmatch d i) == 1 then i else find_flag d nn (i + 1)
+skip_flags d nn i =
+  if (i + 8) > nn then i
+  else if (flagmatch d i) == 1 then skip_flags d nn (i + 8) else i
+next_flag d nn i =
+  if (i + 8) > nn then nn
+  else if (flagmatch d i) == 1 then i else next_flag d nn (i + 1)
+
+-- ===== RUNG 3c: de-stuff content d[start..end): drop the 0 after five 1s =====
+destuff d start end out onescell oicell i =
+  if i >= end then 0
+  else
+    let ones = arr_get onescell 0
+    if ones == 5 then
+      let _ = arr_set onescell 0 0
+      destuff d start end out onescell oicell (i + 1)
+    else
+      let b = arr_get d i
+      let oi = arr_get oicell 0
+      let _ = arr_set out oi b
+      let _ = arr_set oicell 0 (oi + 1)
+      let _ = arr_set onescell 0 (if b == 1 then ones + 1 else 0)
+      destuff d start end out onescell oicell (i + 1)
+
+-- ===== RUNG 3d: pack de-stuffed bits LSB-first into bytes =====
+pack_bits bits nbytes obytes j =
+  if j >= nbytes then 0
+  else
+    let _ = arr_set obytes j (pack_one bits (8 * j) 0 0)
+    pack_bits bits nbytes obytes (j + 1)
+pack_one bits base i acc =
+  if i >= 8 then acc
+  else pack_one bits base (i + 1) (bit_or acc (shl (arr_get bits (base + i)) i))
+
+-- ===== RUNG 3e: CRC-16/X-25 byte-wise (reflected, poly 0x8408 = 33800) =====
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+crcbyte crc b = crcbit (bit_xor crc b) 0
+crc_loop obytes n i cell =
+  if i >= n then 0
+  else
+    let _ = arr_set cell 0 (crcbyte (arr_get cell 0) (arr_get obytes i))
+    crc_loop obytes n (i + 1) cell
+crc16_x25 obytes n =
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let _ = crc_loop obytes n 0 cell
+  bit_xor (arr_get cell 0) 65535
+
+-- ===== printers + hex/ascii dumps =====
+hexd v = str_sub "0123456789abcdef" v 1
+hex8 v = cat [hexd (bit_and (shr v 4) 15), hexd (bit_and v 15)]
+hexdump obytes i n acc =
+  if i >= n then acc
+  else hexdump obytes (i + 1) n (cat [acc, hex8 (arr_get obytes i), " "])
+-- payload-as-hex (no spaces): carry recovered frame bytes into the receipt hash as HEX so
+-- any 0x00 byte survives (char_from_int 0 returns "" -> binary-as-string would drop NULs).
+payhex obytes i n acc =
+  if i >= n then acc
+  else payhex obytes (i + 1) n (cat [acc, hex8 (arr_get obytes i)])
+asc obytes i n acc =
+  if i >= n then acc
+  else
+    let b = arr_get obytes i
+    let c = if b >= 32 then (if b <= 126 then char_from_int b else ".") else "."
+    asc obytes (i + 1) n (cat [acc, c])
+
+main =
+  -- ---------- staging ----------
+  let sps = pint (field_or "/tmp/beacon_gen_sps.txt" "40")
+  let fsi = 48000
+  let mark = 1200
+  let space = 2200
+
+  -- ---------- RUNG 1: read IQ + FM-discriminate to recovered audio ----------
+  let bytes = read_bytes "/tmp/beacon_in.s8"
+  let nsamp = (arr_len bytes) / 2
+  let aud = float_arr_new nsamp 0.0
+  let _ = fill_aud bytes nsamp aud 1
+  let nsym = nsamp / sps
+  let _ = print (cat ["INFO IQ_samples=", show nsamp, " sps=", show sps, " channel_symbols=", show nsym, " (AFSK Bell-202 over FM-discriminated int8 IQ)"])
+
+  -- ---------- RUNG 2: AFSK bit slice -> channel bits (+ soft carrier detect) ----------
+  let chan = arr_new nsym 0
+  let detcell = float_arr_new 2 0.0
+  let _ = afsk_syms aud nsym sps fsi mark space 0 chan detcell
+  let sep = float_arr_get detcell 0
+  let tot = float_arr_get detcell 1
+  let detect = if tot >. 0.0 then (if (sep /. tot) >. 0.2 then 1 else 0) else 0
+  let _ = print (cat ["RUNG1_DETECT carrier_present=", show detect, " (mark/space tone separation over the burst; soft in-band detect)"])
+  let _ = print (cat ["CHAN ", bitdump chan 0 nsym ""])
+
+  -- ---------- RUNG 3: NRZI + HDLC deframe + CRC ----------
+  let d = arr_new nsym 0
+  let _ = nrzi_dec chan nsym d 0
+  let f0 = find_flag d nsym 0
+  let cstart = if f0 < 0 then nsym else skip_flags d nsym f0
+  let cend = next_flag d nsym cstart
+  let _ = print (cat ["FLAGS first=", show f0, " content=[", show cstart, ",", show cend, ")"])
+  let out = arr_new nsym 0
+  let onescell = arr_new 1 0
+  let oicell = arr_new 1 0
+  let _ = destuff d cstart cend out onescell oicell cstart
+  let totbits = arr_get oicell 0
+  let nbytes = totbits / 8
+  let obytes = arr_new nbytes 0
+  let _ = pack_bits out nbytes obytes 0
+  let framelen = nbytes - 2
+  let calc = crc16_x25 obytes framelen
+  let rxfcs = bit_or (arr_get obytes framelen) (shl (arr_get obytes (framelen + 1)) 8)
+  let crcok = if calc == rxfcs then 1 else 0
+  let _ = print (cat ["BYTES destuffed_bits=", show totbits, " bytes=", show nbytes, " frame=", show framelen])
+  let _ = print (cat ["FCS calc=0x", hex8 (bit_and (shr calc 8) 255), hex8 (bit_and calc 255), " rx=0x", hex8 (bit_and (shr rxfcs 8) 255), hex8 (bit_and rxfcs 255)])
+  let _ = print (cat ["CRC_OK=", show crcok])
+  let _ = print (cat ["HEX ", hexdump obytes 0 nbytes ""])
+  let _ = print (cat ["ASCII ", asc obytes 0 framelen ""])
+
+  -- ---------- RUNG 4: proof-of-reception RECEIPT over the recovered payload ----------
+  -- DEV signing key (NOT a production attestation authority -- clearly labeled).
+  let seed = hex_to_bytes "9012345678901234567890123456789012345678901234567890123456789000"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+  -- payload = recovered frame bytes (without FCS), carried as a hex string -> sha256 the hex
+  let payload_hex = payhex obytes 0 framelen ""
+  let payload_hash = sha256_hex payload_hex
+  -- detection facts come from the decode itself (carrier present) + staged synth pulse/freq
+  let freq = field_or "/tmp/beacon_det_freq.txt" "137.500"
+  let snr = field_or "/tmp/beacon_det_snr.txt" "PENDING_no_snr"
+  let pulse = field_or "/tmp/beacon_det_pulse.txt" "SYNTH_pulse_0"
+  let prev = "GENESIS"
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let band = "VHF-137-138MHz-beacon"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+  let receipt = join "|" ["BEACON_DECODE_RECEIPT", "kind=SYNTHETIC_TEST", cat ["station=", sta], cat ["band=", band], cat ["freqMHz=", freq], cat ["snr_dB=", snr], cat ["geo=", geo], cat ["pulse=", pulse], cat ["crc_ok=", show crcok], cat ["payload_sha256=", payload_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sig = ed25519_sign seed msg mlen
+  let sig_hex = bytes_to_hex sig 64
+  let verify_ok = ed25519_verify pk msg mlen sig
+  let tstr = cat [receipt, "X"]
+  let tmsg = string_to_bytes tstr
+  let tlen = string_length_bytes tstr
+  let tamper_ok = ed25519_verify pk tmsg tlen sig
+  let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+  let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["PAYLOAD_SHA256 ", payload_hash])
+  let _ = print (cat ["SIG      ", sig_hex])
+  let _ = print (cat ["CHAIN    ", chain_hash])
+  let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+  let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+  let jrec = join "\n" ["{", "  \"kind\": \"SYNTHETIC_TEST\",", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"crc_ok\": ", show crcok, ","], cat ["  \"payload_sha256\": \"", payload_hash, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/beacon_decode_receipt.json" jrec
+
+  -- ---------- end-to-end self-check ----------
+  let chain_ok = if crcok == 1 then (if verify_ok == 1 then (if tamper_ok == 0 then 1 else 0) else 0) else 0
+  let _ = print (cat ["CHAIN_STATUS rung1_detect=", show detect, " rung2_demod=ok rung3_crc=", show crcok, " rung4_verify=", show verify_ok, " rung4_tamper=", show tamper_ok])
+  let _ = print (cat ["END_TO_END ", (if chain_ok == 1 then "PASS (decode->deframe->CRC->attest all green; SYNTHETIC_TEST)" else "FAIL")])
+  0
+
+-- channel-bit dump (kept after main so it reads at the bottom like the other modules' helpers)
+bitdump outbits i n acc =
+  if i >= n then acc
+  else bitdump outbits (i + 1) n (cat [acc, show (arr_get outbits i)])

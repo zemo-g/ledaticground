@@ -1,0 +1,167 @@
+-- ledaticground LRPT rung: framesync — CCSDS attached-sync-marker (ASM) frame sync
+-- over SOFT bits, with QPSK 4-fold phase-ambiguity resolution. Sits between qpsk.rail's
+-- carrier recovery and viterbi.rail's soft-decision decode in the Meteor-M2 LRPT chain.
+--
+-- WHY SOFT (vs a hard-bit Hamming compare): the Viterbi decoder downstream wants soft
+-- bits (signed confidence values), so the front end carries soft decisions all the way
+-- from the QPSK demod. This rung correlates the 32-bit ASM 0x1ACFFC1D against the SOFT
+-- stream (a matched correlation, not a Hamming-distance hard compare), which is far more
+-- robust at the low SNR Meteor runs at, and it emits frame-aligned, DE-ROTATED soft bits
+-- that feed straight into viterbi.rail (no information thrown away). The hunt does a TRUE
+-- global peak search over the soft correlation, so channel noise cannot trip a false
+-- early accept the way a hard first-under-threshold sync would.
+--
+-- SOFT convention (matches qpsk.rail / viterbi.rail soft_at): each input byte is a signed
+-- int8 soft sample s in [-128,127]. The implied hard bit is 0 if s>=0, 1 if s<0
+-- (i.e. + -> bit 0, - -> bit 1, the same BPSK/per-rail convention viterbi.rail uses).
+-- The "bit sign" of an ideal bit b is sgn = +1 for b=0, -1 for b=1. The soft correlation
+-- of one position against an expected bit b is (sgn * s): large positive when the soft
+-- agrees with b, large negative when it disagrees.
+--
+-- QPSK rotation acts on the interleaved (I,Q) SOFT pairs. The hard-bit map is
+--   rot1: (I,Q) -> (Q, 1-I). In bit terms 1-x flips the bit; on a soft value, flipping
+-- the bit negates the soft value. So on the soft pair (si, sq):
+--   r=0: ( si,  sq)
+--   r=1: ( sq, -si)
+--   r=2: (-si, -sq)
+--   r=3: (-sq,  si)
+-- We de-rotate by applying the rotation that recovers truth; the search reports that
+-- de-rotation. Reads int8 soft stream from /tmp/framesync_in.s8.
+-- Prints "SYNC offset=<o> rotation=<r> corr=<c>" and "SOFT <signed decimals>".
+-- All loops carry int indices + array cells (self-loop-safe).
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+-- builtin malloc/free, bit_and/shr/shl
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 soft sample at index k
+soft_at bytes k =
+  let b = arr_get bytes k
+  if b < 128 then b else b - 256
+
+-- the DE-ROTATED soft value at absolute stream position (off + k), for k in [0,32),
+-- under rotation r. k is paired: pair = k/2, within-pair = k%2. si = soft at off+pair*2,
+-- sq = soft at off+pair*2+1. Returns the de-rotated soft (signed) value.
+--   r=0: (si, sq)  r=1: (sq,-si)  r=2: (-si,-sq)  r=3: (-sq, si)
+rot_soft bytes off k r =
+  let pair = k / 2
+  let inpair = k - pair * 2
+  let si = soft_at bytes (off + pair * 2)
+  let sq = soft_at bytes (off + pair * 2 + 1)
+  if inpair == 0 then
+    (if r == 0 then si else (if r == 1 then sq else (if r == 2 then (0 - si) else (0 - sq))))
+  else
+    (if r == 0 then sq else (if r == 1 then (0 - si) else (if r == 2 then (0 - sq) else si)))
+
+-- ASM 32 bits, MSB first: 0x1ACFFC1D = bytes [0x1A,0xCF,0xFC,0x1D].
+-- Rail miscompiles big int literals (>=32768) in some positions, so the marker is held
+-- as 4 small byte constants; asm_bit reads bit (7 - k%8) of byte k/8.
+asm_byte j = if j == 0 then 26 else (if j == 1 then 207 else (if j == 2 then 252 else 29))
+asm_bit k =
+  let j = k / 8
+  let b = k - j * 8
+  bit_and (shr (asm_byte j) (7 - b)) 1
+
+-- soft correlation of the de-rotated window at (off,r) against the ASM (32 bits).
+-- expected bit b -> sign +1 (b=0) / -1 (b=1); contribution = sign * soft. A correctly
+-- aligned, correctly de-rotated window maximizes this sum. Accumulate in an int cell.
+corr_acc bytes off r k cell =
+  if k >= 32 then 0
+  else
+    let s = rot_soft bytes off k r
+    let want = asm_bit k
+    let sign = if want == 0 then 1 else (0 - 1)
+    let _ = arr_set cell 0 ((arr_get cell 0) + sign * s)
+    corr_acc bytes off r (k + 1) cell
+asm_corr bytes off r =
+  let cell = arr_new 1 0
+  let _ = corr_acc bytes off r 0 cell
+  arr_get cell 0
+
+-- try all 4 rotations at one offset; record the best (largest) correlation into ccell[0]
+-- and its rotation into rcell[0].
+best_rot bytes off r ccell rcell =
+  if r >= 4 then 0
+  else
+    let c = asm_corr bytes off r
+    let _ = if c > (arr_get ccell 0) then
+              let _ = arr_set ccell 0 c
+              let _ = arr_set rcell 0 r
+              0
+            else 0
+    best_rot bytes off (r + 1) ccell rcell
+
+-- slide the offset (step 2 = QPSK symbol boundary), keep the GLOBAL best (offset,rotation)
+-- by correlation. Unlike a hard threshold this is a true peak search over soft correlation,
+-- so noise can't trip a false early accept. bestc[0]=best corr, besto[0]=offset, bestr[0]=rot.
+hunt bytes n off besto bestr bestc =
+  if (off + 32) > n then 0
+  else
+    let lc = arr_new 1 0
+    let lr = arr_new 1 0
+    let _ = arr_set lc 0 (0 - 1000000000)
+    let _ = arr_set lr 0 0
+    let _ = best_rot bytes off 0 lc lr
+    let _ = if (arr_get lc 0) > (arr_get bestc 0) then
+              let _ = arr_set bestc 0 (arr_get lc 0)
+              let _ = arr_set besto 0 off
+              let _ = arr_set bestr 0 (arr_get lr 0)
+              0
+            else 0
+    hunt bytes n (off + 2) besto bestr bestc
+
+-- emit the de-rotated soft values starting right after the ASM, nbits of them, as a
+-- space-separated signed-decimal string (these feed viterbi.rail as soft symbols).
+softs bytes dataoff r k nbits acc =
+  if k >= nbits then acc
+  else softs bytes dataoff r (k + 1) nbits (cat [acc, show (rot_soft bytes dataoff k r), " "])
+
+main =
+  let bytes = read_bytes "/tmp/framesync_in.s8"
+  let n = arr_len bytes
+  if n < 32 then
+    let _ = print "SYNC not_found"
+    0
+  else
+    let besto = arr_new 1 0
+    let bestr = arr_new 1 0
+    let bestc = arr_new 1 0
+    let _ = arr_set besto 0 (0 - 1)
+    let _ = arr_set bestr 0 0
+    let _ = arr_set bestc 0 (0 - 1000000000)
+    let _ = hunt bytes n 0 besto bestr bestc
+    let off = arr_get besto 0
+    let r = arr_get bestr 0
+    let c = arr_get bestc 0
+    let _ = print (cat ["INFO total_soft=", show n])
+    let _ = print (cat ["SYNC offset=", show off, " rotation=", show r, " corr=", show c])
+    -- emit a window of de-rotated soft bits after the ASM (128 bits of frame-aligned soft)
+    let dataoff = off + 32
+    let nbits = 128
+    let avail = n - dataoff
+    let emit = if nbits < avail then nbits else avail
+    let _ = print (cat ["SOFT ", softs bytes dataoff r 0 emit ""])
+    0

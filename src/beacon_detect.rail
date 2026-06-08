@@ -1,0 +1,222 @@
+-- ledaticground BEACON rung 1: narrowband carrier / energy detector (pure Rail).
+-- A CubeSat beacon near 137-138 MHz is a narrowband carrier in a wide SDR capture.
+-- This scans int8 IQ, Welch-averages the power spectrum (FFT idioms reused from
+-- src/spectrum.rail, but for SIGNED int8 samples), finds the strongest bin away from
+-- the DC spike, estimates the noise floor as the mean of off-peak bins, and reports:
+--   beacon offset (Hz from center), absolute freq (MHz), and in-band SNR (dB).
+-- Reads /tmp/beacon_detect_in.s8 ; prints DETECT/CARRIER/SNR lines to stdout.
+-- All FFT loops carry int indices + float arrays (self-loop-safe).
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign log x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+-- malloc/free: use builtins (do NOT declare foreign-returning-int; tags the pointer).
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 at byte index k
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- ---- FFT (validated, see src/fft.rail / src/spectrum.rail) ----
+brev_one i bits acc =
+  let bit = i % 2
+  brev_loop (i / 2) (bits - 1) (acc * 2 + bit)
+brev_loop i bits acc =
+  if bits == 0 then acc else brev_one i bits acc
+bitrev i bits = brev_loop i bits 0
+log2i n = if n <= 1 then 0 else 1 + log2i (n / 2)
+
+reorder re im n bits i =
+  if i >= n then 0
+  else
+    let r = bitrev i bits
+    let _ = if i < r then
+              let tr = float_arr_get re i
+              let ti = float_arr_get im i
+              let _ = float_arr_set re i (float_arr_get re r)
+              let _ = float_arr_set im i (float_arr_get im r)
+              let _ = float_arr_set re r tr
+              let _ = float_arr_set im r ti
+              0
+            else 0
+    reorder re im n bits (i + 1)
+
+bfly re im len half i j twopi =
+  if j >= half then 0
+  else
+    let ang = (0.0 - twopi) * (int_to_float j) / (int_to_float len)
+    let wr = cos ang
+    let wi = sin ang
+    let a = i + j
+    let b = i + j + half
+    let ur = float_arr_get re a
+    let ui = float_arr_get im a
+    let xr = float_arr_get re b
+    let xi = float_arr_get im b
+    let vr = xr * wr - xi * wi
+    let vi = xr * wi + xi * wr
+    let _ = float_arr_set re a (ur + vr)
+    let _ = float_arr_set im a (ui + vi)
+    let _ = float_arr_set re b (ur - vr)
+    let _ = float_arr_set im b (ui - vi)
+    bfly re im len half i (j + 1) twopi
+grp re im n len half i twopi =
+  if i >= n then 0
+  else
+    let _ = bfly re im len half i 0 twopi
+    grp re im n len half (i + len) twopi
+stage re im n len twopi =
+  if len > n then 0
+  else
+    let half = len / 2
+    let _ = grp re im n len half 0 twopi
+    stage re im n (len * 2) twopi
+fft re im n =
+  let bits = log2i n
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = reorder re im n bits 0
+  let _ = stage re im n 2 twopi
+  0
+
+-- load one frame of signed int8 IQ, Hann-windowed, into re/im
+load_frame bytes re im base n j twopi =
+  if j >= n then 0
+  else
+    let bi = base + 2 * j
+    let iv = isig bytes bi
+    let qv = isig bytes (bi + 1)
+    let w = 0.5 - 0.5 * (cos (twopi * (int_to_float j) / (int_to_float (n - 1))))
+    let _ = float_arr_set re j (iv * w)
+    let _ = float_arr_set im j (qv * w)
+    load_frame bytes re im base n (j + 1) twopi
+
+accum_power acc re im n k =
+  if k >= n then 0
+  else
+    let mr = float_arr_get re k
+    let mi = float_arr_get im k
+    let _ = float_arr_set acc k ((float_arr_get acc k) + (mr * mr + mi * mi))
+    accum_power acc re im n (k + 1)
+
+do_frames bytes re im acc n nf twopi f =
+  if f >= nf then 0
+  else
+    let base = f * n * 2
+    let _ = load_frame bytes re im base n 0 twopi
+    let _ = fft re im n
+    let _ = accum_power acc re im n 0
+    do_frames bytes re im acc n nf twopi (f + 1)
+
+-- natural-order power: natural index m -> fft bin (m + n/2) mod n
+natpow acc n m =
+  let half = n / 2
+  let b = if m < half then m + half else m - half
+  float_arr_get acc b
+
+-- zero fft bins around DC (center) to drop the SDR DC spike
+zero_dc acc n k b =
+  if b > k then 0
+  else
+    let _ = float_arr_set acc (n - 1 - b) 0.0
+    let _ = float_arr_set acc b 0.0
+    zero_dc acc n k (b + 1)
+
+-- strongest natural bin, skipping DC guard [glo,ghi] and band edges
+peak_scan acc n m bestm bestp glo ghi =
+  if m >= n then bestm
+  else
+    let edge = if m < 8 then 1 else (if m >= n - 8 then 1 else 0)
+    let inguard = if m >= glo then (if m <= ghi then 1 else 0) else 0
+    let skip = if edge == 1 then 1 else inguard
+    let p = natpow acc n m
+    let better = if skip == 0 then (if p > bestp then 1 else 0) else 0
+    let nm = if better == 1 then m else bestm
+    let np = if better == 1 then p else bestp
+    peak_scan acc n (m + 1) nm np glo ghi
+
+-- noise-floor estimate: mean power of bins OUTSIDE a guard window around the peak,
+-- and outside the DC guard + edges. Carries (count,sum) in a 2-cell float array.
+noise_acc acc n peakm pw glo ghi cell m =
+  if m >= n then 0
+  else
+    let edge = if m < 8 then 1 else (if m >= n - 8 then 1 else 0)
+    let indc = if m >= glo then (if m <= ghi then 1 else 0) else 0
+    let lo = peakm - pw
+    let hi = peakm + pw
+    let inpeak = if m >= lo then (if m <= hi then 1 else 0) else 0
+    let skip = if edge == 1 then 1 else (if indc == 1 then 1 else inpeak)
+    let _ = if skip == 0 then
+              let _ = float_arr_set cell 0 ((float_arr_get cell 0) + 1.0)
+              let _ = float_arr_set cell 1 ((float_arr_get cell 1) + (natpow acc n m))
+              0
+            else 0
+    noise_acc acc n peakm pw glo ghi cell (m + 1)
+
+main =
+  let n = 4096
+  let bytes = read_bytes "/tmp/beacon_detect_in.s8"
+  let total = arr_len bytes
+  let nf = total / (n * 2)
+  -- physical params (match the generator defaults; the generator's truth file is canonical)
+  let fs = 240000.0
+  let fc = 137500000.0
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let re = float_arr_new n 0.0
+  let im = float_arr_new n 0.0
+  let acc = float_arr_new n 0.0
+  let _ = print (cat ["INFO iq_bytes=", show total, " frames=", show nf, " N=", show n, " binHz=", show_float (fs / (int_to_float n))])
+  let _ = do_frames bytes re im acc n nf twopi 0
+  let half = n / 2
+  let _ = zero_dc acc n 6 0
+  -- find the beacon bin (natural order), skipping a DC guard of +/-6 bins
+  let glo = half - 6
+  let ghi = half + 6
+  let pk = peak_scan acc n 0 0 0.0 glo ghi
+  let pkpow = natpow acc n pk
+  -- noise floor: mean off-peak (peak +/-3 bins masked out)
+  let cell = float_arr_new 2 0.0
+  let _ = noise_acc acc n pk 3 glo ghi cell 0
+  let cnt = float_arr_get cell 0
+  let nsum = float_arr_get cell 1
+  let nfloor = if cnt > 0.0 then nsum / cnt else 1.0
+  -- in-band SNR in dB (10 log10 of peak/floor)
+  let ratio = if nfloor > 0.0 then pkpow / nfloor else 0.0
+  let ln10 = log 10.0
+  let snr_db = if ratio > 0.0 then 10.0 * (log ratio) / ln10 else 0.0
+  -- offset of the peak from center, absolute freq
+  let offHz = (int_to_float (pk - half)) * fs / (int_to_float n)
+  let absMHz = (fc + offHz) / 1000000.0
+  -- detection decision: SNR over a threshold => beacon present
+  let detected = if snr_db > 6.0 then 1 else 0
+  let _ = print (cat ["NFLOOR bins=", show_float cnt, " mean_pow=", show_float nfloor, " peak_pow=", show_float pkpow])
+  let _ = print (cat ["DETECT ", show detected, " (1=beacon present, SNR>6dB)"])
+  let _ = print (cat ["CARRIER bin=", show pk, " offsetHz=", show_float offHz, " absMHz=", show_float absMHz])
+  let _ = print (cat ["SNR ", show_float snr_db, " dB"])
+  0

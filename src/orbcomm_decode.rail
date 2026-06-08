@@ -1,0 +1,239 @@
+-- ledaticground Orbcomm INTEGRATED DECODER: the ONE end-to-end pure-Rail receive chain.
+--
+-- Wires the three working Orbcomm rungs into a single pipeline and runs it on the synthetic
+-- FULL-CHAIN vector produced by scripts/gen_orbcomm_gen.py (the "gen.py" for this decoder):
+--
+--   /tmp/orbcomm_in.s8  (int8 IQ, 1 samp/sym)            <- gen_orbcomm_gen.py transmit chain
+--     -> SD-PSK differential decode  bit=sign(Re(z[k]*conj(z[k-1]))<0)   [rung 1 orbcomm_demod]
+--     -> UW frame sync: correlate the 16-bit unique word                  [rung 1 orbcomm_demod]
+--     -> self-sync descramble: x_hat[n]=y[n]^y[n-4]^y[n-7] (x^7+x^4+1)    [rung 2 orbcomm_descram]
+--     -> CRC-16/X-25 integrity over (header+payload) vs trailing FCS      [rung 3 orbcomm_frame]
+--
+-- It PRINTS the decoded result (UW position, opaque header/payload bits, CRC) and then
+-- SELF-CHECKS against ground truth WITHOUT any external script: it reads the gen.py truth
+-- sidecars (/tmp/orbcomm_truth_msg.bits = the true header+payload+FCS plaintext, 1 byte/bit;
+-- /tmp/orbcomm_truth_uwpos.bits = the true UW decoded-start) and asserts, in pure Rail:
+--   (1) UW found at the true position with a full 16/16 correlation score,
+--   (2) the descrambled (header+payload+FCS) matches the true bits EXACTLY (BER 0),
+--   (3) CRC-16/X-25 over the recovered region equals the recovered FCS (cryptographic-grade
+--       integrity -- any single bit error anywhere in the chain breaks it).
+-- It emits DECODE_PASS / DECODE_FAIL accordingly.
+--
+-- PUBLIC/PROPRIETARY BOUNDARY (kept honest): the recovered header+payload are reported as
+-- OPAQUE bits with a measured length + a recomputable CRC. We NEVER emit a "message" with
+-- invented field semantics -- Orbcomm user data is commercial/partly-encrypted with no public
+-- message dictionary. The UW value, scrambler taps (x^7+x^4+1) and frame layout are
+-- illustrative synthetic stand-ins for the PUBLIC architecture; the MECHANISM is the public part.
+-- HONESTY: synthetic vector (no real off-air decode, no attestation wired -- src/attest.rail /
+-- src/ais_attest.rail is the drop-in Ed25519 receipt pattern if a signed receipt is wanted).
+--
+-- RAIL TRAPS DODGED (see qpsk.rail / viterbi.rail idioms):
+--   * malloc/free used as BUILTINS (never `foreign ... -> int`, which would tag the 64-bit
+--     pointer as a 63-bit int and corrupt every byte read).
+--   * every loop with cross-dependent computed tail args is split into MUTUAL RECURSION
+--     (best_uw/best_step, crc_loop/crc_step, cmp_loop/cmp_step) -- self-loops with computed
+--     tail args + array cells segfault under this compiler.
+--   * float comparison uses `<.` (polymorphic == on floats can segfault value-dependently).
+--   * big consts (33800/65535) appear only as OPERANDS, never in a return/branch-value slot.
+--   * all recursions carry int indices + array cells.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+-- NUL-safe O(n) byte reader (malloc/free are BUILTINS, not foreign).
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- signed int8 sample -> float (b in 0..255; 128..255 are negative)
+soft_at bytes k =
+  let b = arr_get bytes k
+  let s = if b < 128 then b else b - 256
+  int_to_float s
+
+-- ============================ RUNG 1a: SD-PSK differential decode ============================
+-- bit (k-1) = 1 if Re(z[k]*conj(z[k-1])) < 0 (phase flipped ~pi). Phase-invariant; no Costas.
+diffdec bytes nsym k outbits =
+  if k >= nsym then 0
+  else
+    let ik  = soft_at bytes (k * 2)
+    let qk  = soft_at bytes (k * 2 + 1)
+    let ik1 = soft_at bytes ((k - 1) * 2)
+    let qk1 = soft_at bytes ((k - 1) * 2 + 1)
+    let dot = ik * ik1 + qk * qk1
+    let _ = arr_set outbits (k - 1) (if dot <. 0.0 then 1 else 0)
+    diffdec bytes nsym (k + 1) outbits
+
+-- ============================ RUNG 1b: UW frame sync ============================
+-- 16-bit unique word (must match gen_orbcomm_gen.py UW). Illustrative synthetic pattern.
+set_uw uw =
+  let _ = arr_set uw 0 0
+  let _ = arr_set uw 1 0
+  let _ = arr_set uw 2 1
+  let _ = arr_set uw 3 0
+  let _ = arr_set uw 4 0
+  let _ = arr_set uw 5 1
+  let _ = arr_set uw 6 1
+  let _ = arr_set uw 7 0
+  let _ = arr_set uw 8 1
+  let _ = arr_set uw 9 1
+  let _ = arr_set uw 10 1
+  let _ = arr_set uw 11 0
+  let _ = arr_set uw 12 1
+  let _ = arr_set uw 13 0
+  let _ = arr_set uw 14 0
+  let _ = arr_set uw 15 1
+  0
+
+match_cnt dec uw ulen start j cell =
+  if j >= ulen then arr_get cell 0
+  else
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get dec (start + j)) == (arr_get uw j) then 1 else 0))
+    match_cnt dec uw ulen start (j + 1) cell
+-- mutual recursion best_uw/best_step to dodge the self-loop cross-dep-arg miscompile
+best_step dec ndec uw ulen start bestcell poscell =
+  let c = arr_new 1 0
+  let sc = match_cnt dec uw ulen start 0 c
+  let _ = if sc > (arr_get bestcell 0) then
+            let _ = arr_set bestcell 0 sc
+            let _ = arr_set poscell 0 start
+            0
+          else 0
+  best_uw dec ndec uw ulen (start + 1) bestcell poscell
+best_uw dec ndec uw ulen start bestcell poscell =
+  if (start + ulen) > ndec then 0
+  else best_step dec ndec uw ulen start bestcell poscell
+
+-- ============================ RUNG 2: self-sync descramble ============================
+-- out[i] = y[i] ^ y[i-4] ^ y[i-7]  (taps 4,7 = x^7+x^4+1). slice = dec[base..base+n).
+tapbit_slice dec base i k = if (i - k) < 0 then 0 else arr_get dec (base + i - k)
+descram dec base n i out =
+  if i >= n then 0
+  else
+    let yi = arr_get dec (base + i)
+    let y4 = tapbit_slice dec base i 4
+    let y7 = tapbit_slice dec base i 7
+    let v  = bit_xor (bit_xor yi y4) y7
+    let _  = arr_set out i v
+    descram dec base n (i + 1) out
+
+-- ============================ RUNG 3: CRC-16/X-25 over header+payload ============================
+-- reflected CRC-16/X-25 (poly 0x8408 = 33800, init 0xFFFF, xorout 0xFFFF) over MSB-first bytes.
+crcbit crc i =
+  if i >= 8 then crc
+  else crcbit (if (bit_and crc 1) == 1 then bit_xor (shr crc 1) 33800 else shr crc 1) (i + 1)
+crcbyte crc b = crcbit (bit_xor crc b) 0
+-- pack 8 bits (MSB-first) from msg[base..base+8) into a byte value
+packbyte8 msg base =
+  bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (bit_or (shl (arr_get msg base) 1) (arr_get msg (base+1))) 1) (arr_get msg (base+2))) 1) (arr_get msg (base+3))) 1) (arr_get msg (base+4))) 1) (arr_get msg (base+5))) 1) (arr_get msg (base+6))) 1) (arr_get msg (base+7))
+-- byte loop folded via mutual recursion (self-loop cross-dep-arg safe)
+crc_step msg nbytes b base cell =
+  let _ = arr_set cell 0 (crcbyte (arr_get cell 0) (packbyte8 msg base))
+  crc_loop msg nbytes (b + 1) (base + 8) cell
+crc_loop msg nbytes b base cell =
+  if b >= nbytes then arr_get cell 0
+  else crc_step msg nbytes b base cell
+crc16_region msg start nbits =
+  let nbytes = nbits / 8
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let r = crc_loop msg nbytes 0 start cell
+  bit_xor (arr_get cell 0) 65535
+
+-- read a 16-bit FCS (MSB-first) at msg[start..start+16) into an int
+fcs_read msg start j acc =
+  if j >= 16 then acc
+  else fcs_read msg start (j + 1) (bit_or (shl acc 1) (arr_get msg (start + j)))
+
+bitstr out i n acc = if i >= n then acc else bitstr out (i + 1) n (cat [acc, show (arr_get out i)])
+
+-- ============================ ground-truth self-check ============================
+-- bit-for-bit compare recovered msg[0..n) vs truth[0..n); diff count into cell (mutual rec).
+cmp_step rec truth n i cell =
+  let _ = arr_set cell 0 ((arr_get cell 0) + (if (arr_get rec i) == (arr_get truth i) then 0 else 1))
+  cmp_loop rec truth n (i + 1) cell
+cmp_loop rec truth n i cell =
+  if i >= n then arr_get cell 0
+  else cmp_step rec truth n i cell
+
+main =
+  -- ---- read the full-chain IQ vector from the decoder's gen.py ----
+  let bytes = read_bytes "/tmp/orbcomm_in.s8"
+  let len = arr_len bytes
+  let nsym = len / 2
+  let ndec = nsym - 1
+  let dec = arr_new ndec 0
+  let _ = diffdec bytes nsym 1 dec
+  let _ = print (cat ["INFO samples=", show len, " symbols=", show nsym, " decoded_bits=", show ndec])
+  let _ = print "SYMRATE 4800"
+
+  -- ---- RUNG 1: UW frame sync ----
+  let uw = arr_new 16 0
+  let _ = set_uw uw
+  let bestcell = arr_new 1 0
+  let poscell = arr_new 1 0
+  let _ = best_uw dec ndec uw 16 0 bestcell poscell
+  let uwpos = arr_get poscell 0
+  let uwsc = arr_get bestcell 0
+  let _ = print (cat ["UW_AT ", show uwpos, " score ", show uwsc, " /16"])
+
+  -- ---- RUNG 2: descramble the message slice (header+payload+FCS) right after the UW ----
+  let hdr_len = 24
+  let pay_len = 144
+  let region_bits = hdr_len + pay_len
+  let msg_len = region_bits + 16
+  let scr_start = uwpos + 16
+  let msg = arr_new msg_len 0
+  let _ = descram dec scr_start msg_len 0 msg
+  let _ = print (cat ["MSG_OPAQUE_LEN ", show region_bits, " bits (header+payload; semantics PROPRIETARY -- not decoded)"])
+  let _ = print (cat ["HEADER_OPAQUE ", bitstr msg 0 hdr_len ""])
+  let _ = print (cat ["PAYLOAD_OPAQUE_LEN ", show pay_len, " bits"])
+
+  -- ---- RUNG 3: CRC-16/X-25 integrity over (header+payload) vs trailing FCS ----
+  let calc = crc16_region msg 0 region_bits
+  let rxfcs = fcs_read msg region_bits 0 0
+  let crc_ok = if calc == rxfcs then 1 else 0
+  let _ = print (cat ["CRC calc=", show calc, " rx=", show rxfcs])
+  let _ = print (cat ["CRC_OK=", show crc_ok])
+
+  -- ============================ SELF-CHECK vs ground truth ============================
+  -- gen.py sidecars: true header+payload+FCS plaintext (1 byte/bit) + true UW decoded-start.
+  let truth = read_bytes "/tmp/orbcomm_truth_msg.bits"
+  let tlen = arr_len truth
+  let upos = read_bytes "/tmp/orbcomm_truth_uwpos.bits"
+  let true_uwpos = if (arr_len upos) > 0 then arr_get upos 0 else (0 - 1)
+  -- (1) UW at the true position with a full 16/16 score
+  let uw_ok = if uwpos == true_uwpos then (if uwsc == 16 then 1 else 0) else 0
+  -- (2) recovered msg matches truth EXACTLY (compare over the truth length)
+  let dcell = arr_new 1 0
+  let cmp_n = if tlen < msg_len then tlen else msg_len
+  let ndiff = if tlen > 0 then cmp_loop msg truth cmp_n 0 dcell else (0 - 1)
+  let len_ok = if tlen == msg_len then 1 else 0
+  let bits_ok = if (tlen > 0) then (if ndiff == 0 then (if len_ok == 1 then 1 else 0) else 0) else 0
+  let _ = print (cat ["TRUTH uw_at=", show true_uwpos, " msg_bits=", show tlen, " diff_bits=", show ndiff])
+  -- (3) overall verdict: UW + exact bits + CRC integrity all green
+  let pass = if uw_ok == 1 then (if bits_ok == 1 then (if crc_ok == 1 then 1 else 0) else 0) else 0
+  let _ = print (cat ["CHECK uw_ok=", show uw_ok, " bits_ok=", show bits_ok, " crc_ok=", show crc_ok])
+  let _ = if pass == 1
+            then print "DECODE_PASS orbcomm full chain: SD-PSK demod -> UW sync -> self-sync descramble -> CRC-16/X-25 (recovered opaque header+payload+FCS match truth bit-for-bit)"
+            else print "DECODE_FAIL orbcomm chain did not match ground truth (see CHECK line)"
+  0
