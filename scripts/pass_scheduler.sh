@@ -90,10 +90,14 @@ capture_iq_pass(){      # $1=sat $2=freq(Hz) $3=dur(min) $4=elev $5=mode — RAW
   bash "$GD/scripts/validate_external.sh" "$loc" >/tmp/iqval.log 2>&1 || true
   # honest signal tell from satdump's OWN decode OUTPUT (not module names — those appear on noise too):
   #   LRPT -> max MSU-MR image line count (>0 = real frames decoded); APT -> wedge calibration succeeded.
-  xl=$(grep -oE "Lines  : [0-9]+" /tmp/iqval.log 2>/dev/null | grep -oE "[0-9]+$" | sort -rn | head -1)
-  if [ -n "$xl" ]; then [ "$xl" -gt 0 ] && xtag="[satdump LRPT lines=$xl -> SIGNAL]" || xtag="[satdump LRPT lines=0 -> noise]"
-  elif grep -qiE "no valid wedge|Couldn.t calibrate" /tmp/iqval.log; then xtag="[satdump APT no-wedge -> noise]"
-  else xtag="[satdump APT wedge-ok -> SIGNAL?]"; fi
+  # honest signal tell, keyed on pass MODE (APT vs LRPT have different success signatures):
+  #   LRPT signal = satdump wrote an MSU-MR channel PNG or non-zero image lines; else 0 frames = noise.
+  #   APT  noise  = wedge calibration failed ("no valid wedge"); else wedges calibrated = signal.
+  if [ "$MODE" = "LRPT" ]; then
+    if ls "${loc%.bin}.satdump"/MSU-MR/*.png >/dev/null 2>&1 || grep -qE "Lines  : [1-9]" /tmp/iqval.log 2>/dev/null; then xtag="[satdump LRPT image -> SIGNAL]"; else xtag="[satdump LRPT 0-frames -> noise]"; fi
+  else
+    if grep -qiE "no valid wedge|Couldn.t calibrate" /tmp/iqval.log 2>/dev/null; then xtag="[satdump APT no-wedge -> noise]"; else xtag="[satdump APT wedge-ok -> SIGNAL]"; fi
+  fi
   log "satdump xcheck -> ${loc%.bin}.satdump/ $xtag"
 }
 
