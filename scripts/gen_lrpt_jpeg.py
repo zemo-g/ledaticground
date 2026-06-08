@@ -188,10 +188,16 @@ ac_list=[(sym,L,C) for sym,(L,C) in sorted(AC_CODES.items())]
 # runtime (same idiom dct.rail uses to load the zig-zag table from a string — avoids a
 # 178-arm nested-if). Format: first line "ndc nac nbits nblocks", then for each table a
 # flat stream of "symbol length code" triples (DC table first, then AC table).
+# NOTE: this synthetic generator uses the RAW QTBL with no quality scaling, which is
+# exactly the libjpeg quality=50 case (scale = 200-2*50 = 100 -> Q[i] = std[i]). So it
+# emits a single degenerate packet (quality 50, all NB blocks, firstbit 0), keeping it
+# compatible with the packet-aware src/lrpt_jpeg.rail (gen_lrpt_real.py is the canonical
+# real-Meteor generator; this stays as a quick synthetic smoke).
 with open('/tmp/lrpt_jpeg_tables.txt','w') as f:
-    f.write(f"{len(dc_list)} {len(ac_list)} {nbits} {NB}\n")
+    f.write(f"{len(dc_list)} {len(ac_list)} {nbits} {NB} 1\n")
     f.write(" ".join(f"{s} {L} {C}" for (s,L,C) in dc_list)+"\n")
     f.write(" ".join(f"{s} {L} {C}" for (s,L,C) in ac_list)+"\n")
+    f.write(f"50 {NB} 0\n")   # single packet: quality 50 (=identity qtbl), NB blocks, firstbit 0
 json.dump({"nb":NB,"nbits":nbits,"qtbl":[int(x) for x in QTBL.flatten()],"zz":ZZ,
            "expected":expected,"src":src_blocks,"zz_coeffs":zz_coeffs,
            "dc_table":dc_list,"ac_table":ac_list},

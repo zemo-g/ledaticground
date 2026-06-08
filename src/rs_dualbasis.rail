@@ -1,0 +1,379 @@
+-- ledaticground LRPT rung: rs_dualbasis -- Reed-Solomon RS(255,223) CCSDS decode over
+-- GF(2^8), poly 0x11D, WITH the CCSDS dual-basis byte transform wrapped around the RS
+-- algebra (dual->conventional pre-RS, conventional->dual post-RS). Pure Rail.
+--
+-- Position in the LRPT chain:  ... -> viterbi -> derand -> [de-interleave] ->
+--   [per byte: DUAL->CONV] -> RS decode (conventional) -> [per byte: CONV->DUAL] -> vcdu ...
+--
+-- FIELD: GF(256), primitive polynomial 0x11D (=285), primitive element alpha=2, first
+-- consecutive root FCR=1 -- the CONVENTIONAL (Berlekamp) RS field. The RS algebra here is
+-- bit-identical to src/rs.rail: Horner syndromes -> Berlekamp-Massey -> Chien -> Forney ->
+-- in-place correction -> post-correction syndrome recheck. The ONLY addition is the
+-- dual-basis change of basis applied to each byte on the way in and out.
+--
+-- DUAL BASIS: a fixed, invertible 8x8 GF(2) change of basis. Each conversion is GF(2)-linear,
+-- so it is fully determined by the images of the 8 basis vectors -- carried here as two
+-- 8-element "column" vectors (C2D = conventional->dual, D2C = dual->conventional). Converting
+-- a byte is an XOR-fold: out = XOR over set input bits i of COLS[i]. No matrix loop, no LUT
+-- literal; the two 256-entry LUTs the C decoders (Karn libfec Taltab/Tal1tab) hardcode are
+-- exactly the XOR-fold of these columns over all 256 inputs, built once at init.
+--
+-- HONESTY (transform): the canonical CCSDS dual<->conv anchors (0x00<->0x00, conv 0x01<->dual
+-- 0x7b, conv 0x55<->dual 0xc1, conv 0xff<->dual 0xa3) are rank-deficient (3 nonzero vectors)
+-- and CANNOT uniquely pin a rank-8 GF(2) map. The transform below is a genuine trace-dual
+-- change of basis (delta=0x7b) that satisfies all 4 anchors AND round-trips bijectively over
+-- all 256 values; it is structurally a valid CCSDS dual basis. It is NOT yet byte-verified
+-- against Karn libfec's exact Taltab/Tal1tab -- that final wire-bit match is pinned by a real
+-- Meteor-M2 capture (the remaining step). This rung proves: (a) the transform is a clean
+-- invertible bijection (256-value round-trip), and (b) encode-in-dual -> RS-correct -> the
+-- original conventional message bytes are recovered through <=16 byte errors per codeword.
+--
+-- RAIL traps handled: every recursion carries only int indices; loop-carried scalars live in
+-- 1-element int cells; GF arithmetic via bit_xor/bit_and builtins; field constant 285 and
+-- sizes kept as plain operands; malloc/free/bit_xor used as BUILTINS (never `foreign`); the
+-- dual transform carries the int bit index + an int accumulator (XOR via bit_xor), no floats,
+-- no char_from_int 0 (every byte stays an int 0..255 so 0x00 bytes survive).
+--
+-- Reads CADU bytes (dual basis) from /tmp/rs_in.s8 (1020 bytes = 4 * 255). Emits per codeword:
+--   "CW<k> nerr=<e> L=<L> corrected_ok=<0|1> DATA <223 decimal DUAL-basis bytes>"
+-- a leading "INFO ..." line, and a "SELFTEST ..." line for the dual-basis round-trip.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+-- malloc/free/bit_xor/bit_and/shl/arr_* are builtins -- do NOT declare them foreign.
+
+-- ---- NUL-safe O(n) file reader (the repo's shared boilerplate) ----
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- ================= CCSDS dual-basis byte transform =================
+-- Two GF(2)-linear maps, each held as an 8-element column vector. Converting a byte v:
+--   out = XOR over set bits i of v of  COLS[i].
+-- C2D = conventional->dual columns:  conv basis vector e_i -> dual byte
+-- D2C = dual->conventional columns:  dual basis vector e_i -> conv byte
+-- (Derived: GF(256) poly 0x11D, delta=0x7b trace-dual; satisfies the 4 CCSDS anchors and is
+-- a bijection over all 256 values. See module header for the honest provenance note.)
+build_c2d cols =
+  let _ = arr_set cols 0 123
+  let _ = arr_set cols 1 171
+  let _ = arr_set cols 2 79
+  let _ = arr_set cols 3 62
+  let _ = arr_set cols 4 153
+  let _ = arr_set cols 5 194
+  let _ = arr_set cols 6 108
+  let _ = arr_set cols 7 53
+  0
+build_d2c cols =
+  let _ = arr_set cols 0 133
+  let _ = arr_set cols 1 240
+  let _ = arr_set cols 2 231
+  let _ = arr_set cols 3 253
+  let _ = arr_set cols 4 211
+  let _ = arr_set cols 5 49
+  let _ = arr_set cols 6 107
+  let _ = arr_set cols 7 187
+  0
+
+-- XOR-fold the column vector over the set bits of v. Carries int bit index + int acc.
+xor_fold cols v bit acc =
+  if bit >= 8 then acc
+  else
+    let nacc = if (bit_and v (shl 1 bit)) != 0
+                 then bit_xor acc (arr_get cols bit)
+                 else acc
+    xor_fold cols v (bit + 1) nacc
+
+-- byte conversions
+to_conv d2c v = xor_fold d2c v 0 0       -- dual byte -> conventional byte
+to_dual c2d v = xor_fold c2d v 0 0       -- conventional byte -> dual byte
+
+-- Build the two full 256-entry LUTs once (the libfec Taltab/Tal1tab form). Indexed by int byte.
+build_lut cols lut i =
+  if i >= 256 then 0
+  else
+    let _ = arr_set lut i (xor_fold cols i 0 0)
+    build_lut cols lut (i + 1)
+
+-- convert a whole codeword in place via a LUT
+convert_cw lut cw i =
+  if i >= 255 then 0
+  else
+    let _ = arr_set cw i (arr_get lut (arr_get cw i))
+    convert_cw lut cw (i + 1)
+
+-- ---- dual-basis round-trip self-test over all 256 values ----
+-- For each v: assert c2d[d2c[v]] == v AND d2c[c2d[v]] == v. Returns count of failures.
+selftest_rt c2dlut d2clut v fails =
+  if v >= 256 then fails
+  else
+    let a = arr_get c2dlut (arr_get d2clut v)   -- c2d[d2c[v]]
+    let b = arr_get d2clut (arr_get c2dlut v)   -- d2c[c2d[v]]
+    let f1 = if a != v then 1 else 0
+    let f2 = if b != v then 1 else 0
+    selftest_rt c2dlut d2clut (v + 1) (fails + f1 + f2)
+-- anchor check: conv->dual must hit the 4 CCSDS canonical anchors.
+anchor_ok c2dlut =
+  let a0 = if (arr_get c2dlut 0) == 0 then 1 else 0
+  let a1 = if (arr_get c2dlut 1) == 123 then 1 else 0      -- 0x01 -> 0x7b
+  let a2 = if (arr_get c2dlut 85) == 193 then 1 else 0     -- 0x55 -> 0xc1
+  let a3 = if (arr_get c2dlut 255) == 163 then 1 else 0    -- 0xff -> 0xa3
+  a0 + a1 + a2 + a3
+
+-- ---- GF(256) tables: exp[0..511] (doubled for index wrap), log[0..255] ----
+-- alpha=2; reduction poly 0x11D = 285. exp[i] = alpha^i, log[exp[i]] = i.
+gf_build expt logt i x =
+  if i >= 255 then 0
+  else
+    let _ = arr_set expt i x
+    let _ = arr_set logt x i
+    let dbl = shl x 1
+    let nx = if dbl >= 256 then bit_xor dbl 285 else dbl
+    gf_build expt logt (i + 1) nx
+gf_ext expt i =
+  if i >= 512 then 0
+  else
+    let _ = arr_set expt i (arr_get expt (i - 255))
+    gf_ext expt (i + 1)
+
+-- GF multiply / divide / power via log-exp.
+gmul expt logt a b =
+  if a == 0 then 0
+  else if b == 0 then 0
+  else arr_get expt (((arr_get logt a) + (arr_get logt b)) % 255)
+gdiv expt logt a b =
+  if a == 0 then 0
+  else arr_get expt (((arr_get logt a) - (arr_get logt b) + 255) % 255)
+galpha expt p = arr_get expt (p % 255)
+
+-- ---- I=4 column de-interleave: codeword k, byte i = cadu[i*I + k] ----
+deinterleave cadu cw ii k i =
+  if i >= 255 then 0
+  else
+    let _ = arr_set cw i (arr_get cadu (i * ii + k))
+    deinterleave cadu cw ii k (i + 1)
+
+-- ---- Syndromes S[j] = cw(alpha^(FCR+j)), j=0..NPAR-1, via Horner.
+syn_horner expt logt cw root i scell =
+  if i >= 255 then 0
+  else
+    let _ = arr_set scell 0 (bit_xor (gmul expt logt (arr_get scell 0) root) (arr_get cw i))
+    syn_horner expt logt cw root (i + 1) scell
+calc_syndromes expt logt cw synd npar j =
+  if j >= npar then 0
+  else
+    let root = galpha expt (1 + j)
+    let sc = arr_new 1 0
+    let _ = syn_horner expt logt cw root 0 sc
+    let _ = arr_set synd j (arr_get sc 0)
+    calc_syndromes expt logt cw synd npar (j + 1)
+syndromes_nonzero synd npar j =
+  if j >= npar then 0
+  else if (arr_get synd j) != 0 then 1
+  else syndromes_nonzero synd npar (j + 1)
+
+-- ---- Berlekamp-Massey: find the error-locator polynomial lambda[].
+poly_copy src dst n i = if i > n then 0 else let _ = arr_set dst i (arr_get src i) in poly_copy src dst n (i + 1)
+poly_zero a n i = if i > n then 0 else let _ = arr_set a i 0 in poly_zero a n (i + 1)
+
+bm_disc expt logt lam synd r ll i dcell =
+  if i > ll then 0
+  else
+    let _ = arr_set dcell 0 (bit_xor (arr_get dcell 0) (gmul expt logt (arr_get lam i) (arr_get synd (r - i))))
+    bm_disc expt logt lam synd r ll (i + 1) dcell
+bm_shift expt logt lam b t coef m npar i =
+  if i > npar then 0
+  else
+    let bsh = if (i - m) < 0 then 0 else arr_get b (i - m)
+    let _ = arr_set t i (bit_xor (arr_get lam i) (gmul expt logt coef bsh))
+    bm_shift expt logt lam b t coef m npar (i + 1)
+
+berlekamp expt logt synd npar lam b t lcell mcell =
+  let _ = poly_zero lam npar 0
+  let _ = poly_zero b npar 0
+  let _ = arr_set lam 0 1
+  let _ = arr_set b 0 1
+  let _ = arr_set lcell 0 0
+  let _ = arr_set mcell 0 1
+  let bdc = arr_new 1 1
+  let _ = bm_loop expt logt synd npar lam b t lcell mcell bdc 0
+  0
+bm_loop expt logt synd npar lam b t lcell mcell bdc r =
+  if r >= npar then 0
+  else
+    let ll = arr_get lcell 0
+    let dc = arr_new 1 0
+    let _ = arr_set dc 0 (arr_get synd r)
+    let _ = bm_disc expt logt lam synd r ll 1 dc
+    let d = arr_get dc 0
+    let m = arr_get mcell 0
+    let _ = if d == 0 then
+              let _ = arr_set mcell 0 (m + 1)
+              0
+            else
+              let coef = gdiv expt logt d (arr_get bdc 0)
+              let _ = poly_copy lam t npar 0
+              let _ = bm_shift expt logt lam b t coef m npar 0
+              let _ = if (2 * ll) <= r then
+                        let _ = poly_copy lam b npar 0
+                        let _ = poly_copy t lam npar 0
+                        let _ = arr_set lcell 0 (r + 1 - ll)
+                        let _ = arr_set bdc 0 d
+                        let _ = arr_set mcell 0 1
+                        0
+                      else
+                        let _ = poly_copy t lam npar 0
+                        let _ = arr_set mcell 0 (m + 1)
+                        0
+              0
+    bm_loop expt logt synd npar lam b t lcell mcell bdc (r + 1)
+
+-- ---- Chien search ----
+lam_eval expt logt lam ll x j acc =
+  if j > ll then acc
+  else lam_eval expt logt lam ll x (j + 1) (bit_xor acc (gmul expt logt (arr_get lam j) (galpha expt (((arr_get logt x) * j) % 255))))
+chien expt logt lam ll epos ecell i =
+  if i >= 255 then 0
+  else
+    let x = galpha expt ((255 - i) % 255)
+    let v = lam_eval expt logt lam ll x 0 0
+    let _ = if v == 0 then
+              let nn = arr_get ecell 0
+              let _ = arr_set epos nn i
+              let _ = arr_set ecell 0 (nn + 1)
+              0
+            else 0
+    chien expt logt lam ll epos ecell (i + 1)
+
+-- ---- Forney ----
+omega_inner expt logt synd lam d j oc =
+  if j > d then 0
+  else
+    let _ = arr_set oc 0 (bit_xor (arr_get oc 0) (gmul expt logt (arr_get synd j) (arr_get lam (d - j))))
+    omega_inner expt logt synd lam d (j + 1) oc
+calc_omega expt logt synd lam npar omega d =
+  if d >= npar then 0
+  else
+    let oc = arr_new 1 0
+    let _ = omega_inner expt logt synd lam d 0 oc
+    let _ = arr_set omega d (arr_get oc 0)
+    calc_omega expt logt synd lam npar omega (d + 1)
+poly_eval expt logt p deg x j acc =
+  if j > deg then acc
+  else poly_eval expt logt p deg x (j + 1) (bit_xor acc (gmul expt logt (arr_get p j) (galpha expt (((arr_get logt x) * j) % 255))))
+lamprime_eval expt logt lam ll x j acc =
+  if j > ll then acc
+  else
+    let term = if (bit_and j 1) == 1 then gmul expt logt (arr_get lam j) (galpha expt (((arr_get logt x) * (j - 1)) % 255)) else 0
+    lamprime_eval expt logt lam ll x (j + 1) (bit_xor acc term)
+
+forney_fix expt logt cw lam omega npar ll epos nerr k =
+  if k >= nerr then 0
+  else
+    let i = arr_get epos k
+    let xinv = galpha expt ((255 - i) % 255)
+    let om = poly_eval expt logt omega (npar - 1) xinv 0 0
+    let lp = lamprime_eval expt logt lam ll xinv 1 0
+    let mag = if lp == 0 then 0 else gdiv expt logt om lp
+    let bidx = 254 - i
+    let _ = arr_set cw bidx (bit_xor (arr_get cw bidx) mag)
+    forney_fix expt logt cw lam omega npar ll epos nerr (k + 1)
+
+-- build the " b0 b1 .. " decimal data string (return-position cat only)
+decs a i n acc = if i >= n then acc else decs a (i + 1) n (cat [acc, show (arr_get a i), " "])
+
+-- decode one length-255 codeword cw (already in CONVENTIONAL basis).
+-- Mutates cw in place to corrected conventional bytes. Returns 0.
+-- Prints CW<k>: nerr, L, corrected_ok, and the 223 DATA bytes re-encoded back to DUAL basis.
+decode_cw expt logt c2dlut cw npar k =
+  let synd = arr_new npar 0
+  let _ = calc_syndromes expt logt cw synd npar 0
+  if (syndromes_nonzero synd npar 0) == 0 then
+    let dual = arr_new 223 0
+    let _ = emit_dual c2dlut cw dual 0
+    let _ = print (cat ["CW", show k, " nerr=0 L=0 corrected_ok=1 DATA ", decs dual 0 223 ""])
+    0
+  else
+    let lam = arr_new (npar + 1) 0
+    let b = arr_new (npar + 1) 0
+    let t = arr_new (npar + 1) 0
+    let lcell = arr_new 1 0
+    let mcell = arr_new 1 0
+    let _ = berlekamp expt logt synd npar lam b t lcell mcell
+    let ll = arr_get lcell 0
+    let epos = arr_new 255 0
+    let ecell = arr_new 1 0
+    let _ = chien expt logt lam ll epos ecell 0
+    let nerr = arr_get ecell 0
+    let omega = arr_new npar 0
+    let _ = calc_omega expt logt synd lam npar omega 0
+    let _ = forney_fix expt logt cw lam omega npar ll epos nerr 0
+    let synd2 = arr_new npar 0
+    let _ = calc_syndromes expt logt cw synd2 npar 0
+    let ok = if (syndromes_nonzero synd2 npar 0) == 0 then 1 else 0
+    let dual = arr_new 223 0
+    let _ = emit_dual c2dlut cw dual 0
+    let _ = print (cat ["CW", show k, " nerr=", show nerr, " L=", show ll, " corrected_ok=", show ok, " DATA ", decs dual 0 223 ""])
+    0
+-- re-encode the first 223 (conventional, corrected) data bytes back to DUAL basis for output.
+emit_dual c2dlut cw dual i =
+  if i >= 223 then 0
+  else
+    let _ = arr_set dual i (arr_get c2dlut (arr_get cw i))
+    emit_dual c2dlut cw dual (i + 1)
+
+decode_all expt logt d2clut c2dlut cadu ii npar k =
+  if k >= ii then 0
+  else
+    let cw = arr_new 255 0
+    let _ = deinterleave cadu cw ii k 0
+    -- DUAL -> CONVENTIONAL on every byte BEFORE the RS algebra
+    let _ = convert_cw d2clut cw 0
+    let _ = decode_cw expt logt c2dlut cw npar k
+    decode_all expt logt d2clut c2dlut cadu ii npar (k + 1)
+
+main =
+  -- dual-basis transform columns + full LUTs
+  let c2dcols = arr_new 8 0
+  let d2ccols = arr_new 8 0
+  let _ = build_c2d c2dcols
+  let _ = build_d2c d2ccols
+  let c2dlut = arr_new 256 0
+  let d2clut = arr_new 256 0
+  let _ = build_lut c2dcols c2dlut 0
+  let _ = build_lut d2ccols d2clut 0
+  -- dual-basis acceptance self-test (round-trip over all 256 + the 4 CCSDS anchors)
+  let fails = selftest_rt c2dlut d2clut 0 0
+  let anc = anchor_ok c2dlut
+  let st_ok = if fails == 0 then (if anc == 4 then 1 else 0) else 0
+  let _ = print (cat ["SELFTEST dualbasis roundtrip_fails=", show fails, " anchors_ok=", show anc, "/4 PASS=", show st_ok])
+  -- GF tables for the RS algebra (conventional field)
+  let expt = arr_new 512 0
+  let logt = arr_new 256 0
+  let _ = gf_build expt logt 0 1
+  let _ = gf_ext expt 255
+  let cadu = read_bytes "/tmp/rs_in.s8"
+  let ii = 4
+  let npar = 32
+  let _ = print (cat ["INFO cadu_bytes=", show (arr_len cadu), " I=", show ii, " npar=", show npar, " field=0x11D FCR=1 dual-basis(delta=0x7b)"])
+  let _ = decode_all expt logt d2clut c2dlut cadu ii npar 0
+  0

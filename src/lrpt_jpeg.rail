@@ -13,15 +13,31 @@
 --              ->  2D inverse DCT-II + level-shift (+128) + clamp [0,255]
 --              ->  reconstructed 8x8 grayscale pixels.
 --
--- HONESTY: the Huffman tables here are a real, self-consistent CANONICAL prefix code (not
--- the exact Meteor on-board code lengths). The entropy ALGORITHM — variable-length DC size
--- category, AC (run,size) symbols, JPEG magnitude-bit value coding, EOB(0x00)/ZRL(0xF0) —
--- is the real JPEG-baseline scheme. Swapping in Meteor's actual code lengths is a TABLE
--- change, not an algorithm change. (Same disclosure in scripts/gen_lrpt_jpeg.py.)
+-- REAL METEOR STRUCTURE (gen_lrpt_real.py, supersedes the synthetic gen_lrpt_jpeg.py):
+-- this rung now decodes the bitstream EXACTLY as a real Meteor-M2 LRPT image packet
+-- stream is laid out, so a pixel match proves the real structure round-trips:
+--   * Huffman tables are the STANDARD JPEG (ITU-T T.81 Annex-K) baseline LUMINANCE
+--     DC + AC tables — the verbatim codes Meteor's on-board encoder uses (the decode
+--     path is table-agnostic: a generic linear scan over (sym,len,code) triples, so
+--     the Annex-K code drops straight in, no algorithm change).
+--   * PER-PACKET QUALITY BYTE: each Meteor image packet ships a quality value; the
+--     dequant table is DERIVED AT RUNTIME (`meteor_qtbl`) by scaling the Annex-K base
+--     quant table with the libjpeg quality law (scale = 5000/q if q<50 else 200-2q;
+--     Q[i] = clamp((std[i]*scale + 50)/100, 1, 255)) — NOT a hardcoded table.
+--   * PER-PACKET DC PREDICTOR RESET: Meteor packets are independently decodable, so the
+--     DC differential predictor resets to 0 at each packet boundary (the bit reader is
+--     also re-seeked to the packet's byte-aligned first bit) — not one scan-long predictor.
 --
--- Inputs (file-driven, written by gen_lrpt_jpeg.py):
---   /tmp/lrpt_jpeg_in.bin      compressed bitstream bytes (MSB-first bit order)
---   /tmp/lrpt_jpeg_tables.txt  "ndc nac nbits nblocks" then DC then AC (symbol length code)*
+-- HONESTY: this is an IMPAIRED-SYNTHETIC reference (real Meteor STRUCTURE, numpy PIXELS),
+-- the last step before a real Meteor-M2 recording — no real pass is decoded, no
+-- attestation produced. Strip ASSEMBLY (APID 64/65/66 -> 3 spectral buffers by sequence
+-- number) and dual-basis RS live in the vcdu.rail / lrpt_decode.rail integration layer,
+-- not in this per-block rung.
+--
+-- Inputs (file-driven, written by gen_lrpt_real.py):
+--   /tmp/lrpt_jpeg_in.bin      entropy bitstream bytes (MSB-first), packets concatenated
+--   /tmp/lrpt_jpeg_tables.txt  "ndc nac nbits nblocks npkt" then DC then AC (sym len code)*
+--                              then a packet directory: per packet "quality nblk firstbit"
 -- Output: "INFO ...", then per block "BLK<k> PIX <64 decimal pixels>".
 --
 -- TRAP DODGES (study qpsk.rail / dct.rail / viterbi.rail):
@@ -176,6 +192,24 @@ qtbl j =
   else if j < 56 then (if j==48 then 49 else if j==49 then 64 else if j==50 then 78 else if j==51 then 87 else if j==52 then 103 else if j==53 then 121 else if j==54 then 120 else 101)
   else (if j==56 then 72 else if j==57 then 92 else if j==58 then 95 else if j==59 then 98 else if j==60 then 112 else if j==61 then 100 else if j==62 then 103 else 99)
 
+-- ---- REAL Meteor per-packet quality-scaled quant table ----
+-- Meteor ships a quality byte per image packet; the dequant table is derived at runtime
+-- from the Annex-K base table (qtbl) by the libjpeg quality law:
+--   scale = (q < 50) ? 5000/q : 200 - 2*q
+--   Q[j]  = clamp((qtbl[j]*scale + 50)/100, 1, 255)
+-- Integer division throughout (Rail / on ints truncates). q clamped to [1,100]. The
+-- result is never 0 (clamped to >=1) so dequant never multiplies by a 0 table entry.
+-- 5000/200/100/50 are operands here (small consts), never branch/return literals.
+qclamp_q q = if q <= 0 then 1 else (if q > 100 then 100 else q)
+qscale q =
+  let qq = qclamp_q q
+  if qq < 50 then 5000 / qq else 200 - 2 * qq
+meteor_qtbl q j =
+  let base = qtbl j
+  let sc = qscale q
+  let v = (base * sc + 50) / 100
+  if v < 1 then 1 else (if v > 255 then 255 else v)
+
 -- zig-zag table parsed from a string at runtime (verbatim from dct.rail)
 fill_zz zz =
   let s = "0 1 8 16 9 2 3 10 17 24 32 25 18 11 4 5 12 19 26 33 40 48 41 34 27 20 13 6 7 14 21 28 35 42 49 56 57 50 43 36 29 22 15 23 30 37 44 51 58 59 52 45 38 31 39 46 53 60 61 54 47 55 62 63 "
@@ -234,14 +268,15 @@ decode_one_block b bp dcsym dcln dccode ndc acsym acln accode nac coeffs dccell 
   0
 
 -- ---- dequant + IDCT core (verbatim algorithm from dct.rail) ----
--- D[zz[j]] = coeffs_zz[j] * qtbl[zz[j]]
-deq_fill D coeffs zz j =
+-- D[zz[j]] = coeffs_zz[j] * meteor_qtbl(quality)[zz[j]]
+-- `qual` is the per-packet quality byte; the quant table is derived at runtime.
+deq_fill D coeffs zz qual j =
   if j >= 64 then 0
   else
     let nat = arr_get zz j
     let q = arr_get coeffs j
-    let _ = float_arr_set D nat (int_to_float (q * (qtbl nat)))
-    deq_fill D coeffs zz (j + 1)
+    let _ = float_arr_set D nat (int_to_float (q * (meteor_qtbl qual nat)))
+    deq_fill D coeffs zz qual (j + 1)
 
 idct_inner D x y u v acc =
   if u >= 8 then 0
@@ -265,30 +300,52 @@ idct_block D out x y acc =
 
 pixs out i acc = if i >= 64 then acc else pixs out (i + 1) (cat [acc, show (arr_get out i), " "])
 
--- ---- main block loop ----
-decode_blocks b bp dcsym dcln dccode ndc acsym acln accode nac zz dccell nb k =
-  if k >= nb then 0
+-- ---- decode ONE packet's run of blocks ----
+-- decodes `nblk` blocks at the current bit position, all with quality `qual` (so the
+-- per-packet quant table is used). `gk` is the GLOBAL block index for output numbering.
+-- i counts blocks within this packet; both i and gk are plain int indices (the only
+-- float accumulators live inside idct cells), so the self-loop carry is trap-safe.
+-- Returns the next global block index.
+decode_pkt_blocks b bp dcsym dcln dccode ndc acsym acln accode nac zz dccell qual nblk i gk =
+  if i >= nblk then gk
   else
     let coeffs = arr_new 64 0
     let _ = decode_one_block b bp dcsym dcln dccode ndc acsym acln accode nac coeffs dccell
     let D = float_arr_new 64 0.0
-    let _ = deq_fill D coeffs zz 0
+    let _ = deq_fill D coeffs zz qual 0
     let out = arr_new 64 0
     let acc = float_arr_new 1 0.0
     let _ = idct_block D out 0 0 acc
-    let _ = print (cat ["BLK", show k, " PIX ", pixs out 0 ""])
-    decode_blocks b bp dcsym dcln dccode ndc acsym acln accode nac zz dccell nb (k + 1)
+    let _ = print (cat ["BLK", show gk, " PIX ", pixs out 0 ""])
+    decode_pkt_blocks b bp dcsym dcln dccode ndc acsym acln accode nac zz dccell qual nblk (i + 1) (gk + 1)
+
+-- ---- outer PACKET loop ----
+-- reads the packet directory (quality nblk firstbit) from cursor `cur`, and for each
+-- packet: re-seeks the bit reader to the packet's byte-aligned first bit, RESETS the DC
+-- predictor (Meteor packets are independently decodable), then decodes nblk blocks with
+-- that packet's quality-derived quant table. p indexes packets; gk is the global block #.
+decode_packets b bp dcsym dcln dccode ndc acsym acln accode nac zz dccell tx cur npkt p gk =
+  if p >= npkt then 0
+  else
+    let qual = read_int tx cur
+    let nblk = read_int tx cur
+    let firstbit = read_int tx cur
+    let _ = arr_set bp 0 firstbit       -- seek to this packet's byte-aligned start
+    let _ = arr_set dccell 0 0          -- PER-PACKET DC predictor reset
+    let gk2 = decode_pkt_blocks b bp dcsym dcln dccode ndc acsym acln accode nac zz dccell qual nblk 0 gk
+    decode_packets b bp dcsym dcln dccode ndc acsym acln accode nac zz dccell tx cur npkt (p + 1) gk2
 
 main =
   let b = read_bytes "/tmp/lrpt_jpeg_in.bin"
   let tx = read_text "/tmp/lrpt_jpeg_tables.txt"
   let cur = arr_new 2 0
   let _ = arr_set cur 0 0
-  -- header: ndc nac nbits nblocks
+  -- header: ndc nac nbits nblocks npkt
   let ndc = read_int tx cur
   let nac = read_int tx cur
   let nbits = read_int tx cur
   let nb = read_int tx cur
+  let npkt = read_int tx cur
   -- DC table
   let dcsym = arr_new ndc 0
   let dcln  = arr_new ndc 0
@@ -306,6 +363,8 @@ main =
   let _ = arr_set bp 0 0
   let dccell = arr_new 1 0
   let _ = arr_set dccell 0 0
-  let _ = print (cat ["INFO bytes=", show (arr_len b), " bits=", show nbits, " blocks=", show nb, " ndc=", show ndc, " nac=", show nac])
-  let _ = decode_blocks b bp dcsym dcln dccode ndc acsym acln accode nac zz dccell nb 0
+  let _ = print (cat ["INFO bytes=", show (arr_len b), " bits=", show nbits, " blocks=", show nb, " npkt=", show npkt, " ndc=", show ndc, " nac=", show nac])
+  -- cur is now positioned at the packet directory (after both Huffman tables). Loop
+  -- over packets: each re-seeks the bit reader + resets DC + uses its own quality.
+  let _ = decode_packets b bp dcsym dcln dccode ndc acsym acln accode nac zz dccell tx cur npkt 0 0
   0
