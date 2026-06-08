@@ -88,6 +88,13 @@ capture_iq_pass(){      # $1=sat $2=freq(Hz) $3=dur(min) $4=elev $5=mode — RAW
 }
 
 run_next(){
+  # keep TLEs fresh so skyfield timing doesn't drift; refresh if >12h old (radio-free, at loop top).
+  # fetch_tle.sh is set -e + writes via temp->cat, so a failed curl leaves the existing TLE intact.
+  local tlef="$GD/data/tle_weather.txt" tage
+  tage=$(( $(date +%s) - $(stat -f %m "$tlef" 2>/dev/null || echo 0) ))
+  if [ "$tage" -gt 43200 ]; then
+    if bash "$GD/scripts/fetch_tle.sh" >/tmp/tle_fetch.log 2>&1; then log "TLE refreshed: $(tail -1 /tmp/tle_fetch.log)"; else log "TLE refresh failed — keeping existing (age $((tage/3600))h)"; fi
+  fi
   local na="--minel $MINEL"; [ "$CAPTURE" = iq ] && na="$na --all"   # iq mode also catches Meteor (raw IQ decodes any carrier)
   local info; info=$($PY "$GD/scripts/next_pass.py" $na)
   if [[ "$info" == NONE* ]]; then log "no pass >= ${MINEL}deg soon"; return 2; fi
