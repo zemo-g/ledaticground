@@ -85,6 +85,10 @@ capture_iq_pass(){      # $1=sat $2=freq(Hz) $3=dur(min) $4=elev $5=mode — RAW
   $SSH "$PI" "rm -f '$pf'"
   out=$("$PY" "$GD/scripts/iq_apt_decode.py" "$loc" "${loc%.bin}" 2>&1) || log "iq_apt_decode returned nonzero"
   log "iq_decode: $(echo "$out" | tr '\n' '|')"
+  # independent cross-check: satdump (reference decoder) on the SAME bytes — non-fatal, off-radio.
+  # outputs-match between our decoder and satdump = the external proof (raw-IQ-first thesis).
+  bash "$GD/scripts/validate_external.sh" "$loc" >/tmp/iqval.log 2>&1 || true
+  log "satdump xcheck -> ${loc%.bin}.satdump/ $(grep -qiE 'no valid wedge|Couldn.t calibrate' /tmp/iqval.log && printf '[apt:no-wedge=noise]'; grep -qiE 'Viterbi|deframer|[1-9][0-9]+ frames' /tmp/iqval.log && printf '[lrpt:frames=signal]')"
 }
 
 run_next(){
