@@ -71,7 +71,7 @@ capture_iq_pass(){      # $1=sat $2=freq(Hz) $3=dur(min) $4=elev $5=mode — RAW
   $SSH "$PI" "sudo systemctl stop roofmon.service" || { log "could not stop roofmon; abort"; return 1; }
   sleep 1
   # raw uint8 I/Q @250k; timeout-bounded so the SDR ALWAYS frees even if rtl_sdr hangs -> AIS can resume.
-  if ! $SSH "$PI" "nohup timeout $RDUR rtl_sdr -f $FREQ -s 250000 -g $GAIN '$pf' >/tmp/iqrec.log 2>&1 &"; then
+  if ! $SSH "$PI" "nohup timeout -k 10 $RDUR rtl_sdr -f $FREQ -s 250000 -g $GAIN '$pf' >/tmp/iqrec.log 2>&1 &"; then
     log "Pi IQ capture trigger failed"; resume_ais; return 1
   fi
   log "raw-IQ recording ${RDUR}s on the Pi (~$(( RDUR / 2 ))MB @250k)..."
