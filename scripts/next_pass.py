@@ -1,19 +1,22 @@
 #!/usr/bin/env python3.11
-# Mini-side: print the next decodable NOAA APT pass as machine-readable fields for
-# pass_scheduler.sh, using ACCURATE skyfield/full-SGP4 timing (the same engine as
+# Mini-side: print the next decodable weather-sat pass as machine-readable fields for
+# pass_scheduler.sh, using ACCURATE skyfield/full-SGP4 timing (same engine as
 # pass_schedule.py, reading data/tle_weather.txt).
 #
 # REPLACES the old passes.rail path (2026-06-08): that simplified-SGP4 source was
 # ~27 min off AND emitted spurious/phantom passes (e.g. three "NOAA 19" passes inside
-# 90 min, orbitally impossible), so the scheduler was preempting AIS to capture empty
-# sky. Output contract is byte-identical to before, so pass_scheduler.sh is untouched.
+# 90 min, orbitally impossible), so the scheduler was preempting AIS to record empty
+# sky. Output contract is a superset of before (adds MODE=), so pass_scheduler.sh is
+# untouched (it just sets an extra harmless var under eval).
 #
-# SCOPE = NOAA 15/19 only. Those are analog APT, which the live capture+decode path
-# (pi_record.sh FM-demod audio -> recv_decode.sh APT 2400Hz) can actually decode.
-# METEOR-M2 is LRPT (QPSK) — it needs a raw-IQ capture + the (still-synthetic) LRPT
-# decoder, NOT FM-demod audio + an APT decoder. Scheduling it here would preempt AIS
-# for an undecodable capture and log a misleading "noise" verdict, so Meteor is
-# intentionally excluded; catch Meteor passes with the dedicated raw-IQ workflow.
+# SCOPE:
+#   default   -> NOAA 15/19 only (analog APT). These decode end-to-end via the live
+#                FM-demod-audio + APT path (pi_record.sh -> recv_decode.sh).
+#   --all     -> also METEOR-M2 2/3/4 (LRPT). Use this for the RAW-IQ scheduler: raw IQ
+#                captures any carrier and the waterfall Doppler-drift discriminator tells
+#                us if the antenna heard the bird, independent of the (still-synthetic)
+#                LRPT decoder. Do NOT use --all with the FM-audio APT path — it can't
+#                decode LRPT and would log a misleading "noise" verdict.
 #
 # On any error (skyfield/TLE/etc.) prints NONE and exits 0 so the LaunchAgent loop
 # degrades gracefully (sleeps + retries) instead of crashing under `set -u`.
@@ -24,7 +27,17 @@ TLE = f"{GD}/data/tle_weather.txt"
 LAT, LON = 42.31, -83.08                      # Detroit Salsa Co (geometry only; receipt geo stays PENDING)
 MIN_EL = int(sys.argv[sys.argv.index('--minel') + 1]) if '--minel' in sys.argv else 25
 HOURS  = int(sys.argv[sys.argv.index('--hours') + 1]) if '--hours' in sys.argv else 24
-FREQ = {"NOAA 15": 137620000, "NOAA 19": 137100000}
+ALL    = '--all' in sys.argv
+
+# name -> (downlink Hz, mode). APT = our live decoder; LRPT = raw-IQ + synthetic decoder.
+SATS = {
+    "NOAA 15":     (137620000, "APT"),
+    "NOAA 19":     (137100000, "APT"),
+    "METEOR-M2 2": (137900000, "LRPT"),
+    "METEOR-M2 3": (137900000, "LRPT"),
+    "METEOR-M2 4": (137100000, "LRPT"),
+}
+WANT = SATS if ALL else {k: v for k, v in SATS.items() if v[1] == "APT"}
 
 try:
     from skyfield.api import load, wgs84, EarthSatellite
@@ -36,7 +49,7 @@ try:
     i = 0
     while i < len(lines) - 2:
         nm = lines[i].strip()
-        if nm in FREQ and lines[i + 1].startswith('1 ') and lines[i + 2].startswith('2 '):
+        if nm in WANT and lines[i + 1].startswith('1 ') and lines[i + 2].startswith('2 '):
             sats[nm] = EarthSatellite(lines[i + 1], lines[i + 2], nm, ts); i += 3
         else:
             i += 1
@@ -72,7 +85,8 @@ try:
     dur  = max(1, round((los - aos).total_seconds() / 60))
     elev = round(p['maxel'])
     sat  = p['name']
-    print(f'SAT="{sat}" MINS={mins} DUR={dur} ELEV={elev} FREQ={FREQ[sat]} AOS_EPOCH={aos_epoch}')
+    freq, mode = SATS[sat]
+    print(f'SAT="{sat}" MINS={mins} DUR={dur} ELEV={elev} FREQ={freq} MODE={mode} AOS_EPOCH={aos_epoch}')
 except Exception as e:
     sys.stderr.write(f"next_pass.py: {e}\n")
     print("NONE"); sys.exit(0)

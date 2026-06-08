@@ -18,6 +18,9 @@ PI="${PI_USER}@${PI_HOST}"
 SSH="ssh -o ConnectTimeout=10 -o BatchMode=yes"
 PY=/opt/homebrew/bin/python3.11
 MINEL=${MINEL:-20}
+CAPTURE=${CAPTURE:-apt}      # apt = FM-demod audio -> APT decode (NOAA only); iq = raw IQ -> waterfall+decode (NOAA+Meteor)
+GAIN=${GAIN:-49}             # rtl gain for raw-IQ capture (49 = max sensitivity / diagnostic baseline)
+RAWDIR=${RAWDIR:-/Users/ledaticempire/.ledatic/roofv2/raw_iq}   # where pulled raw-IQ artifacts land
 # Approximate station location (Detroit Salsa Co) for satellite ground-track geometry
 # ONLY. The signed reception receipt keeps geo=PENDING (no GPS) — we do not attest a
 # precise location we cannot prove.
@@ -59,14 +62,40 @@ capture_pass(){         # $1=sat $2=freq(Hz) $3=dur(min)
   bash "$GD/scripts/recv_decode.sh" "$loc" roofv2 "$NODE_LAT" "$NODE_LON" 0 110 || log "decode returned nonzero"
 }
 
+capture_iq_pass(){      # $1=sat $2=freq(Hz) $3=dur(min) $4=elev $5=mode — RAW IQ: the ground-truth, externally-validatable artifact
+  local SAT="$1" FREQ="$2" DUR="$3" ELEV="${4:-0}" MODE="${5:-APT}"
+  local RDUR=$(( ($3+3)*60 )) ts label pf sz loc out
+  ts=$(date -u +%Y%m%dT%H%MZ); label="iq_${SAT// /}_el${ELEV}_${MODE}_${ts}"; pf="/home/ledatic/${label}.bin"
+  mkdir -p "$RAWDIR"
+  log "IQ PASS WINDOW: $SAT $MODE El${ELEV} @${FREQ}Hz ~${DUR}min — preempting AIS for raw-IQ capture (g${GAIN})"
+  $SSH "$PI" "sudo systemctl stop roofmon.service" || { log "could not stop roofmon; abort"; return 1; }
+  sleep 1
+  # raw uint8 I/Q @250k; timeout-bounded so the SDR ALWAYS frees even if rtl_sdr hangs -> AIS can resume.
+  if ! $SSH "$PI" "nohup timeout $RDUR rtl_sdr -f $FREQ -s 250000 -g $GAIN '$pf' >/tmp/iqrec.log 2>&1 &"; then
+    log "Pi IQ capture trigger failed"; resume_ais; return 1
+  fi
+  log "raw-IQ recording ${RDUR}s on the Pi (~$(( RDUR / 2 ))MB @250k)..."
+  sleep $(( RDUR + 20 ))
+  resume_ais            # free the radio + restore the MAIN system ASAP; pull + decode are off-radio
+  sz=$($SSH "$PI" "stat -c%s '$pf' 2>/dev/null" || echo 0); sz=${sz:-0}
+  if [ "$sz" -lt 1000000 ]; then log "IQ capture too small (${sz}B) — capture failed, nothing to pull"; return 1; fi
+  loc="$RAWDIR/${label}.bin"
+  log "captured ${sz}B; pulling -> $(basename "$loc")"
+  scp -C "$PI:$pf" "$loc" 2>/dev/null || { log "scp failed (IQ left on Pi at $pf)"; return 1; }
+  $SSH "$PI" "rm -f '$pf'"
+  out=$("$PY" "$GD/scripts/iq_apt_decode.py" "$loc" "${loc%.bin}" 2>&1) || log "iq_apt_decode returned nonzero"
+  log "iq_decode: $(echo "$out" | tr '\n' '|')"
+}
+
 run_next(){
-  local info; info=$($PY "$GD/scripts/next_pass.py" --minel "$MINEL")
+  local na="--minel $MINEL"; [ "$CAPTURE" = iq ] && na="$na --all"   # iq mode also catches Meteor (raw IQ decodes any carrier)
+  local info; info=$($PY "$GD/scripts/next_pass.py" $na)
   if [[ "$info" == NONE* ]]; then log "no pass >= ${MINEL}deg soon"; return 2; fi
-  eval "$info"   # SAT MINS DUR ELEV FREQ AOS_EPOCH
-  log "next: $SAT in ${MINS}min  El${ELEV}deg  @${FREQ}Hz  (AOS $(date -u -r $AOS_EPOCH +%H:%MZ 2>/dev/null || echo +${MINS}min))"
+  eval "$info"   # SAT MINS DUR ELEV FREQ MODE AOS_EPOCH
+  log "next: $SAT (${MODE:-APT}) in ${MINS}min  El${ELEV}deg  @${FREQ}Hz  [$CAPTURE]  (AOS $(date -u -r $AOS_EPOCH +%H:%MZ 2>/dev/null || echo +${MINS}min))"
   local now w; now=$(date +%s); w=$(( AOS_EPOCH - now - 45 ))
   if [ "$w" -gt 0 ]; then log "AIS keeps running; sleeping ${w}s until AOS-45s"; sleep "$w"; fi
-  capture_pass "$SAT" "$FREQ" "$DUR"
+  if [ "$CAPTURE" = iq ]; then capture_iq_pass "$SAT" "$FREQ" "$DUR" "$ELEV" "${MODE:-APT}"; else capture_pass "$SAT" "$FREQ" "$DUR"; fi
 }
 
 if [ "$ONCE" = 1 ]; then run_next; else while true; do run_next || sleep 1800; done; fi
