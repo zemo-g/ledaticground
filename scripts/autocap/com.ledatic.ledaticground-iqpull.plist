@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ledaticground / autocap — MINI puller + decoder.
+  Runs scripts/.../pull_iq.sh: when the Pi is reachable, rsync COMPLETED captures
+  down to ~/.ledatic/roofv2/raw_iq/ (never --delete; the Pi owns retention) and
+  decode each NEW one exactly once (idempotent via .decoded markers + a stability
+  gate). If the Pi is down it does nothing and the next tick catches up — captures
+  wait safely on the Pi. This is the DECOUPLED-TRANSFER half on the Mini.
+
+  Cadence: every 10 min (StartInterval 600) + once at load. The script is
+  single-flight (mkdir lock), so an interval that fires during a long backlog
+  decode simply no-ops. It never touches the radio or roofmon — pure read side.
+
+  NOTE: one of the two new agents that REPLACE com.ledatic.ledaticground-iq.
+  See scripts/autocap/CUTOVER.md (never run both capture systems at once).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ledatic.ledaticground-iqpull</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ledaticempire/projects/ledaticground/scripts/autocap/pull_iq.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <!-- Catch up immediately after a Mini reboot ... -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- ... then sweep every 10 minutes. -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+    <!-- Not KeepAlive: this is a periodic sweep, not a daemon; it exits each tick. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/iqpull.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/iqpull.log</string>
+</dict>
+</plist>

@@ -1,0 +1,49 @@
+# ledaticground — Pi-local IQ capturer (schedule-driven, no-SSH).
+#
+# Runs pi_iq_capture.sh as a persistent daemon on the Pi (Pi Zero 2 W, Debian/systemd).
+# It reads a Mini-pushed schedule (~/.iq/schedule.tsv), captures each satellite pass on
+# the Pi's OWN clock, time-shares the radio with roofmon (AIS) for the pass window only,
+# and ALWAYS restarts roofmon afterward. This decouples capture from transfer so spotty
+# roof WiFi at AOS never costs a pass.
+#
+# DEPLOY (operator does this; NOT done by the generator):
+#   install -m 755 pi_iq_capture.sh /usr/local/bin/pi_iq_capture.sh
+#   sudo cp ledaticground-iqcap.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ledaticground-iqcap.service
+# Logs:  journalctl -u ledaticground-iqcap.service -f
+#
+# Auto-resume after a nightly Pi power-cycle is intrinsic: WantedBy=multi-user.target
+# starts it at boot, and Restart=always recovers it from any in-loop crash.
+
+[Unit]
+Description=ledaticground Pi-local IQ pass capturer (schedule-driven, time-shares radio with roofmon/AIS)
+Documentation=https://github.com/Ledatic-Empire/ledaticground
+# Capturing needs the radio + filesystem; start after the network is plumbed (harmless if
+# WiFi is actually down — this daemon does no networking, it only reads a local schedule).
+After=network.target
+# roofmon owns the radio in steady state; we preempt/restore it, so order after it when present.
+After=roofmon.service
+Wants=roofmon.service
+
+[Service]
+Type=simple
+User=ledatic
+# Stable shell environment for the loop (HOME so ~/.iq resolves; PATH includes rtl_sdr's dir).
+Environment=HOME=/home/ledatic
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin
+ExecStart=/usr/local/bin/pi_iq_capture.sh
+# Resilience: this is core capture infra on a box that power-cycles nightly. Always come back.
+Restart=always
+RestartSec=10
+# A clean stop must NOT leave the radio stolen from AIS. SIGTERM is trapped in the script
+# (on_signal -> resume_ais); give it room to restart roofmon before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+# Don't let a transient crash-loop trip systemd's start limiter and wedge the unit off.
+StartLimitIntervalSec=0
+# Light hardening (the script needs sudo systemctl + rtl_sdr + /home writes — keep it permissive).
+Nice=0
+
+[Install]
+WantedBy=multi-user.target

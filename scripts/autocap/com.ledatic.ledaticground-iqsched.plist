@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ledaticground / autocap — MINI schedule builder + pusher.
+  Runs scripts/.../push_iq_schedule.sh: refresh TLE if stale, enumerate the next
+  48h of high-elevation passes, write data/iq_schedule.tsv atomically, and (best
+  effort, non-fatal) push it to the Pi at ~/.iq/schedule.tsv. This is the
+  DECOUPLING half on the Mini: the Pi captures off the LAST schedule it received,
+  so a single missed push (roof WiFi down) costs nothing.
+
+  Cadence: once at load (so a Mini reboot re-pushes immediately) + once daily at
+  03:10 local. The script never touches the radio, so its timing is unconstrained;
+  a daily refresh on a 48h horizon gives ~2x push redundancy.
+
+  NOTE: this agent only PLANS. It is one of the two new agents that REPLACE
+  com.ledatic.ledaticground-iq. Never run this alongside the old Mini-driven
+  agent's capture — see scripts/autocap/CUTOVER.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ledatic.ledaticground-iqsched</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/ledaticempire/projects/ledaticground/scripts/autocap/push_iq_schedule.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- 48h horizon, high-elevation only (matches the live iq plist MINEL=40). -->
+        <key>HOURS</key>
+        <string>48</string>
+        <key>MINEL</key>
+        <string>40</string>
+    </dict>
+    <!-- Re-push on login (covers a Mini reboot) ... -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- ... and refresh once a day at 03:10 local. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>10</integer>
+    </dict>
+    <!-- A daily planner must not be KeepAlive (it would respin instantly). -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/iqsched_v2.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/iqsched_v2.log</string>
+</dict>
+</plist>

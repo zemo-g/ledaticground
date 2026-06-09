@@ -1,0 +1,53 @@
+# /etc/cron.d/iqcap-retention  (Pi-side, GNU coreutils + Debian cron)
+# ----------------------------------------------------------------------------
+# ledaticground decoupled-capture RETENTION for the Pi capture store.
+#
+# The Pi KEEPS every raw-IQ capture under ~/.iq/captures/ so a missed / slow
+# Mini pull never loses a pass (that is the whole point of the decouple). But
+# /home is 51G and each cu8 pass is ~tens of MB, so we prune on two rules:
+#
+#   (1) AGE   — delete captures older than 7 days (already pulled long ago).
+#   (2) SPACE — if /home drops below 5G free, delete OLDEST-first until back
+#               above 5G (protects roofmon/AIS + the OS from a full disk).
+#
+# Every prune is reflected in the manifest (~/.iq/manifest.tsv) so the Mini
+# pull side never tries to fetch a name the Pi already reclaimed: we drop the
+# matching manifest line whenever we delete its .bin.
+#
+# Runs every 15 min as the capture user (ledatic). It is purely a janitor:
+# it NEVER touches roofmon, rtl_sdr, rtl_fm, or the SDR — capture preemption
+# and AIS-resume are owned entirely by pi_iq_capture.sh. Safe to run while a
+# capture is in flight (it skips the single newest file as a courtesy).
+#
+# NOTE: this file is data for cron, not an executable. Deployed by
+# install_autocap.sh via `sudo install -m 0644 ... /etc/cron.d/iqcap-retention`.
+# cron.d files must be root-owned, mode 0644, and contain a user field.
+# ----------------------------------------------------------------------------
+
+# m h dom mon dow user  command
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Inlined janitor. Kept as a one-liner so the whole policy lives in this single
+# cron.d file (no extra script to deploy / drift). `bash -lc` for a clean shell.
+*/15 * * * * ledatic bash -lc '\
+set -u; \
+CAP="$HOME/.iq/captures"; MAN="$HOME/.iq/manifest.tsv"; \
+[ -d "$CAP" ] || exit 0; \
+LOG="$HOME/.iq/retention.log"; \
+ts(){ date -u +%FT%TZ; }; \
+drop_manifest(){ [ -f "$MAN" ] || return 0; n=$(basename "$1"); t="$MAN.tmp.$$"; awk -F"\t" -v want="$n" "\$2 != want" "$MAN" > "$t" 2>/dev/null && mv -f "$t" "$MAN"; rm -f "$t"; }; \
+del(){ f="$1"; why="$2"; [ -e "$f" ] || return 0; sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0); rm -f "$f"; drop_manifest "$f"; echo "$(ts) prune[$why] $(basename "$f") ${sz}B" >> "$LOG"; }; \
+newest=$(ls -t "$CAP"/*.bin 2>/dev/null | head -1); \
+for f in $(find "$CAP" -maxdepth 1 -type f -name "*.bin" -mtime +7 2>/dev/null); do [ "$f" = "$newest" ] && continue; del "$f" age7d; done; \
+freek(){ df -Pk "$HOME" 2>/dev/null | awk "NR==2{print \$4}"; }; \
+MINK=$((5*1024*1024)); \
+guard=0; \
+while [ "$(freek)" -lt "$MINK" ] && [ "$guard" -lt 100000 ]; do \
+  guard=$((guard+1)); \
+  oldest=$(ls -tr "$CAP"/*.bin 2>/dev/null | head -1); \
+  [ -n "$oldest" ] || break; \
+  [ "$oldest" = "$newest" ] && break; \
+  del "$oldest" lowdisk; \
+done; \
+exit 0'
