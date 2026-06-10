@@ -1,0 +1,10 @@
+# ledaticground — roofmon deadman (cron.d snippet; installed by install_autocap.sh)
+#
+# Force-starts roofmon (AIS) if it dies — but NEVER while any rtl_* process holds
+# the single SDR: an iqcap pass window legitimately stops roofmon (rtl_sdr running),
+# and roofmon's own rtl_fm means it's already alive. Without the pgrep guards the
+# deadman steals the dongle back MID-CAPTURE and corrupts the pass (earned 8bab1fb;
+# was Pi-local-only until folded into the repo 2026-06-10 — a re-flash now keeps it).
+#
+# cron.d rules: filename must have no dot, mode 0644, owner root.
+*/3 * * * * root systemctl is-active --quiet roofmon || pgrep -x rtl_fm >/dev/null || pgrep -x rtl_sdr >/dev/null || systemctl start roofmon

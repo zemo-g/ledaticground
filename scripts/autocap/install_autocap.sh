@@ -10,6 +10,7 @@
 #     pi_iq_capture.sh           -> /usr/local/bin/pi_iq_capture.sh   (separate component)
 #     ledaticground-iqcap.service-> /etc/systemd/system/ledaticground-iqcap.service
 #     iqcap-retention            -> /etc/cron.d/iqcap-retention
+#     roofmon-deadman            -> /etc/cron.d/roofmon-deadman
 #   The Pi reads a pushed ~/.iq/schedule.tsv, captures each pass on its OWN
 #   clock (preempting roofmon ONLY for the window, always restarting it),
 #   and KEEPS captures in ~/.iq/captures/ until the Mini pulls them.
@@ -53,6 +54,7 @@ LAUNCH="$HOME/Library/LaunchAgents"
 PI_CAP_SRC="$STAGE/pi_iq_capture.sh"            # pi_capture component (SEPARATE — may not be staged yet)
 PI_UNIT_SRC="$STAGE/ledaticground-iqcap.service"  # pi_capture component (systemd unit)
 PI_RETENTION_SRC="$STAGE/iqcap-retention"       # THIS component (cron snippet)
+PI_DEADMAN_SRC="$STAGE/roofmon-deadman"         # THIS component (cron snippet; roofmon resurrection w/ SDR guards)
 MINI_SCHED_SRC="$STAGE/com.ledatic.ledaticground-iqsched.plist"   # THIS component (wraps push_iq_schedule.sh)
 MINI_PULL_SRC="$STAGE/com.ledatic.ledaticground-iqpull.plist"     # THIS component (wraps pull_iq.sh)
 
@@ -101,7 +103,7 @@ runssh(){
 # all be present or we refuse to deploy a half-system.
 require_files(){
   local missing=0 f
-  for f in "$PI_UNIT_SRC" "$PI_RETENTION_SRC" "$MINI_SCHED_SRC" "$MINI_PULL_SRC"; do
+  for f in "$PI_UNIT_SRC" "$PI_RETENTION_SRC" "$PI_DEADMAN_SRC" "$MINI_SCHED_SRC" "$MINI_PULL_SRC"; do
     if [ ! -f "$f" ]; then warn "missing staged artifact: $f"; missing=1; fi
   done
   [ "$missing" = 0 ] || die "stage incomplete — these autocap components must be present in $STAGE before deploy."
@@ -189,6 +191,15 @@ if [ "$PI_UP" = 1 ]; then
   say "[Pi] -> /etc/cron.d/iqcap-retention"
   run scp -q "$PI_RETENTION_SRC" "$PI:/tmp/iqcap-retention.new"
   runssh "sudo install -m 0644 -o root -g root /tmp/iqcap-retention.new /etc/cron.d/iqcap-retention && rm -f /tmp/iqcap-retention.new"
+
+  # 3b) roofmon deadman cron -> /etc/cron.d (root, 0644). Resurrects roofmon if it
+  #     dies, but NEVER while any rtl_* holds the dongle (an iqcap pass window
+  #     legitimately stops roofmon — the pgrep guards keep the deadman from
+  #     stealing the SDR back mid-capture). Was Pi-local-only (8bab1fb); folded
+  #     into the repo so a re-flash keeps it. Same cron.d naming rules as above.
+  say "[Pi] -> /etc/cron.d/roofmon-deadman"
+  run scp -q "$PI_DEADMAN_SRC" "$PI:/tmp/roofmon-deadman.new"
+  runssh "sudo install -m 0644 -o root -g root /tmp/roofmon-deadman.new /etc/cron.d/roofmon-deadman && rm -f /tmp/roofmon-deadman.new"
 
   # 4) reload systemd + ENABLE (so it auto-starts after the nightly power-cycle)
   #    but DO NOT start now — starting is the contention moment, done at cutover.
@@ -283,4 +294,4 @@ else
 fi
 
 echo
-say "Done${DRY:+ (dry-run)}."
+if [ "$DRY" = 1 ]; then say "Done (dry-run)."; else say "Done."; fi

@@ -25,6 +25,9 @@ After=network.target
 # roofmon owns the radio in steady state; we preempt/restore it, so order after it when present.
 After=roofmon.service
 Wants=roofmon.service
+# Don't let a transient crash-loop trip systemd's start limiter and wedge the unit off.
+# (Must live in [Unit] — Bookworm systemd ignores it under [Service] with a warning.)
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -40,8 +43,6 @@ RestartSec=10
 # (on_signal -> resume_ais); give it room to restart roofmon before SIGKILL.
 KillSignal=SIGTERM
 TimeoutStopSec=30
-# Don't let a transient crash-loop trip systemd's start limiter and wedge the unit off.
-StartLimitIntervalSec=0
 # Light hardening (the script needs sudo systemctl + rtl_sdr + /home writes — keep it permissive).
 Nice=0
 
