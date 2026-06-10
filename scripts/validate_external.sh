@@ -31,6 +31,13 @@ echo "satdump[$PIPE] on $(basename "$BIN") -> $OUT/"
 rc=$?
 echo "exit=$rc | products:"
 ls -1 "$OUT" 2>/dev/null | grep -iE '\.(png|json|cbor)$' | sed 's/^/  /'
+# LRPT: the CADU count is the AUTHORITATIVE verdict (1 CADU = 1024 B of deframed,
+# Viterbi-locked downlink). Deterministic — no waterfall heuristic can substitute:
+# 2026-06-10 the "FLAT NOISE" APT discriminator mislabeled a 1023-CADU M2-3 pass.
+if [ "$MODE" = lrpt ]; then
+  cb=$(stat -f %z "$OUT/meteor_m2-x_lrpt.cadu" 2>/dev/null || stat -c %s "$OUT/meteor_m2-x_lrpt.cadu" 2>/dev/null || echo 0)
+  echo "CADUS=$(( cb / 1024 )) cadu_bytes=$cb"
+fi
 # signal indicators from satdump's own log: LRPT prints Viterbi/frames/lock; APT just renders (eyeball the PNG).
 grep -iE "frames|deframer|valid|Viterbi|BER|lock|SNR|correlat" "${OUT}.log" 2>/dev/null | tail -6 | sed 's/^/  log: /'
 echo "  verdict: inspect $OUT/*.png — Earth/cloud structure = SIGNAL, uniform speckle = NOISE (full log: ${OUT}.log)"

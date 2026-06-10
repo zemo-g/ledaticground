@@ -52,11 +52,20 @@ MINEL = int(sys.argv[sys.argv.index('--minel') + 1]) if '--minel' in sys.argv el
 # schedule entries (unlike the FM-audio APT-only path, which would be misled by a
 # Meteor pass). Keep this dict in sync with next_pass.py if frequencies change.
 SATS = {
-    "NOAA 15":     (137620000, "APT"),
-    "NOAA 19":     (137100000, "APT"),
-    "METEOR-M2 2": (137900000, "LRPT"),
+    # TRANSMITTER GROUND TRUTH (verified 2026-06-10 against SatNOGS DB + usradioguy):
+    #   NOAA 19 APT: DECOMMISSIONED 2025-08-13. NOAA 15 APT: DECOMMISSIONED 2025-08-19
+    #     (the last APT bird — the mode is off the air entirely). Scheduling them
+    #     guaranteed flat-noise captures and poisoned every antenna conclusion.
+    #   METEOR-M2 2: LRPT dead (micrometeorite power-system damage; battery can't
+    #     carry the transmitter; HRPT ended 2024-07).
+    #   METEOR-M2 4: transmits 137.9 MHz (NOT 137.1 — we had it wrong; both its
+    #     captures were empty spectrum). M2-3 + M2-4 both 137.9 / 72k as of mid-2026.
+    # Proof the chain works: M2-3 el78 2026-06-09 02:16Z @137.9 -> 1023 CADUs.
+    # "NOAA 15":     (137620000, "APT"),   # decommissioned 2025-08-19
+    # "NOAA 19":     (137100000, "APT"),   # decommissioned 2025-08-13
+    # "METEOR-M2 2": (137900000, "LRPT"),  # LRPT dead (power damage)
     "METEOR-M2 3": (137900000, "LRPT"),
-    "METEOR-M2 4": (137100000, "LRPT"),
+    "METEOR-M2 4": (137900000, "LRPT"),   # was 137100000 — wrong freq
 }
 
 try:

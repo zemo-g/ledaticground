@@ -13,10 +13,12 @@ HOURS = int(sys.argv[sys.argv.index('--hours')+1]) if '--hours' in sys.argv else
 MINEL = int(sys.argv[sys.argv.index('--minel')+1]) if '--minel' in sys.argv else 20
 EDT = ZoneInfo("America/Detroit")
 
-WANT = {  # name -> (downlink, mode)
- "NOAA 15":("137.620 MHz","APT"), "NOAA 19":("137.100 MHz","APT"),
- "METEOR-M2 2":("137.900 MHz","LRPT"), "METEOR-M2 3":("137.900 MHz","LRPT"),
- "METEOR-M2 4":("137.100 MHz","LRPT"),
+WANT = {  # name -> (downlink, mode) — ground truth verified 2026-06-10; sync w/ autocap/enum_passes.py
+ # "NOAA 15":("137.620 MHz","APT"),   # decommissioned 2025-08-19 (last APT bird — mode off-air)
+ # "NOAA 19":("137.100 MHz","APT"),   # decommissioned 2025-08-13
+ # "METEOR-M2 2":("137.900 MHz","LRPT"),  # LRPT dead (micrometeorite power damage)
+ "METEOR-M2 3":("137.900 MHz","LRPT"),
+ "METEOR-M2 4":("137.900 MHz","LRPT"),   # was 137.100 — wrong freq
 }
 ts = load.timescale()
 lines=[l.rstrip() for l in open(TLE)]

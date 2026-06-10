@@ -114,16 +114,19 @@ for bin in "$RAWDIR"/iq_*.bin; do
   dout=$("$PY" "$DECODER" "$bin" "$prefix" 2>&1)
   drc=$?
   [ "$drc" -eq 0 ] || log "iq_apt_decode returned $drc for $name"
-  # one-line verdict for the manifest: prefer the DECODE SYNC line, else the WATERFALL line.
-  verdict=$(echo "$dout" | grep -E "DECODE SYNC_LOCK|WATERFALL" | tr '\n' '|' | sed 's/|$//')
+  # one-line verdict for the manifest: prefer the DECODE line, else the WATERFALL line.
+  # (DECODE prints "skipped (LRPT)" for Meteor files — APT sync-lock is meaningless there.)
+  verdict=$(echo "$dout" | grep -E "DECODE |WATERFALL" | tr '\n' '|' | sed 's/|$//')
   [ -n "$verdict" ] || verdict="(decoder produced no verdict line; rc=$drc)"
 
   # ---- independent external cross-check: satdump on the SAME bytes (non-fatal, mode auto) ----
   # validate_external.sh exits 1 if satdump is absent; that is intentionally NON-fatal here
   # (matches pass_scheduler.sh's "|| true"). We still record whether it ran.
+  # For LRPT it also emits "CADUS=n cadu_bytes=b" — the AUTHORITATIVE LRPT verdict
+  # (deterministic deframed-byte count; the waterfall heuristic is advisory only).
   vout=$(bash "$VALIDATOR" "$bin" 2>&1)
   vrc=$?
-  vtag=$(echo "$vout" | grep -E "^exit=" | head -1)
+  vtag=$(echo "$vout" | grep -E "^(exit=|CADUS=)" | head -2 | tr '\n' ' ' | sed 's/ $//')
   [ -n "$vtag" ] || vtag="satdump_rc=$vrc"
 
   # ---- write the marker LAST (so a crash mid-decode re-tries next tick, not skips) ----

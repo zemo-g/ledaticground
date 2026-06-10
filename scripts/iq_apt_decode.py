@@ -15,6 +15,14 @@ from PIL import Image
 INP=sys.argv[1]; PRE=sys.argv[2]
 FS=int(sys.argv[sys.argv.index('--fs')+1]) if '--fs' in sys.argv else 250000
 PIX=4160; LINE=2080; SUBC=2400.0
+# LRPT (Meteor) captures: the narrowband APT discriminator below is structurally blind
+# to a 120 kHz OQPSK envelope (per-column argmax bounces inside the wide signal ->
+# huge "drift" -> mislabels real signal "FLAT NOISE"; proven 2026-06-10 on a 1023-CADU
+# M2-3 pass). And no waterfall heuristic we tested separates LRPT from pre-filter FM
+# hash (wideband temporal-contrast scored EMPTY-sky captures above the true positive).
+# So for LRPT the verdict defers to satdump's CADU count (validate_external.sh) —
+# deterministic deframed bytes — and the APT subcarrier decode stage is skipped.
+LRPT='_LRPT_' in INP.upper() or 'lrpt' in INP.lower()
 
 raw=np.fromfile(INP,dtype=np.uint8).astype(np.float32)-127.5
 iq=raw[0::2]+1j*raw[1::2]
@@ -48,7 +56,9 @@ Image.fromarray(img).save(PRE+"_waterfall.png")
 # discriminate: APT sat = coherent drift (small adjacent-step std) over a few-kHz Doppler SPAN;
 # fixed RTL spur = coherent but ~0 span; noise = random (huge drift). The waterfall PNG is the
 # ground truth — these metrics are a hint, eyeball the image.
-if sig_snr>8 and drift<2500 and 800<fspan<20000:
+if LRPT:
+    verdict="LRPT — narrowband discriminator N/A; authoritative verdict = satdump CADUS (eyeball waterfall for the wide envelope)"
+elif sig_snr>8 and drift<2500 and 800<fspan<20000:
     verdict="SIGNAL PRESENT (Doppler-drifting trace — APT!)"
 elif sig_snr>8 and drift<2500 and fspan<=800:
     verdict="fixed spur (not a satellite — RTL/LO artifact)"
@@ -57,6 +67,10 @@ elif drift>6000:
 else:
     verdict="faint/ambiguous — inspect waterfall"
 print(f"WATERFALL peak_snr={sig_snr:.1f}dB | drift_std={drift:.0f}Hz | doppler_span={fspan:.0f}Hz | {verdict} | -> {PRE}_waterfall.png")
+
+if LRPT:
+    print("DECODE skipped (LRPT: APT sync-lock meaningless; see satdump CADUS)")
+    sys.exit(0)
 
 # ---------------- DECODE attempt (channelize -> FM demod -> APT) ----------------
 # lowpass ±25kHz around DC (carrier is within Doppler ±~4kHz of center), decimate to ~50k

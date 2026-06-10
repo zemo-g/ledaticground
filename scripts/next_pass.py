@@ -29,13 +29,17 @@ MIN_EL = int(sys.argv[sys.argv.index('--minel') + 1]) if '--minel' in sys.argv e
 HOURS  = int(sys.argv[sys.argv.index('--hours') + 1]) if '--hours' in sys.argv else 24
 ALL    = '--all' in sys.argv
 
-# name -> (downlink Hz, mode). APT = our live decoder; LRPT = raw-IQ + synthetic decoder.
+# name -> (downlink Hz, mode). Transmitter ground truth verified 2026-06-10
+# (SatNOGS DB + usradioguy): NOAA 15/19 APT decommissioned Aug 2025 — the APT mode
+# is off the air entirely, so the default (APT-only) scope now yields NONE, which
+# is correct. M2-2 LRPT dead (power damage). M2-4 is 137.9 NOT 137.1 (both its
+# captures were empty spectrum). Keep in sync with autocap/enum_passes.py.
 SATS = {
-    "NOAA 15":     (137620000, "APT"),
-    "NOAA 19":     (137100000, "APT"),
-    "METEOR-M2 2": (137900000, "LRPT"),
+    # "NOAA 15":     (137620000, "APT"),   # decommissioned 2025-08-19 (last APT bird)
+    # "NOAA 19":     (137100000, "APT"),   # decommissioned 2025-08-13
+    # "METEOR-M2 2": (137900000, "LRPT"),  # LRPT dead (micrometeorite power damage)
     "METEOR-M2 3": (137900000, "LRPT"),
-    "METEOR-M2 4": (137100000, "LRPT"),
+    "METEOR-M2 4": (137900000, "LRPT"),   # was 137100000 — wrong freq
 }
 WANT = SATS if ALL else {k: v for k, v in SATS.items() if v[1] == "APT"}
 
