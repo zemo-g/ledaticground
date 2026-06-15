@@ -1,0 +1,113 @@
+-- ledaticground RS41 rung 2: GFSK 2-FSK demodulator + bit sync (pure Rail).
+-- Vaisala RS41-SG is plain NRZ 2-FSK (4800 baud, +/-2.4 kHz dev). The polar
+-- discriminator disc[n] = Q[n]*I[n-1] - I[n]*Q[n-1] (imag part of z[n]*conj(z[n-1]))
+-- gives the instantaneous-frequency sign per sample. Integrate disc over each sps-sample
+-- symbol window and sign-slice: positive -> bit 1 (high tone), negative -> bit 0.
+-- This is the FSK9600 path of src/beacon_fsk.rail (mode 1) / src/gmsk.rail, VERBATIM
+-- DSP -- the only RS41-specific change is sps (read from /tmp/rs41_sps.txt) and the
+-- input path. Reads int8 IQ from /tmp/rs41_in.s8; prints a BITS line (same contract
+-- as beacon_fsk.rail so the checker greps BITS).
+--
+-- Symbol timing: for the synthetic vector with known sps we use fixed-phase
+-- integrate-and-dump (clean, deterministic). For real RF a Gardner TED loop
+-- (src/gardner.rail) layers ahead of the slicer, gated on /tmp/rs41_use_gardner.txt --
+-- kept as a SELECTABLE second stage so synthetic uses the simple path and live uses
+-- tracking. (The synthetic path is what validates offline NOW; live 400 MHz reception is
+-- hardware-blocked on a separate antenna, so the Gardner branch is documented + reserved.)
+--
+-- RAIL traps honored: every loop carries an int index only, floats live in array cells
+-- (dodges the float-accumulator self-loop miscompile); no &&/||; read_bytes uses
+-- malloc/byte_at builtins NOT foreign-int-declared (would tag the pointer).
+--
+-- Run: bash scripts/railrun.sh <ledaticground>/src/rs41_demod.rail
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- read one config line, strip newline, fall back to a safe default
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+-- string -> int by walking chars (to_int is float-only; canonical socket.rail pattern)
+pint_acc cs acc =
+  if cs == [] then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else pint_acc (tail cs) (acc * 10 + d)
+pint s = pint_acc (chars s) 0
+
+-- signed int8 at byte index k -> float
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- disc[n] = Q[n]*I[n-1] - I[n]*Q[n-1]  (imag part of z[n] * conj(z[n-1]))
+fill_disc bytes nsamp disc n =
+  if n >= nsamp then 0
+  else
+    let in0 = isig bytes (2 * n)
+    let qn0 = isig bytes (2 * n + 1)
+    let ip = isig bytes (2 * (n - 1))
+    let qp = isig bytes (2 * (n - 1) + 1)
+    let _ = float_arr_set disc n (qn0 * ip - in0 * qp)
+    fill_disc bytes nsamp disc (n + 1)
+
+-- integrate disc over [start, start+n) into acc[0] (cell accumulator; recursion carries i)
+sum_win disc start n i acc =
+  if i >= n then 0
+  else
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get disc (start + i)))
+    sum_win disc start n (i + 1) acc
+
+fsk_syms disc nsym sps k acc outbits =
+  if k >= nsym then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = sum_win disc (k * sps) sps 0 acc
+    let s = float_arr_get acc 0
+    let _ = arr_set outbits k (if s > 0.0 then 1 else 0)
+    fsk_syms disc nsym sps (k + 1) acc outbits
+
+bitstr outbits i n acc =
+  if i >= n then acc
+  else bitstr outbits (i + 1) n (cat [acc, show (arr_get outbits i)])
+
+main =
+  let sps = pint (field_or "/tmp/rs41_sps.txt" "10")
+  let bytes = read_bytes "/tmp/rs41_in.s8"
+  let nsamp = (arr_len bytes) / 2
+  let disc = float_arr_new nsamp 0.0
+  let _ = fill_disc bytes nsamp disc 1
+  let nsym = nsamp / sps
+  let outbits = arr_new nsym 0
+  let acc = float_arr_new 1 0.0
+  let _ = print (cat ["INFO mode=RS41-2FSK samples=", show nsamp, " sps=", show sps, " symbols=", show nsym])
+  let _ = fsk_syms disc nsym sps 0 acc outbits
+  let _ = print (cat ["BITS ", bitstr outbits 0 nsym ""])
+  0

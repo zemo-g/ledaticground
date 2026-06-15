@@ -1,0 +1,582 @@
+-- ledaticground RS41: FULL-CHAIN decoder + block parse + FACT/INFERENCE split (pure Rail).
+-- Reads the synthetic end-to-end RS41-SG GFSK frame (int8 IQ at /tmp/rs41_in.s8, written by
+-- scripts/gen_rs41_gen.py) and runs ALL rungs back-to-back, mirroring src/beacon_decode.rail:
+--
+--   RUNG 1 (demod)        -- polar discriminator over int8 IQ, integrate-and-dump per sps
+--                            symbol, sign-slice -> NRZ channel bits (rs41_demod logic).
+--   RUNG 2 (pack/sync)    -- pack bits LSB-first into bytes; search the RS41 8-byte sync
+--                            (descrambled constant) by XOR-testing each offset with M[0..7].
+--   RUNG 3 (descramble)   -- XOR FRAME_LEN bytes with the 64-byte RS41 mask M (mod 64).
+--   RUNG 4 (RS correct)   -- deinterleave I=2, RS(255,231) FCR=0 correct both codewords.
+--   RUNG 5 (block parse)  -- per-block CRC16-CCITT (poly 0x1021 init 0xFFFF, non-reflected)
+--                            verify; parse typed sub-blocks {0x79,type,len,payload,CRC16}.
+--                            STATUS(0x28)->frame#/serial/battery, GPS-POS(0x7C)->ECEF int32,
+--                            PTU(0x7A)->raw temp/rh/pressure counts.
+--   RUNG 6 (FACT/INFER)   -- THE WALL (docs/CHANNEL_INTELLIGENCE.md): CRC-verified raw
+--                            fields are FACTS (-> /tmp/rs41_facts.txt, signed type=FACT).
+--                            Derived lat/lon/alt (ECEF->WGS84 Bowring transform) + calibrated
+--                            temp/RH are LABELED INFERENCE (-> /tmp/rs41_derived.txt, signed
+--                            SEPARATELY type=INFERENCE). Cal coeffs live in the sonde's own
+--                            cal sub-frames; absent here -> temp/RH degrade to PENDING_no_cal.
+--
+-- *** HONESTY ***: SYNTHETIC TEST VECTOR ONLY. No real 400 MHz reception (the 137-MHz halo
+-- cannot hear 400 MHz; needs a separate antenna -- a hardware-procurement blocker). The
+-- entire SOFTWARE chain validates synthetically NOW. The radiosonde's OWN GPS position is the
+-- TRANSMITTER's position, explicitly distinct from the (PENDING) receiver geo in the receipt.
+--
+-- RAIL traps: int32 LE assembly via shl+bit_or (sign-corrected for negative ECEF); ECEF
+-- floats live in array cells; frame payload carried as HEX into the hash (NUL-safe);
+-- malloc/byte_at builtins NOT foreign-int-declared. No &&/|| (nested if/else).
+--
+-- Run: bash scripts/railrun.sh <ledaticground>/src/rs41_decode.rail
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+pint_acc cs acc =
+  if cs == [] then acc
+  else
+    let c = head cs
+    let d = char_to_int c - 48
+    if d < 0 then acc
+    else if d > 9 then acc
+    else pint_acc (tail cs) (acc * 10 + d)
+pint s = pint_acc (chars s) 0
+
+isig bytes k =
+  let b = arr_get bytes k
+  int_to_float (if b < 128 then b else b - 256)
+
+-- ===== RUNG 1: polar discriminator + integrate-and-dump (rs41_demod logic) =====
+fill_disc bytes nsamp disc n =
+  if n >= nsamp then 0
+  else
+    let in0 = isig bytes (2 * n)
+    let qn0 = isig bytes (2 * n + 1)
+    let ip = isig bytes (2 * (n - 1))
+    let qp = isig bytes (2 * (n - 1) + 1)
+    let _ = float_arr_set disc n (qn0 * ip - in0 * qp)
+    fill_disc bytes nsamp disc (n + 1)
+sum_win disc start n i acc =
+  if i >= n then 0
+  else
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get disc (start + i)))
+    sum_win disc start n (i + 1) acc
+fsk_syms disc nsym sps k acc outbits =
+  if k >= nsym then 0
+  else
+    let _ = float_arr_set acc 0 0.0
+    let _ = sum_win disc (k * sps) sps 0 acc
+    let s = float_arr_get acc 0
+    let _ = arr_set outbits k (if s > 0.0 then 1 else 0)
+    fsk_syms disc nsym sps (k + 1) acc outbits
+
+-- ===== RUNG 2: pack LSB-first + sync search =====
+pack_one bits base i acc =
+  if i >= 8 then acc
+  else pack_one bits base (i + 1) (bit_or acc (shl (arr_get bits (base + i)) i))
+pack_bits bits nbytes obytes j =
+  if j >= nbytes then 0
+  else
+    let _ = arr_set obytes j (pack_one bits (8 * j) 0 0)
+    pack_bits bits nbytes obytes (j + 1)
+
+-- ===== RUNG 3: RS41 scramble mask M (literal) + sync (post-descramble constant) =====
+build_mask m =
+  let _ = arr_set m 0 0
+  let _ = arr_set m 1 96
+  let _ = arr_set m 2 18
+  let _ = arr_set m 3 120
+  let _ = arr_set m 4 10
+  let _ = arr_set m 5 110
+  let _ = arr_set m 6 24
+  let _ = arr_set m 7 112
+  let _ = arr_set m 8 5
+  let _ = arr_set m 9 103
+  let _ = arr_set m 10 23
+  let _ = arr_set m 11 127
+  let _ = arr_set m 12 15
+  let _ = arr_set m 13 106
+  let _ = arr_set m 14 29
+  let _ = arr_set m 15 119
+  let _ = arr_set m 16 2
+  let _ = arr_set m 17 99
+  let _ = arr_set m 18 17
+  let _ = arr_set m 19 123
+  let _ = arr_set m 20 9
+  let _ = arr_set m 21 108
+  let _ = arr_set m 22 26
+  let _ = arr_set m 23 115
+  let _ = arr_set m 24 7
+  let _ = arr_set m 25 101
+  let _ = arr_set m 26 20
+  let _ = arr_set m 27 125
+  let _ = arr_set m 28 12
+  let _ = arr_set m 29 104
+  let _ = arr_set m 30 31
+  let _ = arr_set m 31 117
+  let _ = arr_set m 32 1
+  let _ = arr_set m 33 97
+  let _ = arr_set m 34 19
+  let _ = arr_set m 35 121
+  let _ = arr_set m 36 11
+  let _ = arr_set m 37 111
+  let _ = arr_set m 38 25
+  let _ = arr_set m 39 113
+  let _ = arr_set m 40 4
+  let _ = arr_set m 41 102
+  let _ = arr_set m 42 22
+  let _ = arr_set m 43 126
+  let _ = arr_set m 44 14
+  let _ = arr_set m 45 107
+  let _ = arr_set m 46 28
+  let _ = arr_set m 47 118
+  let _ = arr_set m 48 3
+  let _ = arr_set m 49 98
+  let _ = arr_set m 50 16
+  let _ = arr_set m 51 122
+  let _ = arr_set m 52 8
+  let _ = arr_set m 53 109
+  let _ = arr_set m 54 27
+  let _ = arr_set m 55 114
+  let _ = arr_set m 56 6
+  let _ = arr_set m 57 100
+  let _ = arr_set m 58 21
+  let _ = arr_set m 59 124
+  let _ = arr_set m 60 13
+  let _ = arr_set m 61 105
+  let _ = arr_set m 62 30
+  let _ = arr_set m 63 116
+  0
+sync_byte k =
+  if k == 0 then 134
+  else if k == 1 then 53
+  else if k == 2 then 244
+  else if k == 3 then 64
+  else if k == 4 then 147
+  else if k == 5 then 223
+  else if k == 6 then 26
+  else 96
+sm_acc bytes m i k cell =
+  if k >= 8 then 0
+  else
+    let dv = bit_xor (arr_get bytes (i + k)) (arr_get m k)
+    let _ = arr_set cell 0 ((arr_get cell 0) + (if dv == (sync_byte k) then 1 else 0))
+    sm_acc bytes m i (k + 1) cell
+syncmatch bytes m i =
+  let cell = arr_new 1 0
+  let _ = sm_acc bytes m i 0 cell
+  if (arr_get cell 0) == 8 then 1 else 0
+find_sync bytes m nb i =
+  if (i + 8) > nb then (0 - 1)
+  else if (syncmatch bytes m i) == 1 then i else find_sync bytes m nb (i + 1)
+descr bytes m off out flen i =
+  if i >= flen then 0
+  else
+    let _ = arr_set out i (bit_xor (arr_get bytes (off + i)) (arr_get m (i % 64)))
+    descr bytes m off out flen (i + 1)
+
+-- ===== RUNG 4: GF(256) + RS(255,231) FCR=0 I=2 (rs41_rs engine) =====
+gf_build expt logt i x =
+  if i >= 255 then 0
+  else
+    let _ = arr_set expt i x
+    let _ = arr_set logt x i
+    let dbl = shl x 1
+    let nx = if dbl >= 256 then bit_xor dbl 285 else dbl
+    gf_build expt logt (i + 1) nx
+gf_ext expt i =
+  if i >= 512 then 0
+  else
+    let _ = arr_set expt i (arr_get expt (i - 255))
+    gf_ext expt (i + 1)
+gmul expt logt a b =
+  if a == 0 then 0
+  else if b == 0 then 0
+  else arr_get expt (((arr_get logt a) + (arr_get logt b)) % 255)
+gdiv expt logt a b =
+  if a == 0 then 0
+  else arr_get expt (((arr_get logt a) - (arr_get logt b) + 255) % 255)
+galpha expt p = arr_get expt (p % 255)
+rs_deinterleave cadu cw ii k i =
+  if i >= 255 then 0
+  else
+    let _ = arr_set cw i (arr_get cadu (i * ii + k))
+    rs_deinterleave cadu cw ii k (i + 1)
+syn_horner expt logt cw root i scell =
+  if i >= 255 then 0
+  else
+    let _ = arr_set scell 0 (bit_xor (gmul expt logt (arr_get scell 0) root) (arr_get cw i))
+    syn_horner expt logt cw root (i + 1) scell
+calc_syndromes expt logt cw synd npar fcr j =
+  if j >= npar then 0
+  else
+    let root = galpha expt (fcr + j)
+    let sc = arr_new 1 0
+    let _ = syn_horner expt logt cw root 0 sc
+    let _ = arr_set synd j (arr_get sc 0)
+    calc_syndromes expt logt cw synd npar fcr (j + 1)
+syndromes_nonzero synd npar j =
+  if j >= npar then 0
+  else if (arr_get synd j) != 0 then 1
+  else syndromes_nonzero synd npar (j + 1)
+poly_copy src dst n i = if i > n then 0 else let _ = arr_set dst i (arr_get src i) in poly_copy src dst n (i + 1)
+poly_zero a n i = if i > n then 0 else let _ = arr_set a i 0 in poly_zero a n (i + 1)
+bm_disc expt logt lam synd r ll i dcell =
+  if i > ll then 0
+  else
+    let _ = arr_set dcell 0 (bit_xor (arr_get dcell 0) (gmul expt logt (arr_get lam i) (arr_get synd (r - i))))
+    bm_disc expt logt lam synd r ll (i + 1) dcell
+bm_shift expt logt lam b t coef m npar i =
+  if i > npar then 0
+  else
+    let bsh = if (i - m) < 0 then 0 else arr_get b (i - m)
+    let _ = arr_set t i (bit_xor (arr_get lam i) (gmul expt logt coef bsh))
+    bm_shift expt logt lam b t coef m npar (i + 1)
+berlekamp expt logt synd npar lam b t lcell mcell =
+  let _ = poly_zero lam npar 0
+  let _ = poly_zero b npar 0
+  let _ = arr_set lam 0 1
+  let _ = arr_set b 0 1
+  let _ = arr_set lcell 0 0
+  let _ = arr_set mcell 0 1
+  let bdc = arr_new 1 1
+  let _ = bm_loop expt logt synd npar lam b t lcell mcell bdc 0
+  0
+bm_loop expt logt synd npar lam b t lcell mcell bdc r =
+  if r >= npar then 0
+  else
+    let ll = arr_get lcell 0
+    let dc = arr_new 1 0
+    let _ = arr_set dc 0 (arr_get synd r)
+    let _ = bm_disc expt logt lam synd r ll 1 dc
+    let d = arr_get dc 0
+    let m = arr_get mcell 0
+    let _ = if d == 0 then
+              let _ = arr_set mcell 0 (m + 1)
+              0
+            else
+              let coef = gdiv expt logt d (arr_get bdc 0)
+              let _ = poly_copy lam t npar 0
+              let _ = bm_shift expt logt lam b t coef m npar 0
+              let _ = if (2 * ll) <= r then
+                        let _ = poly_copy lam b npar 0
+                        let _ = poly_copy t lam npar 0
+                        let _ = arr_set lcell 0 (r + 1 - ll)
+                        let _ = arr_set bdc 0 d
+                        let _ = arr_set mcell 0 1
+                        0
+                      else
+                        let _ = poly_copy t lam npar 0
+                        let _ = arr_set mcell 0 (m + 1)
+                        0
+              0
+    bm_loop expt logt synd npar lam b t lcell mcell bdc (r + 1)
+lam_eval expt logt lam ll x j acc =
+  if j > ll then acc
+  else lam_eval expt logt lam ll x (j + 1) (bit_xor acc (gmul expt logt (arr_get lam j) (galpha expt (((arr_get logt x) * j) % 255))))
+chien expt logt lam ll epos ecell i =
+  if i >= 255 then 0
+  else
+    let x = galpha expt ((255 - i) % 255)
+    let v = lam_eval expt logt lam ll x 0 0
+    let _ = if v == 0 then
+              let nn = arr_get ecell 0
+              let _ = arr_set epos nn i
+              let _ = arr_set ecell 0 (nn + 1)
+              0
+            else 0
+    chien expt logt lam ll epos ecell (i + 1)
+omega_inner expt logt synd lam d j oc =
+  if j > d then 0
+  else
+    let _ = arr_set oc 0 (bit_xor (arr_get oc 0) (gmul expt logt (arr_get synd j) (arr_get lam (d - j))))
+    omega_inner expt logt synd lam d (j + 1) oc
+calc_omega expt logt synd lam npar omega d =
+  if d >= npar then 0
+  else
+    let oc = arr_new 1 0
+    let _ = omega_inner expt logt synd lam d 0 oc
+    let _ = arr_set omega d (arr_get oc 0)
+    calc_omega expt logt synd lam npar omega (d + 1)
+poly_eval expt logt p deg x j acc =
+  if j > deg then acc
+  else poly_eval expt logt p deg x (j + 1) (bit_xor acc (gmul expt logt (arr_get p j) (galpha expt (((arr_get logt x) * j) % 255))))
+lamprime_eval expt logt lam ll x j acc =
+  if j > ll then acc
+  else
+    let term = if (bit_and j 1) == 1 then gmul expt logt (arr_get lam j) (galpha expt (((arr_get logt x) * (j - 1)) % 255)) else 0
+    lamprime_eval expt logt lam ll x (j + 1) (bit_xor acc term)
+forney_fix expt logt cw lam omega npar ll epos nerr fcr k =
+  if k >= nerr then 0
+  else
+    let i = arr_get epos k
+    let xinv = galpha expt ((255 - i) % 255)
+    let om = poly_eval expt logt omega (npar - 1) xinv 0 0
+    let lp = lamprime_eval expt logt lam ll xinv 1 0
+    let base = if lp == 0 then 0 else gdiv expt logt om lp
+    let xfac = galpha expt ((i * (1 - fcr)) % 255)
+    let mag = gmul expt logt base xfac
+    let bidx = 254 - i
+    let _ = arr_set cw bidx (bit_xor (arr_get cw bidx) mag)
+    forney_fix expt logt cw lam omega npar ll epos nerr fcr (k + 1)
+-- decode codeword cw IN PLACE; return number of errors corrected (or -1 fail). okcell[0]=ok bit.
+rs_decode_cw expt logt cw npar fcr okcell =
+  let synd = arr_new npar 0
+  let _ = calc_syndromes expt logt cw synd npar fcr 0
+  if (syndromes_nonzero synd npar 0) == 0 then
+    let _ = arr_set okcell 0 1
+    0
+  else
+    let lam = arr_new (npar + 1) 0
+    let b = arr_new (npar + 1) 0
+    let t = arr_new (npar + 1) 0
+    let lcell = arr_new 1 0
+    let mcell = arr_new 1 0
+    let _ = berlekamp expt logt synd npar lam b t lcell mcell
+    let ll = arr_get lcell 0
+    let epos = arr_new 255 0
+    let ecell = arr_new 1 0
+    let _ = chien expt logt lam ll epos ecell 0
+    let nerr = arr_get ecell 0
+    let omega = arr_new npar 0
+    let _ = calc_omega expt logt synd lam npar omega 0
+    let _ = forney_fix expt logt cw lam omega npar ll epos nerr fcr 0
+    let synd2 = arr_new npar 0
+    let _ = calc_syndromes expt logt cw synd2 npar fcr 0
+    let _ = arr_set okcell 0 (if (syndromes_nonzero synd2 npar 0) == 0 then 1 else 0)
+    nerr
+
+-- ===== RUNG 5: CRC16-CCITT (poly 0x1021, init 0xFFFF, NON-reflected: shift LEFT) =====
+ccitt_bit crc i =
+  if i >= 8 then crc
+  else
+    let top = bit_and crc 32768
+    let sh = bit_and (shl crc 1) 65535
+    ccitt_bit (if top == 32768 then bit_xor sh 4129 else sh) (i + 1)
+ccitt_byte crc b = ccitt_bit (bit_and (bit_xor crc (shl b 8)) 65535) 0
+crc_loop data start n i cell =
+  if i >= n then 0
+  else
+    let _ = arr_set cell 0 (ccitt_byte (arr_get cell 0) (arr_get data (start + i)))
+    crc_loop data start n (i + 1) cell
+crc16_ccitt data start n =
+  let cell = arr_new 1 0
+  let _ = arr_set cell 0 65535
+  let _ = crc_loop data start n 0 cell
+  arr_get cell 0
+
+-- ===== RUNG 5b: typed-block CRC verify + field extraction =====
+-- block at offset p in data[] : data[p]=0x79, data[p+1]=type, data[p+2]=len, payload,
+-- then 2-byte CRC16 LE over [p .. p+2+len). Verify and return 1/0 in a cell.
+-- signed/unsigned little-endian assemblers (sign-corrected for negative ECEF).
+u16le data o = bit_or (arr_get data o) (shl (arr_get data (o + 1)) 8)
+u24le data o = bit_or (bit_or (arr_get data o) (shl (arr_get data (o + 1)) 8)) (shl (arr_get data (o + 2)) 16)
+-- signed int32 LE: assemble unsigned then map >= 2^31 to negative.
+s32le data o =
+  let u = bit_or (bit_or (arr_get data o) (shl (arr_get data (o + 1)) 8)) (bit_or (shl (arr_get data (o + 2)) 16) (shl (arr_get data (o + 3)) 24))
+  if u >= 2147483648 then u - 4294967296 else u
+
+-- ===== RUNG 6: ECEF -> WGS84 geodetic (Bowring closed-form, INFERENCE) =====
+-- pure float math: sqrt/atan2/sin/cos foreign. Returns nothing; writes lat/lon/alt to cells.
+ecef_to_geo xf yf zf outcell =
+  let a = 6378137.0
+  let f = 1.0 /. 298.257223563
+  let b = a *. (1.0 -. f)
+  let e2 = f *. (2.0 -. f)
+  let ep2 = (a *. a -. b *. b) /. (b *. b)
+  let p = sqrt (xf *. xf +. yf *. yf)
+  let th = atan2 (zf *. a) (p *. b)
+  let sth = sin th
+  let cth = cos th
+  let lat = atan2 (zf +. ep2 *. b *. sth *. sth *. sth) (p -. e2 *. a *. cth *. cth *. cth)
+  let lon = atan2 yf xf
+  let slat = sin lat
+  let nN = a /. (sqrt (1.0 -. e2 *. slat *. slat))
+  let alt = (p /. (cos lat)) -. nN
+  let r2d = 57.29577951308232
+  let _ = float_arr_set outcell 0 (lat *. r2d)
+  let _ = float_arr_set outcell 1 (lon *. r2d)
+  let _ = float_arr_set outcell 2 alt
+  0
+
+-- ascii printable serial extraction from data[o .. o+8)
+asc_serial data o i n acc =
+  if i >= n then acc
+  else
+    let b = arr_get data (o + i)
+    let c = if b >= 33 then (if b <= 126 then char_from_int b else "") else ""
+    asc_serial data o (i + 1) n (cat [acc, c])
+-- hex of the corrected frame payload (NUL-safe; into the FACT product hash)
+hexd v = str_sub "0123456789abcdef" v 1
+hex8 v = cat [hexd (bit_and (shr v 4) 15), hexd (bit_and v 15)]
+payhex data i n acc =
+  if i >= n then acc
+  else payhex data (i + 1) n (cat [acc, hex8 (arr_get data i)])
+
+main =
+  -- ---------- staging ----------
+  let sps = pint (field_or "/tmp/rs41_sps.txt" "10")
+  let flen = pint (field_or "/tmp/rs41_frame_len.txt" "518")
+
+  -- ---------- RUNG 1: demod ----------
+  let bytesin = read_bytes "/tmp/rs41_in.s8"
+  let nsamp = (arr_len bytesin) / 2
+  let disc = float_arr_new nsamp 0.0
+  let _ = fill_disc bytesin nsamp disc 1
+  let nsym = nsamp / sps
+  let chbits = arr_new nsym 0
+  let acc = float_arr_new 1 0.0
+  let _ = fsk_syms disc nsym sps 0 acc chbits
+  let _ = print (cat ["RUNG1_DEMOD samples=", show nsamp, " sps=", show sps, " channel_bits=", show nsym])
+
+  -- ---------- RUNG 2: pack + sync search ----------
+  let nb = nsym / 8
+  let wbytes = arr_new nb 0
+  let _ = pack_bits chbits nb wbytes 0
+  let m = arr_new 64 0
+  let _ = build_mask m
+  let off = find_sync wbytes m nb 0
+  let _ = print (cat ["RUNG2_SYNC offset=", show off, " bytes=", show nb])
+
+  if off < 0 then
+    let _ = print "END_TO_END FAIL (no sync)"
+    0
+  else
+    -- ---------- RUNG 3: descramble ----------
+    let frame = arr_new flen 0
+    let _ = descr wbytes m off frame flen 0
+    let _ = print (cat ["RUNG3_DESCRAMBLE frame_len=", show flen])
+
+    -- ---------- RUNG 4: deinterleave + RS correct both codewords ----------
+    -- the RS block is frame[8 .. 8+510) (after the 8-byte sync). I=2, npar=24, fcr=0.
+    let expt = arr_new 512 0
+    let logt = arr_new 256 0
+    let _ = gf_build expt logt 0 1
+    let _ = gf_ext expt 255
+    let rsoff = 8
+    let cadu = arr_new 510 0
+    let _ = copy_bytes_arr frame rsoff cadu 0 510
+    let cw0 = arr_new 255 0
+    let cw1 = arr_new 255 0
+    let _ = rs_deinterleave cadu cw0 2 0 0
+    let _ = rs_deinterleave cadu cw1 2 1 0
+    let ok0 = arr_new 1 0
+    let ok1 = arr_new 1 0
+    let ne0 = rs_decode_cw expt logt cw0 24 0 ok0
+    let ne1 = rs_decode_cw expt logt cw1 24 0 ok1
+    let rs_ok = if (arr_get ok0 0) == 1 then (if (arr_get ok1 0) == 1 then 1 else 0) else 0
+    let _ = print (cat ["RUNG4_RS cw0_nerr=", show ne0, " cw0_ok=", show (arr_get ok0 0), " cw1_nerr=", show ne1, " cw1_ok=", show (arr_get ok1 0), " rs_ok=", show rs_ok])
+
+    -- the corrected DATA region = cw0[0..230] (the typed blocks live in cw0's 231 data area)
+    let data = arr_new 231 0
+    let _ = copy_bytes_arr cw0 0 data 0 231
+
+    -- ---------- RUNG 5: typed-block CRC verify + parse ----------
+    -- STATUS block 0x7928 at data[0]: 0x79,0x28,len, payload[len], crc16(2)
+    -- payload = frame#(u16) serial(8 ascii) battery(u16)
+    let st_len = arr_get data 2
+    let st_calc = crc16_ccitt data 0 (3 + st_len)
+    let st_rx = u16le data (3 + st_len)
+    let st_crc_ok = if st_calc == st_rx then 1 else 0
+    let frame_num = u16le data 3
+    let serial = asc_serial data 5 0 8 ""
+    let battery_mv = u16le data 13
+    -- GPS-POS block 0x7C: starts right after STATUS block (header3 + st_len + crc2)
+    let gp_p = 3 + st_len + 2
+    let gp_len = arr_get data (gp_p + 2)
+    let gp_calc = crc16_ccitt data gp_p (3 + gp_len)
+    let gp_rx = u16le data (gp_p + 3 + gp_len)
+    let gp_crc_ok = if gp_calc == gp_rx then 1 else 0
+    let ecef_x = s32le data (gp_p + 3)
+    let ecef_y = s32le data (gp_p + 7)
+    let ecef_z = s32le data (gp_p + 11)
+    let vel_x = s32le data (gp_p + 15)
+    let vel_y = s32le data (gp_p + 19)
+    let vel_z = s32le data (gp_p + 23)
+    -- PTU block 0x7A: after GPS-POS
+    let pt_p = gp_p + 3 + gp_len + 2
+    let pt_len = arr_get data (pt_p + 2)
+    let pt_calc = crc16_ccitt data pt_p (3 + pt_len)
+    let pt_rx = u16le data (pt_p + 3 + pt_len)
+    let pt_crc_ok = if pt_calc == pt_rx then 1 else 0
+    let temp_count = u24le data (pt_p + 3)
+    let rh_count = u24le data (pt_p + 6)
+    let pres_count = u24le data (pt_p + 9)
+    let all_crc_ok = if st_crc_ok == 1 then (if gp_crc_ok == 1 then (if pt_crc_ok == 1 then 1 else 0) else 0) else 0
+
+    let _ = print (cat ["CRC_OK status=", show st_crc_ok, " gpspos=", show gp_crc_ok, " ptu=", show pt_crc_ok])
+    let _ = print (cat ["STATUS serial=", serial, " frame_num=", show frame_num, " battery_mv=", show battery_mv])
+    let _ = print (cat ["GPS_POS ecef_x_cm=", show ecef_x, " ecef_y_cm=", show ecef_y, " ecef_z_cm=", show ecef_z, " vel_x_cms=", show vel_x, " vel_y_cms=", show vel_y, " vel_z_cms=", show vel_z])
+    let _ = print (cat ["PTU temp_count=", show temp_count, " rh_count=", show rh_count, " pres_count=", show pres_count])
+
+    -- ---------- RUNG 6: FACT/INFERENCE split ----------
+    -- (A) FACTS = CRC-verified raw decoded fields + corrected-frame payload HEX (DECODE).
+    let payload_hex = payhex frame 0 flen ""
+    let facts = join "\n" [cat ["serial=", serial], cat ["frame_num=", show frame_num], cat ["battery_mv=", show battery_mv], cat ["ecef_x_cm=", show ecef_x], cat ["ecef_y_cm=", show ecef_y], cat ["ecef_z_cm=", show ecef_z], cat ["vel_x_cms=", show vel_x], cat ["vel_y_cms=", show vel_y], cat ["vel_z_cms=", show vel_z], cat ["temp_count=", show temp_count], cat ["rh_count=", show rh_count], cat ["pres_count=", show pres_count], cat ["rs_ok=", show rs_ok], cat ["payload_hex=", payload_hex]]
+    let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/rs41_facts.txt" facts
+    let _ = write_file "/tmp/rs41_facts.txt" facts
+    -- also stage the canonical product the FACT receipt commits to (contract A.4)
+    let _ = write_file "/tmp/rs41_decode_out.txt" facts
+
+    -- (B) DERIVED = ECEF->WGS84 lat/lon/alt (INFERENCE). cal coeffs absent -> temp PENDING.
+    let xf = (int_to_float ecef_x) /. 100.0
+    let yf = (int_to_float ecef_y) /. 100.0
+    let zf = (int_to_float ecef_z) /. 100.0
+    let geo = float_arr_new 3 0.0
+    let _ = ecef_to_geo xf yf zf geo
+    let lat = float_arr_get geo 0
+    let lon = float_arr_get geo 1
+    let alt = float_arr_get geo 2
+    -- cal sub-frames not all received in a single synthetic frame -> honest PENDING.
+    let temp_c = "PENDING_no_cal"
+    let rh_pct = "PENDING_no_cal"
+    let derived = join "\n" [cat ["lat=", show_float lat], cat ["lon=", show_float lon], cat ["alt_m=", show_float alt], cat ["temp_C=", temp_c], cat ["rh_pct=", rh_pct], "method=ECEF->WGS84-Bowring + RS41-cal-poly(PENDING)"]
+    let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/rs41_derived.txt" derived
+    let _ = write_file "/tmp/rs41_derived.txt" derived
+    let _ = print (cat ["DERIVED lat=", show_float lat, " lon=", show_float lon, " alt_m=", show_float alt, " temp_C=", temp_c, " rh_pct=", rh_pct])
+
+    -- ---------- end-to-end self-check ----------
+    let e2e = if rs_ok == 1 then (if all_crc_ok == 1 then 1 else 0) else 0
+    let _ = print (cat ["CHAIN_STATUS rung1_demod=ok rung2_sync=", show off, " rung4_rs_ok=", show rs_ok, " rung5_crc_ok=", show all_crc_ok])
+    let _ = print (cat ["END_TO_END ", (if e2e == 1 then "PASS (demod->descramble->RS->CRC->parse->FACT/INFERENCE all green; SYNTHETIC_TEST)" else "FAIL")])
+    0
+
+-- copy a slice of one int array into another (helper used by RS deinterleave staging)
+copy_bytes_arr src soff dst doff n =
+  copy_bytes_arr_i src soff dst doff 0 n
+copy_bytes_arr_i src soff dst doff i n =
+  if i >= n then 0
+  else
+    let _ = arr_set dst (doff + i) (arr_get src (soff + i))
+    copy_bytes_arr_i src soff dst doff (i + 1) n

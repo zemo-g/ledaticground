@@ -1,0 +1,154 @@
+-- ledaticground RS41: TWO signed receipt types -- DECODE fact + INFERENCE (pure Rail).
+-- CONTRACT v=2 (docs/RECEIPT_CONTRACT.md) — uniform with every other ledaticground signer
+-- (ais/acars/orbcomm/orbcomm_por/paos/vessel): the signed pipe-string follows the canonical
+-- LOAD-BEARING field order so verify.rail's ledger-walk can validate RS41 receipts too.
+--
+--   Receipt A (RS41_DECODE_RECEIPT, type=FACT) -- the FACT: CRC/RS-verified raw decode.
+--       honesty bit rs_ok=<0|1>; product_sha256 commits to the decode evidence
+--       (serial + frame# + rs verdict + corrected-frame HEX). Appends data/rs41_receipts.jsonl.
+--   Receipt B (RS41_INFERENCE_RECEIPT, type=INFERENCE) -- the DERIVED product: lat/lon/alt
+--       (ECEF->WGS84) + calibrated temp/RH. Chains ON TOP OF Receipt A:
+--       prev = A.chain_hash AND derived_from = A.chain_hash, cryptographically BINDING the
+--       inference to the fact it was computed from (a verifier that can't resolve
+--       derived_from in the FACT ledger MUST reject). Appends data/rs41_inference_receipts.jsonl.
+--
+-- Both: ed25519_sign (DEV seed, clearly labeled -- NOT a production authority), own-sig
+-- verify MUST==1, tamper-X MUST==0, sha256 chain_hash. Also writes the legacy single-object
+-- data/rs41_decode_receipt.json + data/rs41_inference_receipt.json (backward compat; rich
+-- domain detail preserved there).
+--
+-- *** HONESTY ***: SYNTHETIC_TEST over a SYNTHETIC RS41 detection (no real 400 MHz RX --
+-- the 137-MHz halo cannot hear 400 MHz; hardware-procurement blocker). geo stays the
+-- literal PENDING_needs_GPS_PPS (receiver geolocation NOT asserted -- and the sonde's OWN
+-- GPS is the TRANSMITTER position, distinct from receiver geo). pulse from the SHARED beacon
+-- fetcher's /tmp/lg_pulse_id.txt + /tmp/lg_pulse_hex.txt; absent -> honest
+-- PENDING_beacon_unreachable (NEVER 0, never wall-clock).
+--
+-- Run: bash scripts/railrun.sh <ledaticground>/src/rs41_attest.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+main =
+  -- RS41 DEV signing key (distinct, clearly labeled -- NOT a production authority).
+  let seed = hex_to_bytes "5341315341315341315341315341315341315341315341315341315341310000"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- shared contract inputs
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let node = sta
+  let band = "UHF-400-406MHz-radiosonde"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  -- beacon pulse (SHARED staging, by the shell wrapper, per contract C). HONEST fallback.
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING_beacon_unreachable"
+
+  -- batch provenance BOUNDS + count — staged by the driver. NOT the attestation clock.
+  let batch_start = field_or "/tmp/rs41_batch_start.txt" "PENDING_no_batch"
+  let batch_end = field_or "/tmp/rs41_batch_end.txt" "PENDING_no_batch"
+  let n = field_or "/tmp/rs41_batch_n.txt" "1"
+
+  -- detection metadata (folded into the hashed product, not the canonical field order)
+  let freq = field_or "/tmp/rs41_freq.txt" "405.000"
+  let snr = field_or "/tmp/rs41_snr.txt" "PENDING_no_snr"
+
+  -- decode facts staged by the decoder (gen_rs41_attest.py / rs41_decode.rail)
+  let serial = field_or "/tmp/rs41_serial.txt" "PENDING_no_serial"
+  let frame_num = field_or "/tmp/rs41_frame_num.txt" "PENDING_no_frame"
+  let rs_ok = field_or "/tmp/rs41_rs_ok.txt" "0"
+  let rs_corrected = field_or "/tmp/rs41_rs_corrected.txt" "0"
+  -- corrected frame payload carried as HEX (NUL-safe).
+  let payload_hex = field_or "/tmp/rs41_payload_hex.txt" "00"
+
+  -- derived product fields (INFERENCE)
+  let latlonalt = field_or "/tmp/rs41_latlonalt.txt" "PENDING_no_pos"
+  let temp_c = field_or "/tmp/rs41_temp_c.txt" "PENDING_no_cal"
+  let rh_pct = field_or "/tmp/rs41_rh_pct.txt" "PENDING_no_cal"
+
+  -- ============ Receipt A: RS41_DECODE_RECEIPT (type=FACT) ============
+  -- product_sha256 commits to the full decode evidence (serial/frame#/rs verdict/det meta/hex).
+  let productA = join "|" [cat ["serial=", serial], cat ["frame_num=", frame_num], cat ["rs_ok=", rs_ok], cat ["rs_corrected=", rs_corrected], cat ["freqMHz=", freq], cat ["snr_dB=", snr], cat ["payload_hex=", payload_hex]]
+  let productA_hash = sha256_hex productA
+
+  let prevA = field_or "/tmp/rs41_prev_sha.txt" "GENESIS"
+  -- v=2 FACT receipt — field order is LOAD-BEARING (the signature is over this exact string).
+  let receiptA = join "|" ["RS41_DECODE_RECEIPT", "v=2", "type=FACT", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", n], cat ["rs_ok=", rs_ok], cat ["product_sha256=", productA_hash], cat ["prev=", prevA], cat ["signer=", pk_hex]]
+  let msgA = string_to_bytes receiptA
+  let mlenA = string_length_bytes receiptA
+  let sigA = ed25519_sign seed msgA mlenA
+  let sigA_hex = bytes_to_hex sigA 64
+  let verifyA = ed25519_verify pk msgA mlenA sigA
+  let tstrA = cat [receiptA, "X"]
+  let tmsgA = string_to_bytes tstrA
+  let tlenA = string_length_bytes tstrA
+  let tamperA = ed25519_verify pk tmsgA tlenA sigA
+  let chainA = sha256_hex (cat [receiptA, "|sig=", sigA_hex])
+
+  let _ = print (cat ["RECEIPT_A ", receiptA])
+  let _ = print (cat ["SIG_A     ", sigA_hex])
+  let _ = print (cat ["CHAIN_A   ", chainA])
+  let _ = print (cat ["VERIFY_A  own-sig accepted = ", show verifyA, " (want 1)"])
+  let _ = print (cat ["TAMPER_A  modified-msg accepted = ", show tamperA, " (want 0)"])
+
+  -- canonical v=2 ledger line (space-after-colon for verify.rail field_val).
+  let jsonlineA = cat ["{\"v\":2,\"type\":\"FACT\",\"receipt\": \"", receiptA, "\",\"sig\": \"", sigA_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chainA, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/rs41_receipts.jsonl" jsonlineA
+  let _ = print "APPENDED data/rs41_receipts.jsonl (RS41_DECODE_RECEIPT)"
+
+  -- legacy single-object backward-compat (rich domain detail preserved).
+  let jrecA = join "\n" ["{", cat ["  \"receipt\": \"", receiptA, "\","], cat ["  \"sonde_serial\": \"", serial, "\","], cat ["  \"frame_num\": \"", frame_num, "\","], cat ["  \"rs_ok\": \"", rs_ok, "\","], cat ["  \"rs_corrected\": \"", rs_corrected, "\","], cat ["  \"product_sha256\": \"", productA_hash, "\","], cat ["  \"sig\": \"", sigA_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chainA, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/rs41_decode_receipt.json" jrecA
+
+  -- ====== Receipt B: RS41_INFERENCE_RECEIPT (type=INFERENCE, bound to A) ======
+  -- derived_from = A.chain_hash : cryptographically binds the inference to the FACT it was
+  -- computed from (verify.rail resolves derived_from cross-ledger against rs41_receipts.jsonl;
+  -- an unresolvable derived_from MUST be rejected). prev threads the INFERENCE ledger's OWN
+  -- chain (GENESIS on line 1) — same shape as vessel_inference_attest.rail, so verify.rail's
+  -- ledger-walk validates this ledger as a self-consistent chain.
+  let productB = join "|" [cat ["lat_lon_alt=", latlonalt], cat ["temp_C=", temp_c], cat ["rh_pct=", rh_pct], "method=ECEF->WGS84+RS41-cal-poly"]
+  let productB_hash = sha256_hex productB
+
+  let prevB = field_or "/tmp/rs41_inf_prev_sha.txt" "GENESIS"
+  let receiptB = join "|" ["RS41_INFERENCE_RECEIPT", "v=2", "type=INFERENCE", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", n], cat ["derived_from=", chainA], cat ["product_sha256=", productB_hash], cat ["prev=", prevB], cat ["signer=", pk_hex]]
+  let msgB = string_to_bytes receiptB
+  let mlenB = string_length_bytes receiptB
+  let sigB = ed25519_sign seed msgB mlenB
+  let sigB_hex = bytes_to_hex sigB 64
+  let verifyB = ed25519_verify pk msgB mlenB sigB
+  let tstrB = cat [receiptB, "X"]
+  let tmsgB = string_to_bytes tstrB
+  let tlenB = string_length_bytes tstrB
+  let tamperB = ed25519_verify pk tmsgB tlenB sigB
+  let chainB = sha256_hex (cat [receiptB, "|sig=", sigB_hex])
+
+  let _ = print (cat ["RECEIPT_B ", receiptB])
+  let _ = print (cat ["SIG_B     ", sigB_hex])
+  let _ = print (cat ["CHAIN_B   ", chainB])
+  let _ = print (cat ["VERIFY_B  own-sig accepted = ", show verifyB, " (want 1)"])
+  let _ = print (cat ["TAMPER_B  modified-msg accepted = ", show tamperB, " (want 0)"])
+
+  let jsonlineB = cat ["{\"v\":2,\"type\":\"INFERENCE\",\"receipt\": \"", receiptB, "\",\"sig\": \"", sigB_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chainB, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/rs41_inference_receipts.jsonl" jsonlineB
+  let _ = print "APPENDED data/rs41_inference_receipts.jsonl (RS41_INFERENCE_RECEIPT)"
+
+  let jrecB = join "\n" ["{", cat ["  \"receipt\": \"", receiptB, "\","], cat ["  \"derived_from\": \"", chainA, "\","], cat ["  \"lat_lon_alt\": \"", latlonalt, "\","], cat ["  \"temp_C\": \"", temp_c, "\","], cat ["  \"rh_pct\": \"", rh_pct, "\","], cat ["  \"product_sha256\": \"", productB_hash, "\","], cat ["  \"sig\": \"", sigB_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chainB, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/rs41_inference_receipt.json" jrecB
+
+  -- the binding invariant: B.prev == B.derived_from == A.chain_hash
+  -- (chainA must appear as a substring of receiptB -- it is both derived_from= and prev=)
+  let bound = if (str_find chainA receiptB) >= 0 then 1 else 0
+  let _ = print (cat ["BINDING   B.derived_from == A.chain_hash = ", show bound, " (want 1)"])
+  let allok = if verifyA == 1 then (if tamperA == 0 then (if verifyB == 1 then (if tamperB == 0 then (if bound == 1 then 1 else 0) else 0) else 0) else 0) else 0
+  let _ = print (cat ["ATTEST_STATUS ", (if allok == 1 then "PASS (2 receipts: DECODE fact + INFERENCE bound to it; SYNTHETIC_TEST)" else "FAIL")])
+  0

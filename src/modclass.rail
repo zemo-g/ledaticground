@@ -1,11 +1,23 @@
 -- ledaticground RFML: pure-Rail modulation classifier, TRAINED IN RAIL (docs/RFML.md).
--- The whole chain on the verifiable substrate: read FM-demod audio -> extract the 10 features
--- (validated byte-for-byte against the Python oracle) -> standardize -> train a 5-class softmax by
--- SGD -> evaluate held-out -> classify a real off-air capture. No baked Python weights; the model
--- is fit here. classes: 0 noise 1 carrier 2 afsk 3 fsk 4 msk.
+-- The whole chain on the verifiable substrate: read FM-demod audio -> extract the 18 features
+-- (the featlib_v3 coordinate system, validated byte-for-byte against the Python oracle) ->
+-- standardize -> train a 5-class softmax by SGD -> evaluate held-out -> classify a real off-air
+-- capture. No baked Python weights; the model is fit here. classes: 0 noise 1 carrier 2 afsk 3 fsk 4 msk.
 --   train: data/modclass/train.s16 + train.labels   test: test.s16 + test.labels
 --   real : data/ais_clean_a.s16  (expect mostly noise + a few msk = the AIS bursts)
 -- All float loops accumulate into size-1 cells; no float arg depends on another updated arg.
+--
+-- RFML-4 (train/serve substrate reconciliation): the served v3 model + the fixed
+-- scripts/pi_characterize.py use the featlib_v3 18-feature COORDINATE SYSTEM, in this exact order:
+--   [rough zcr flat peak cent kurt bimod hf lf dom peak2 npeaks bw p2p1 peak3 sq_sharp occ_norm baud_norm]
+-- (first-15 byte-identical to featlib.py; last-3 gain-invariant cyclostationary discriminators).
+-- This trainer now computes the SAME 18 features and exports models/audio_softmax.txt with a
+-- `# COLS 0..17` header + 18-wide MU/SG/W/B and models/audio_novelty.txt with 18-wide C/S, in the
+-- EXACT format pi_characterize.py:load_model/load_novelty parse -> a Rail-trained export is drop-in
+-- for the served path. RAIL TRAPS honored below: (a) NO &&/|| short-circuit -> band/threshold guards
+-- in sq_sharp/occ_norm use nested if/then/else, never boolean chains; (b) all float loops accumulate
+-- into size-1 cells; (c) to_int is float-only -> bin<->Hz index math uses integer / and * only.
+-- Feature stride is 18 cols/row throughout (was 10).
 
 foreign fopen path mode -> int
 foreign fclose fp
@@ -171,8 +183,216 @@ spec_pass re im k nb acc =
     let _ = if k < 170 then float_arr_set acc 7 ((float_arr_get acc 7) + p) else 0
     spec_pass re im (k + 1) nb acc
 
--- compute the 10 features of window f (len n) into F at offset off
-feat_store f n re im twopi F off =
+-- ============================================================================
+-- RFML-4: featlib_v3 features 10..17 (the 5 gain-invariant + 3 v3 cyclostationary).
+-- These reuse the post-FFT spectrum in re/im (P[k] = re[k]^2 + im[k]^2) and a second
+-- squared-signal FFT (re2/im2). Each is a power RATIO / freq-over-Nyquist => gain-invariant,
+-- byte-identical math to featlib_v3.feats(). Float loops accumulate into size-1 cells.
+-- ============================================================================
+
+-- materialize per-bin power P[k] from the FFT in re/im; P[0] (DC) stays 0
+fill_power re im P k nb =
+  if k >= nb then 0
+  else
+    let pr = float_arr_get re k
+    let pii = float_arr_get im k
+    let _ = float_arr_set P k (pr * pr + pii * pii)
+    fill_power re im P (k + 1) nb
+
+-- bw: sqrt(sum P[k]*(k-mu_bin)^2 / ps) / nb   (mu_bin = sumkp/ps)
+bw_acc P k nb mu_bin cell =
+  if k >= nb then 0
+  else
+    let dk = (int_to_float k) - mu_bin
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get P k) * dk * dk)
+    bw_acc P (k + 1) nb mu_bin cell
+
+-- 3-tap smoothed spectrum Sm[k] = (P[k-1]+P[k]+P[k+1])/3, with edge zeros (k=1..nb-1)
+fill_smooth P Sm k nb =
+  if k >= nb then 0
+  else
+    let lo = if (k - 1) >= 1 then float_arr_get P (k - 1) else 0.0
+    let hi = if (k + 1) <= (nb - 1) then float_arr_get P (k + 1) else 0.0
+    let _ = float_arr_set Sm k ((lo + (float_arr_get P k) + hi) / 3.0)
+    fill_smooth P Sm (k + 1) nb
+
+-- max of Sm over bins 1..nb-1 into cell0
+smax_acc Sm k nb cell =
+  if k >= nb then 0
+  else
+    let _ = if (float_arr_get Sm k) > (float_arr_get cell 0) then float_arr_set cell 0 (float_arr_get Sm k) else 0
+    smax_acc Sm (k + 1) nb cell
+
+-- npeaks numerator: count bins where Sm[k] >= thr (and smx>0). NO &&/|| short-circuit ->
+-- nested if/then/else for the (Sm>=thr AND smx>0) guard.
+npk_acc Sm k nb thr smx cell =
+  if k >= nb then 0
+  else
+    let _ = if smx > 0.0 then
+              (if (float_arr_get Sm k) >= thr then float_arr_set cell 0 ((float_arr_get cell 0) + 1.0) else 0)
+            else 0
+    npk_acc Sm (k + 1) nb thr smx cell
+
+-- top-3 local-maximum P-values, tracked in cells p1/p2/p3 (descending insert).
+-- A bin k is a local max iff Sm[k] > Sm[k-1] AND Sm[k] >= Sm[k+1] (edges -> 0). The
+-- AND is expressed as nested if (no short-circuit). The descending insert uses the
+-- argmax-into-cells pattern (no float arg depends on another updated arg).
+-- shift v into slot1, pushing the old slot1->slot2->slot3 (descending insert top)
+shift_top1 v p1 p2 p3 =
+  let _ = float_arr_set p3 0 (float_arr_get p2 0)
+  let _ = float_arr_set p2 0 (float_arr_get p1 0)
+  float_arr_set p1 0 v
+-- v beats slot2 (not slot1): push old slot2->slot3, v->slot2
+shift_top2 v p2 p3 =
+  let _ = float_arr_set p3 0 (float_arr_get p2 0)
+  float_arr_set p2 0 v
+ins_top3 v p1 p2 p3 =
+  if v > (float_arr_get p1 0) then shift_top1 v p1 p2 p3
+  else (if v > (float_arr_get p2 0) then shift_top2 v p2 p3
+        else (if v > (float_arr_get p3 0) then float_arr_set p3 0 v else 0))
+locmax_scan P Sm k nb p1 p2 p3 =
+  if k >= nb then 0
+  else
+    let lo = if (k - 1) >= 1 then float_arr_get Sm (k - 1) else 0.0
+    let hi = if (k + 1) <= (nb - 1) then float_arr_get Sm (k + 1) else 0.0
+    let _ = if (float_arr_get Sm k) > lo then
+              (if (float_arr_get Sm k) >= hi then ins_top3 (float_arr_get P k) p1 p2 p3 else 0)
+            else 0
+    locmax_scan P Sm (k + 1) nb p1 p2 p3
+
+-- occ_norm numerator: -6 dB (0.25*mx) occupied span in bins. Track lo/hi in cells.
+-- lo starts at nb, hi at 0; bins with P[k] >= pthr widen the span.
+occ_scan P k nb pthr locell hicell =
+  if k >= nb then 0
+  else
+    let _ = if (float_arr_get P k) >= pthr then
+              let _ = if (int_to_float k) < (float_arr_get locell 0) then float_arr_set locell 0 (int_to_float k) else 0
+              (if (int_to_float k) > (float_arr_get hicell 0) then float_arr_set hicell 0 (int_to_float k) else 0)
+            else 0
+    occ_scan P (k + 1) nb pthr locell hicell
+
+-- squared-signal window: ywin[i] = ((y[i]-ym)/ysd) * Hann, y[i]=(f[i]-mean)^2. Two passes
+-- (mean of y, then variance) accumulate into cells; the final fill writes re2/im2.
+sumsqsig f i n mean cell =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + d * d)
+    sumsqsig f (i + 1) n mean cell
+sumsqvar f i n mean ym cell =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let y = d * d
+    let yc = y - ym
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + yc * yc)
+    sumsqvar f (i + 1) n mean ym cell
+fill_sqspec f re2 im2 i n mean ym ysd twopi =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let y = d * d
+    let yc = (y - ym) / ysd
+    let w = 0.5 - 0.5 * (cos (twopi * (int_to_float i) / (int_to_float (n - 1))))
+    let _ = float_arr_set re2 i (yc * w)
+    let _ = float_arr_set im2 i 0.0
+    fill_sqspec f re2 im2 (i + 1) n mean ym ysd twopi
+-- squared-spectrum total power (bins 1..nb-1) into cell0
+sq_total re2 im2 k nb cell =
+  if k >= nb then 0
+  else
+    let pr = float_arr_get re2 k
+    let pii = float_arr_get im2 k
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + pr * pr + pii * pii)
+    sq_total re2 im2 (k + 1) nb cell
+-- dominant squared-spectrum line in the symbol band [klo,khi): track max power + arg in cells
+sq_band re2 im2 k khi mxcell argcell =
+  if k >= khi then 0
+  else
+    let pr = float_arr_get re2 k
+    let pii = float_arr_get im2 k
+    let p = pr * pr + pii * pii
+    let _ = if p > (float_arr_get mxcell 0) then
+              let _ = float_arr_set mxcell 0 p
+              float_arr_set argcell 0 (int_to_float k)
+            else 0
+    sq_band re2 im2 (k + 1) khi mxcell argcell
+
+-- compute features 10..17 into F[off+10 .. off+17]. re/im hold the (already-computed) main
+-- FFT; re2/im2 are scratch for the squared-signal FFT. P/Sm are scratch power arrays.
+-- mx = main-spectrum peak power (acc[2]); mu_bin = sumkp/ps; ps = acc[0]+eps.
+feat_store_v3 f n re im re2 im2 P Sm twopi nbins ps mx mu_bin F off =
+  let _ = fill_power re im P 1 nbins
+  -- bw (feature 12)
+  let bwcell = float_arr_new 1 0.0
+  let _ = bw_acc P 1 nbins mu_bin bwcell
+  let bw = (sqrt ((float_arr_get bwcell 0) / ps)) / (int_to_float nbins)
+  -- smoothed spectrum + npeaks (feature 11) + top-3 local maxima
+  let _ = fill_smooth P Sm 1 nbins
+  let smxcell = float_arr_new 1 0.0
+  let _ = smax_acc Sm 1 nbins smxcell
+  let smx = float_arr_get smxcell 0
+  let npkcell = float_arr_new 1 0.0
+  let _ = npk_acc Sm 1 nbins (0.25 * smx) smx npkcell
+  let npeaks = (float_arr_get npkcell 0) / (int_to_float nbins)
+  let p1c = float_arr_new 1 0.0
+  let p2c = float_arr_new 1 0.0
+  let p3c = float_arr_new 1 0.0
+  let _ = locmax_scan P Sm 1 nbins p1c p2c p3c
+  let p1 = float_arr_get p1c 0
+  let p2 = float_arr_get p2c 0
+  let p3 = float_arr_get p3c 0
+  let peak2 = p2 / ps
+  let peak3 = p3 / ps
+  let p2p1 = p2 / (p1 + 0.000000000001)
+  -- occ_norm (feature 16): -6 dB occupied bandwidth / Nyquist
+  let locell = float_arr_new 1 (int_to_float nbins)
+  let hicell = float_arr_new 1 0.0
+  let _ = occ_scan P 1 nbins (0.25 * mx) locell hicell
+  let occ_lo = float_arr_get locell 0
+  let occ_hi = float_arr_get hicell 0
+  let occ_bins = if occ_hi >= occ_lo then (occ_hi - occ_lo) else 0.0
+  let occ_norm = (occ_bins * (48000.0 / (int_to_float n))) / (48000.0 / 2.0)
+  -- squared-signal spectrum -> sq_sharp (15) + baud_norm (17)
+  let smean = float_arr_new 1 0.0
+  let _ = sumf f 0 n smean
+  let mean = (float_arr_get smean 0) / (int_to_float n)
+  let symc = float_arr_new 1 0.0
+  let _ = sumsqsig f 0 n mean symc
+  let ym = (float_arr_get symc 0) / (int_to_float n)
+  let yvc = float_arr_new 1 0.0
+  let _ = sumsqvar f 0 n mean ym yvc
+  let ysd = (sqrt ((float_arr_get yvc 0) / (int_to_float n))) + 0.000000001
+  let _ = fill_sqspec f re2 im2 0 n mean ym ysd twopi
+  let _ = fft re2 im2 n
+  let sqtc = float_arr_new 1 0.0
+  let _ = sq_total re2 im2 1 nbins sqtc
+  let p2tot = (float_arr_get sqtc 0) + 0.000000000001
+  -- symbol-clock band [200,12000] Hz -> bins. to_int is float-only; use integer / and *.
+  let klo0 = (200 * n) / 48000
+  let klo = if klo0 < 1 then 1 else klo0
+  let khi0 = (12000 * n) / 48000
+  let khi = if khi0 > nbins then nbins else khi0
+  let mxbcell = float_arr_new 1 0.0
+  let argbcell = float_arr_new 1 0.0
+  let _ = sq_band re2 im2 klo khi mxbcell argbcell
+  let sq_sharp = (float_arr_get mxbcell 0) / p2tot
+  let argb = float_arr_get argbcell 0
+  let baud_hz = if argb > 0.0 then (argb * (48000.0 / (int_to_float n))) else 0.0
+  let baud_norm = baud_hz / (48000.0 / 2.0)
+  -- store in featlib_v3 order: 10 peak2, 11 npeaks, 12 bw, 13 p2p1, 14 peak3, 15 sq_sharp, 16 occ_norm, 17 baud_norm
+  let _ = float_arr_set F (off + 10) peak2
+  let _ = float_arr_set F (off + 11) npeaks
+  let _ = float_arr_set F (off + 12) bw
+  let _ = float_arr_set F (off + 13) p2p1
+  let _ = float_arr_set F (off + 14) peak3
+  let _ = float_arr_set F (off + 15) sq_sharp
+  let _ = float_arr_set F (off + 16) occ_norm
+  let _ = float_arr_set F (off + 17) baud_norm
+  0
+
+-- compute the 18 features of window f (len n) into F at offset off
+feat_store f n re im re2 im2 P Sm twopi F off =
   let cm = float_arr_new 1 0.0
   let _ = sumf f 0 n cm
   let mean = (float_arr_get cm 0) / (int_to_float n)
@@ -218,6 +438,11 @@ feat_store f n re im twopi F off =
   let _ = float_arr_set F (off + 7) hf
   let _ = float_arr_set F (off + 8) lf
   let _ = float_arr_set F (off + 9) dom
+  -- RFML-4: features 10..17 (5 gain-invariant + 3 v3 cyclostationary). mx = peak power
+  -- (acc[2]); mu_bin = sumkp/ps (acc[1]/ps). re/im still hold the main FFT for P[k] reuse.
+  let mx = float_arr_get acc 2
+  let mu_bin = (float_arr_get acc 1) / ps
+  let _ = feat_store_v3 f n re im re2 im2 P Sm twopi nbins ps mx mu_bin F off
   0
 
 load_win bytes f base i n =
@@ -225,18 +450,18 @@ load_win bytes f base i n =
   else
     let _ = float_arr_set f i (int_to_float (s16_at bytes (base + i)))
     load_win bytes f base (i + 1) n
-ff_loop bytes F f re im twopi nwin w =
+ff_loop bytes F f re im re2 im2 P Sm twopi nwin w =
   if w >= nwin then 0
   else
     let _ = load_win bytes f (w * 4096) 0 4096
-    let _ = feat_store f 4096 re im twopi F (w * 10)
-    ff_loop bytes F f re im twopi nwin (w + 1)
--- featurize a whole s16 file into F (10 cols/row); returns window count
-featurize_file path F f re im twopi =
+    let _ = feat_store f 4096 re im re2 im2 P Sm twopi F (w * 18)
+    ff_loop bytes F f re im re2 im2 P Sm twopi nwin (w + 1)
+-- featurize a whole s16 file into F (18 cols/row); returns window count
+featurize_file path F f re im re2 im2 P Sm twopi =
   let bytes = read_bytes path
   let ns = (arr_len bytes) / 2
   let nwin = ns / 4096
-  let _ = ff_loop bytes F f re im twopi nwin 0
+  let _ = ff_loop bytes F f re im re2 im2 P Sm twopi nwin 0
   nwin
 
 -- ---- labels: single-digit class id per line ----
@@ -262,16 +487,16 @@ read_labels path y =
 sum_col F n col i acc =
   if i >= n then 0
   else
-    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get F (i * 10 + col)))
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get F (i * 18 + col)))
     sum_col F n col (i + 1) acc
 ssq_col F n col mu i acc =
   if i >= n then 0
   else
-    let d = (float_arr_get F (i * 10 + col)) - mu
+    let d = (float_arr_get F (i * 18 + col)) - mu
     let _ = float_arr_set acc 0 ((float_arr_get acc 0) + d * d)
     ssq_col F n col mu (i + 1) acc
 fit_stats F n col mu sg =
-  if col >= 10 then 0
+  if col >= 18 then 0
   else
     let a1 = float_arr_new 1 0.0
     let _ = sum_col F n col 0 a1
@@ -283,21 +508,21 @@ fit_stats F n col mu sg =
     let _ = float_arr_set sg col ((sqrt v) + 0.000000001)
     fit_stats F n (col + 1) mu sg
 zs_col F off f mu sg =
-  if f >= 10 then 0
+  if f >= 18 then 0
   else
     let _ = float_arr_set F (off + f) (((float_arr_get F (off + f)) - (float_arr_get mu f)) / (float_arr_get sg f))
     zs_col F off (f + 1) mu sg
 zscore F n i mu sg =
   if i >= n then 0
   else
-    let _ = zs_col F (i * 10) 0 mu sg
+    let _ = zs_col F (i * 18) 0 mu sg
     zscore F n (i + 1) mu sg
 
--- ---- softmax classifier (W is 5x10 row-major, b is 5) ----
+-- ---- softmax classifier (W is 5x18 row-major, b is 5) ----
 dot_cf F off W c f acc =
-  if f >= 10 then float_arr_get acc 0
+  if f >= 18 then float_arr_get acc 0
   else
-    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get W (c * 10 + f)) * (float_arr_get F (off + f)))
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + (float_arr_get W (c * 18 + f)) * (float_arr_get F (off + f)))
     dot_cf F off W c (f + 1) acc
 clog F off W b lg c =
   if c >= 5 then 0
@@ -334,10 +559,10 @@ softmax lg p =
   norm_p p 5 0 s
 
 update_feats W F off c err lr f =
-  if f >= 10 then 0
+  if f >= 18 then 0
   else
-    let wv = float_arr_get W (c * 10 + f)
-    let _ = float_arr_set W (c * 10 + f) (wv - lr * (err * (float_arr_get F (off + f)) + 0.001 * wv))
+    let wv = float_arr_get W (c * 18 + f)
+    let _ = float_arr_set W (c * 18 + f) (wv - lr * (err * (float_arr_get F (off + f)) + 0.001 * wv))
     update_feats W F off c err lr (f + 1)
 update_classes F off W b p yi lr c =
   if c >= 5 then 0
@@ -354,7 +579,7 @@ train_sample F off W b yi lr lg p =
 train_epoch F W b y n lr i lg p =
   if i >= n then 0
   else
-    let _ = train_sample F (i * 10) W b (arr_get y i) lr lg p
+    let _ = train_sample F (i * 18) W b (arr_get y i) lr lg p
     train_epoch F W b y n lr (i + 1) lg p
 train_all F W b y n lr epochs e lg p =
   if e >= epochs then 0
@@ -383,14 +608,14 @@ predict_row F off W b lg =
 eval_loop F n W b y i lg correct =
   if i >= n then 0
   else
-    let pr = predict_row F (i * 10) W b lg
+    let pr = predict_row F (i * 18) W b lg
     let _ = if pr == (arr_get y i) then arr_set correct 0 ((arr_get correct 0) + 1) else 0
     eval_loop F n W b y (i + 1) lg correct
 -- tally predicted classes into counts[5]
 tally_loop F n W b i lg counts =
   if i >= n then 0
   else
-    let pr = predict_row F (i * 10) W b lg
+    let pr = predict_row F (i * 18) W b lg
     let _ = arr_set counts pr ((arr_get counts pr) + 1)
     tally_loop F n W b (i + 1) lg counts
 
@@ -398,13 +623,13 @@ tally_loop F n W b i lg counts =
 cs_loop F y n c f i cell =
   if i >= n then 0
   else
-    let _ = if (arr_get y i) == c then float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get F (i * 10 + f))) else 0
+    let _ = if (arr_get y i) == c then float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get F (i * 18 + f))) else 0
     cs_loop F y n c f (i + 1) cell
 ss_loop F y n c f m i cell =
   if i >= n then 0
   else
     let _ = if (arr_get y i) == c then
-              let d = (float_arr_get F (i * 10 + f)) - m
+              let d = (float_arr_get F (i * 18 + f)) - m
               float_arr_set cell 0 ((float_arr_get cell 0) + d * d)
             else 0
     ss_loop F y n c f m (i + 1) cell
@@ -414,15 +639,15 @@ count_into y n c i cell =
     let _ = if (arr_get y i) == c then float_arr_set cell 0 ((float_arr_get cell 0) + 1.0) else 0
     count_into y n c (i + 1) cell
 cent_cols F y n c nc cent cstd f =
-  if f >= 10 then 0
+  if f >= 18 then 0
   else
     let s1 = float_arr_new 1 0.0
     let _ = cs_loop F y n c f 0 s1
     let m = (float_arr_get s1 0) / nc
-    let _ = float_arr_set cent (c * 10 + f) m
+    let _ = float_arr_set cent (c * 18 + f) m
     let s2 = float_arr_new 1 0.0
     let _ = ss_loop F y n c f m 0 s2
-    let _ = float_arr_set cstd (c * 10 + f) ((sqrt ((float_arr_get s2 0) / nc)) + 0.001)
+    let _ = float_arr_set cstd (c * 18 + f) ((sqrt ((float_arr_get s2 0) / nc)) + 0.001)
     cent_cols F y n c nc cent cstd (f + 1)
 fit_centroids F y n cent cstd c =
   if c >= 5 then 0
@@ -433,9 +658,9 @@ fit_centroids F y n cent cstd c =
     let _ = cent_cols F y n c nc cent cstd 0
     fit_centroids F y n cent cstd (c + 1)
 dist_feats F off cent cstd c f acc =
-  if f >= 10 then 0
+  if f >= 18 then 0
   else
-    let z = ((float_arr_get F (off + f)) - (float_arr_get cent (c * 10 + f))) / (float_arr_get cstd (c * 10 + f))
+    let z = ((float_arr_get F (off + f)) - (float_arr_get cent (c * 18 + f))) / (float_arr_get cstd (c * 18 + f))
     let _ = float_arr_set acc 0 ((float_arr_get acc 0) + z * z)
     dist_feats F off cent cstd c (f + 1) acc
 nov_scan F off cent cstd c bc =
@@ -443,7 +668,7 @@ nov_scan F off cent cstd c bc =
   else
     let acc = float_arr_new 1 0.0
     let _ = dist_feats F off cent cstd c 0 acc
-    let d = sqrt ((float_arr_get acc 0) / 10.0)
+    let d = sqrt ((float_arr_get acc 0) / 18.0)
     let _ = if d < (float_arr_get bc 0) then float_arr_set bc 0 d else 0
     nov_scan F off cent cstd (c + 1) bc
 -- min diagonal-Mahalanobis distance to any class centroid (the novelty score)
@@ -455,14 +680,14 @@ novelty_one F off cent cstd =
 nov_stats F n cent cstd i sumc sqc =
   if i >= n then 0
   else
-    let nv = novelty_one F (i * 10) cent cstd
+    let nv = novelty_one F (i * 18) cent cstd
     let _ = float_arr_set sumc 0 ((float_arr_get sumc 0) + nv)
     let _ = float_arr_set sqc 0 ((float_arr_get sqc 0) + nv * nv)
     nov_stats F n cent cstd (i + 1) sumc sqc
 count_unknown F n cent cstd tau i unk =
   if i >= n then 0
   else
-    let nv = novelty_one F (i * 10) cent cstd
+    let nv = novelty_one F (i * 18) cent cstd
     let _ = if nv > tau then arr_set unk 0 ((arr_get unk 0) + 1) else 0
     count_unknown F n cent cstd tau (i + 1) unk
 
@@ -471,28 +696,33 @@ main =
   let f = float_arr_new 4096 0.0
   let re = float_arr_new 4096 0.0
   let im = float_arr_new 4096 0.0
-  -- featurize train + test + real
-  let Ftr = float_arr_new 12000 0.0
-  let ntr = featurize_file "data/modclass/train.s16" Ftr f re im twopi
-  let Fte = float_arr_new 4000 0.0
-  let nte = featurize_file "data/modclass/test.s16" Fte f re im twopi
-  let Fre = float_arr_new 7000 0.0
-  let nre = featurize_file "data/ais_clean_a.s16" Fre f re im twopi
+  -- RFML-4 scratch: squared-signal FFT buffers + per-bin power arrays for features 10..17
+  let re2 = float_arr_new 4096 0.0
+  let im2 = float_arr_new 4096 0.0
+  let P = float_arr_new 4096 0.0
+  let Sm = float_arr_new 4096 0.0
+  -- featurize train + test + real  (18 cols/row now)
+  let Ftr = float_arr_new 18000 0.0
+  let ntr = featurize_file "data/modclass/train.s16" Ftr f re im re2 im2 P Sm twopi
+  let Fte = float_arr_new 5400 0.0
+  let nte = featurize_file "data/modclass/test.s16" Fte f re im re2 im2 P Sm twopi
+  let Fre = float_arr_new 10000 0.0
+  let nre = featurize_file "data/ais_clean_a.s16" Fre f re im re2 im2 P Sm twopi
   -- labels
   let ytr = arr_new 1200 0
   let nlbl = read_labels "data/modclass/train.labels" ytr
   let yte = arr_new 400 0
   let nlte = read_labels "data/modclass/test.labels" yte
-  -- standardize all three with TRAIN stats
-  let mu = float_arr_new 10 0.0
-  let sg = float_arr_new 10 0.0
+  -- standardize all three with TRAIN stats (18 features)
+  let mu = float_arr_new 18 0.0
+  let sg = float_arr_new 18 0.0
   let _ = fit_stats Ftr ntr 0 mu sg
   let _ = zscore Ftr ntr 0 mu sg
   let _ = zscore Fte nte 0 mu sg
   let _ = zscore Fre nre 0 mu sg
   let _ = print (cat ["windows: train=", show ntr, " test=", show nte, " real=", show nre])
-  -- train softmax
-  let W = float_arr_new 50 0.0
+  -- train softmax (W is 5x18 row-major)
+  let W = float_arr_new 90 0.0
   let b = float_arr_new 5 0.0
   let lg = float_arr_new 5 0.0
   let p = float_arr_new 5 0.0
@@ -520,23 +750,27 @@ main =
                     " msk=", show (arr_get counts 4)]
   let _ = write_file "/tmp/modclass_result.txt" result
   let _ = print "WROTE /tmp/modclass_result.txt"
-  -- export the Rail-trained model so the edge node (pi_characterize.py) runs THIS model
-  let dump = join "\n" ["# audio softmax (rail-trained); classes: noise carrier afsk fsk msk; 10 feats: rough zcr flat peak cent kurt bimod hf lf dom",
-                        cat ["MU", frange mu 0 10 ""],
-                        cat ["SG", frange sg 0 10 ""],
-                        cat ["W0", frange W 0 10 ""],
-                        cat ["W1", frange W 10 20 ""],
-                        cat ["W2", frange W 20 30 ""],
-                        cat ["W3", frange W 30 40 ""],
-                        cat ["W4", frange W 40 50 ""],
+  -- export the Rail-trained model so the edge node (pi_characterize.py) runs THIS model.
+  -- 18-feature featlib_v3 coordinate system; `# COLS 0..17` so the served path indexes F[cols[j]]
+  -- (the fail-loud guard in pi_characterize.py also validates max(cols) < serving feats).
+  let dump = join "\n" ["# audio softmax (rail-trained, v3-18f); classes: noise carrier afsk fsk msk",
+                        "# feats(18): rough zcr flat peak cent kurt bimod hf lf dom peak2 npeaks bw p2p1 peak3 sq_sharp occ_norm baud_norm",
+                        "# COLS 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17",
+                        cat ["MU", frange mu 0 18 ""],
+                        cat ["SG", frange sg 0 18 ""],
+                        cat ["W0", frange W 0 18 ""],
+                        cat ["W1", frange W 18 36 ""],
+                        cat ["W2", frange W 36 54 ""],
+                        cat ["W3", frange W 54 72 ""],
+                        cat ["W4", frange W 72 90 ""],
                         cat ["B", frange b 0 5 ""]]
   let _ = write_file "models/audio_softmax.txt" dump
   let _ = print "WROTE models/audio_softmax.txt"
   -- open-set novelty model (same trained, standardized feature space): per-class centroids +
   -- spreads; UNKNOWN when diagonal-Mahalanobis to the nearest class > tau (=mean+2*std of train
   -- novelty, sort-free ~97th pctile). The node admits it hears something it can't name.
-  let cent = float_arr_new 50 0.0
-  let cstd = float_arr_new 50 0.0
+  let cent = float_arr_new 90 0.0
+  let cstd = float_arr_new 90 0.0
   let _ = fit_centroids Ftr ytr ntr cent cstd 0
   let nsum = float_arr_new 1 0.0
   let nsq = float_arr_new 1 0.0
@@ -547,14 +781,16 @@ main =
   let unk = arr_new 1 0
   let _ = if nre > 0 then count_unknown Fre nre cent cstd tau 0 unk else 0
   let _ = print (cat ["Gate C  novelty tau=", show_float tau, " real-unknown-windows=", show (arr_get unk 0), "/", show nre])
-  let novdump = join "\n" ["# open-set novelty (rail); diagonal-Mahalanobis to class centroids; UNKNOWN if score>TAU",
+  let novdump = join "\n" ["# open-set novelty (rail, v3-18f); diagonal-Mahalanobis to class centroids; UNKNOWN if score>TAU",
+                           "# feats(18): rough zcr flat peak cent kurt bimod hf lf dom peak2 npeaks bw p2p1 peak3 sq_sharp occ_norm baud_norm",
+                           "# COLS 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17",
                            cat ["TAU ", show_float tau],
-                           cat ["C0", frange cent 0 10 ""], cat ["C1", frange cent 10 20 ""],
-                           cat ["C2", frange cent 20 30 ""], cat ["C3", frange cent 30 40 ""],
-                           cat ["C4", frange cent 40 50 ""],
-                           cat ["S0", frange cstd 0 10 ""], cat ["S1", frange cstd 10 20 ""],
-                           cat ["S2", frange cstd 20 30 ""], cat ["S3", frange cstd 30 40 ""],
-                           cat ["S4", frange cstd 40 50 ""]]
+                           cat ["C0", frange cent 0 18 ""], cat ["C1", frange cent 18 36 ""],
+                           cat ["C2", frange cent 36 54 ""], cat ["C3", frange cent 54 72 ""],
+                           cat ["C4", frange cent 72 90 ""],
+                           cat ["S0", frange cstd 0 18 ""], cat ["S1", frange cstd 18 36 ""],
+                           cat ["S2", frange cstd 36 54 ""], cat ["S3", frange cstd 54 72 ""],
+                           cat ["S4", frange cstd 72 90 ""]]
   let _ = write_file "models/audio_novelty.txt" novdump
   let _ = print "WROTE models/audio_novelty.txt"
   0

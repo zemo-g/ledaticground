@@ -1,0 +1,111 @@
+-- ledaticground PAOS label record: the DECODER-AS-ORACLE made real (pure Rail, v=2).
+-- A PAOS label record exists ONLY for a CRC-verified AIS burst: pi_ais_decode.py emits a
+-- frame only after crc_res==0xF0B8, and ais_decode.rail prints DECODE_OK only after the
+-- bitwise CRC-16/X-25 check passes. That CRC-pass is the FACT half of the FACT/INFERENCE
+-- wall (docs/CHANNEL_INTELLIGENCE.md): the MMSI/type are CRC-verified FACT, so the burst
+-- becomes a LABELED training example for the PAOS specialist-model corpus.
+--
+-- Each label line in data/paos_labels.jsonl binds (per the PAOS LABEL RECORD SCHEMA):
+--   {v,kind:'paos_label',label_class,rfml_pred,agree,oracle:{src,mmsi,msg_type,crc_pass:1},
+--    feat:[18 floats],feat_lib:'featlib_v3-18f',snr_db,window_idx,iq_ref:'<cap>:<off>',
+--    node,pulse,ts_scrubbed}.
+-- INVARIANT: crc_pass is ALWAYS 1 by construction — a non-CRC-valid burst NEVER becomes a
+-- label. Disagreement (agree=0: rfml_pred != msk on a CRC-valid AIS burst) is KEPT — those
+-- are the highest-value training examples (the classifier was wrong on a verified signal).
+--
+-- THIS signer signs the BATCH, not a single line: it commits to the sha256 of the
+-- sorted-canonical (LC_ALL=C) paos_labels.jsonl batch the rollup staged. Same Ed25519 DEV
+-- seed + same pipe-string -> sign -> sha256 chain shape as ais_attest.rail / the contract.
+-- type=FACT (a CRC-verified labeled burst is a fact about what the node decoded + how the
+-- classifier labeled the window that carried it).
+--
+-- Run via the flock wrapper from the rail repo root so stdlib imports resolve:
+--   bash scripts/railrun.sh <abs>/src/paos_label_attest.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+main =
+  -- DEV signing key (NOT a production attestation authority — clearly labeled). Shares the
+  -- AIS/RFML DEV seed because the PAOS label corpus is the AIS decoder's oracle output; the
+  -- KIND token PAOS_LABEL_RECEIPT + model field disambiguate it from AIS/RFML receipts.
+  let seed = hex_to_bytes "a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a1500"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- product = the canonical (LC_ALL=C sorted) paos_labels.jsonl batch the rollup staged.
+  -- The label lines themselves are NOT embedded in the receipt; the digest commits to them
+  -- and the staged batch file IS the evidence (a verifier with the same labels recomputes
+  -- the identical digest). digest-canonical-byte-order rule: the rollup did the C-locale
+  -- sort, so this hash is stable across re-runs.
+  let product = field_or "/tmp/paos_labels_batch.txt" "PENDING_no_labels"
+  let batch_sha256 = sha256_hex product
+
+  -- Beacon anchor (staged by scripts/fetch_beacon_pulse.sh via the rollup). Honest fallback:
+  -- PENDING_beacon_unreachable — the receipt is STILL signed+chained. NEVER pulse_id=0.
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING"
+
+  -- prev-hash chaining (tail chain_hash of data/paos_label_receipts.jsonl, or GENESIS).
+  let prev = field_or "/tmp/paos_prev_sha.txt" "GENESIS"
+
+  -- Batch provenance BOUNDS + counts (staged by the rollup; integer parsing done in bash).
+  let batch_start = field_or "/tmp/paos_batch_start.txt" "PENDING_batch_start"
+  let batch_end = field_or "/tmp/paos_batch_end.txt" "PENDING_batch_end"
+  let label_count = field_or "/tmp/paos_label_count.txt" "0"
+  let agree_count = field_or "/tmp/paos_agree_count.txt" "0"
+
+  -- Node / station identity; receiver geo PENDING until GPS-PPS (never fabricated). The
+  -- decoded MMSI in a label is the VESSEL's identity, distinct from the receiver location.
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let node = sta
+  let band = "AIS-161.975MHz-PAOS-labels"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  -- The feature/label coordinate system the corpus uses (RECEIPT_CONTRACT feature contract).
+  let model = field_or "/tmp/paos_feat_lib.txt" "featlib_v3-18f"
+
+  -- v=2 FACT receipt. Field order is LOAD-BEARING (the sig is over this exact string). The
+  -- PAOS honesty slot is label_count + agree_count (crc_pass is invariantly 1 by
+  -- construction — encoded by the kind contract, not a per-record bit).
+  let receipt = join "|" ["PAOS_LABEL_RECEIPT", "v=2", "type=FACT", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", label_count], cat ["label_count=", label_count], cat ["agree_count=", agree_count], cat ["model=", model], cat ["product_sha256=", batch_sha256], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sig = ed25519_sign seed msg mlen
+  let sig_hex = bytes_to_hex sig 64
+
+  let verify_ok = ed25519_verify pk msg mlen sig
+  let tstr = cat [receipt, "X"]
+  let tmsg = string_to_bytes tstr
+  let tlen = string_length_bytes tstr
+  let tamper_ok = ed25519_verify pk tmsg tlen sig
+  let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+  let _ = print (cat ["LABELS   count=", label_count, " agree=", agree_count, " feat_lib=", model])
+  let _ = print (cat ["BATCHSHA ", batch_sha256])
+  let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["SIG      ", sig_hex])
+  let _ = print (cat ["CHAIN    ", chain_hash])
+  let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+  let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+  -- v=2 JSON ledger line — SPACE-AFTER-COLON on receipt/sig/signer/chain_hash is LOAD-BEARING
+  -- for verify.rail's field_val. Append to the chained PAOS-label ledger via append_line.
+  let jline = cat ["{\"v\":2,\"type\":\"FACT\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/paos_label_receipts.jsonl" jline
+  let _ = print "APPENDED data/paos_label_receipts.jsonl"
+
+  -- Legacy single-object write (backward compat with verify.rail single-object mode).
+  let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/paos_label_receipt.json" jrec
+  let _ = print "WROTE data/paos_label_receipt.json"
+  0

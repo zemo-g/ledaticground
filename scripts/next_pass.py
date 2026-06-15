@@ -23,11 +23,17 @@
 import sys, time
 
 GD = "/Users/ledaticempire/projects/ledaticground"
-TLE = f"{GD}/data/tle_weather.txt"
 LAT, LON = 42.31, -83.08                      # Detroit Salsa Co (geometry only; receipt geo stays PENDING)
-MIN_EL = int(sys.argv[sys.argv.index('--minel') + 1]) if '--minel' in sys.argv else 25
+# --constellation orbcomm : load data/tle_orbcomm.txt + the Orbcomm in-band downlinks
+#   (137.2-137.8 MHz, MODE=ORBCOMM); single best-elevation Orbcomm pass for --once.
+#   Same SATS-dict extension + same SGP4 engine as autocap/enum_passes.py.
+CONST  = (sys.argv[sys.argv.index('--constellation') + 1].lower()
+          if '--constellation' in sys.argv else 'weather')
 HOURS  = int(sys.argv[sys.argv.index('--hours') + 1]) if '--hours' in sys.argv else 24
 ALL    = '--all' in sys.argv
+# Orbcomm carriers detectable lower than LRPT images -> default MINEL 25 for orbcomm.
+_DEF_MINEL = 25
+MIN_EL = int(sys.argv[sys.argv.index('--minel') + 1]) if '--minel' in sys.argv else _DEF_MINEL
 
 # name -> (downlink Hz, mode). Transmitter ground truth verified 2026-06-10
 # (SatNOGS DB + usradioguy): NOAA 15/19 APT decommissioned Aug 2025 — the APT mode
@@ -43,6 +49,22 @@ SATS = {
 }
 WANT = SATS if ALL else {k: v for k, v in SATS.items() if v[1] == "APT"}
 
+# Orbcomm in-band downlinks (137.2-137.8 MHz, SD-PSK ~4800 sym/s; representative
+# channels per the design — confirm exact per-sat downlink before live capture).
+# Keep in sync with autocap/enum_passes.py.
+ORBCOMM_CHANNELS = [137250000, 137440000, 137662500, 137737500]
+
+
+def _orbcomm_freq(name):
+    digits = ''.join(c for c in name if c.isdigit())
+    return ORBCOMM_CHANNELS[(int(digits) if digits else 0) % len(ORBCOMM_CHANNELS)]
+
+
+if CONST == 'orbcomm':
+    TLE = f"{GD}/data/tle_orbcomm.txt"
+else:
+    TLE = f"{GD}/data/tle_weather.txt"
+
 try:
     from skyfield.api import load, wgs84, EarthSatellite
     from datetime import timedelta
@@ -53,7 +75,11 @@ try:
     i = 0
     while i < len(lines) - 2:
         nm = lines[i].strip()
-        if nm in WANT and lines[i + 1].startswith('1 ') and lines[i + 2].startswith('2 '):
+        if CONST == 'orbcomm':
+            want = ('ORBCOMM' in nm.upper())
+        else:
+            want = (nm in WANT)
+        if want and lines[i + 1].startswith('1 ') and lines[i + 2].startswith('2 '):
             sats[nm] = EarthSatellite(lines[i + 1], lines[i + 2], nm, ts); i += 3
         else:
             i += 1
@@ -82,14 +108,24 @@ try:
     if not passes:
         print("NONE"); sys.exit(0)
 
-    p = passes[0]
+    # weather/APT/LRPT: the EARLIEST pass (the scheduler captures them in order).
+    # orbcomm: the SINGLE BEST (highest-elevation) upcoming pass — many sats overlap
+    # and the best SNR (given no LNA) is the highest bird; matches enum_passes.py's
+    # best-per-slot policy for the --once capture decision.
+    if CONST == 'orbcomm':
+        p = max(passes, key=lambda q: q['maxel'])
+    else:
+        p = passes[0]
     aos = p['aos'].utc_datetime(); los = p['los'].utc_datetime()
     aos_epoch = int(aos.timestamp())
     mins = max(0, round((aos_epoch - int(time.time())) / 60))
     dur  = max(1, round((los - aos).total_seconds() / 60))
     elev = round(p['maxel'])
     sat  = p['name']
-    freq, mode = SATS[sat]
+    if CONST == 'orbcomm':
+        freq, mode = _orbcomm_freq(sat), 'ORBCOMM'
+    else:
+        freq, mode = SATS[sat]
     print(f'SAT="{sat}" MINS={mins} DUR={dur} ELEV={elev} FREQ={freq} MODE={mode} AOS_EPOCH={aos_epoch}')
 except Exception as e:
     sys.stderr.write(f"next_pass.py: {e}\n")

@@ -84,7 +84,7 @@ ck "same 2-of-3 voting recovers" "$o" "026163"
 $PY scripts/gen_modclass.py >/dev/null 2>&1
 $RN src/modclass.rail >/dev/null 2>&1
 o=$(perl -e 'alarm 150;exec @ARGV' /tmp/rail_out 2>/dev/null)
-ck "rfml modclass held-out >=95% (rail-trained softmax)" "$o" "accuracy: 2[89][0-9]/300"
+ck "rfml modclass held-out >=95% (rail-trained softmax)" "$o" "accuracy: 2[89][0-9]/300\|accuracy: 300/300"
 # RFML rung: parameter head recovers a known carrier center-offset (pure-Rail estimator)
 $PY -c "import numpy as np;v=round(2400*65534/48000);(np.full(8192,v)+np.random.RandomState(1).randint(-2,3,8192)).astype('<i2').tofile('/tmp/modfeat_in.s16')"
 $RN src/modparam.rail >/dev/null 2>&1
@@ -98,7 +98,7 @@ ck "rfml attest verify=1" "$o" "own-sig accepted = 1"; ck "rfml attest tamper=0"
 $PY scripts/gen_modclass_iq.py >/dev/null 2>&1
 $RN src/modclass_iq.rail >/dev/null 2>&1
 o=$(perl -e 'alarm 150;exec @ARGV' /tmp/rail_out 2>/dev/null)
-ck "rfml IQ characterizer held-out >=95% (rail-trained)" "$o" "accuracy: 29[0-9]/300"
+ck "rfml IQ characterizer held-out >=95% (rail-trained)" "$o" "accuracy: 29[0-9]/300\|accuracy: 300/300"
 # RFML rung: edge characterizer (pure-python, NO numpy — the Pi path) runs the Rail-trained
 # weights (models/audio_softmax.txt, written by the modclass gate above) on a known signal.
 $PY -c "import numpy as np,scripts.gen_modclass as G;r=np.random.default_rng(7);np.concatenate([G.make_window('fsk',4096,r) for _ in range(20)]).tofile('/tmp/char_test.s16')"
@@ -112,4 +112,37 @@ ck "rfml novelty flags a novel modulation UNKNOWN" "$o" "\"unknown_windows\": [2
 printf '{"survey":"selftest","entries":[{"freq_mhz":161.975,"heard":"msk"}]}\n' > "$GD/data/rf_survey.json"
 o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/survey_attest.rail 2>/dev/null)
 ck "rf-survey attest verify=1" "$o" "own-sig accepted = 1"; ck "rf-survey attest tamper=0" "$o" "modified-msg accepted = 0"
+# RS41 radiosonde rung: SYNTHETIC end-to-end (gen GFSK frame -> demod -> descramble -> RS(255,231)
+# FCR=0 -> per-block CRC16-CCITT -> ECEF->WGS84 -> 2 receipts). Live 400 MHz RX is hardware-blocked
+# (the halo is 137 MHz only; needs a separate 400 MHz antenna) -- the SOFTWARE chain validates here.
+# RS41-2 demod (GFSK 2-FSK polar discriminator recovers planted channel bits)
+$PY scripts/gen_rs41_demod.py --snr 25 >/dev/null 2>&1
+o=$(bash scripts/railrun.sh $GD/src/rs41_demod.rail 2>/dev/null); echo "$o" | grep "^BITS" > /tmp/rs41_demod_out.txt
+if $PY scripts/check_rs41_demod.py /tmp/rs41_demod_out.txt >/dev/null 2>&1; then r=OK; else r=BAD; fi
+ck "rs41 demod recovers planted bits" "$r" "OK"
+# RS41-4 RS(255,231) FCR=0 I=2 corrects up to 12 byte errors/codeword
+$PY scripts/gen_rs41_rs.py --nerr 12 >/dev/null 2>&1
+o=$(bash scripts/railrun.sh $GD/src/rs41_rs.rail 2>/dev/null); echo "$o" > /tmp/rs41_rs_out.txt
+if $PY scripts/check_rs41_rs.py /tmp/rs41_rs_out.txt >/dev/null 2>&1; then r=OK; else r=BAD; fi
+ck "rs41 RS(255,231) FCR=0 corrects 12 err/cw" "$r" "OK"
+# RS41-5 full-chain decode: recovers serial/frame#/ECEF byte-exact + lat/lon/alt + END_TO_END PASS
+$PY scripts/gen_rs41_decode.py --snr 25 >/dev/null 2>&1
+o=$(bash scripts/railrun.sh $GD/src/rs41_decode.rail 2>/dev/null); echo "$o" > /tmp/rs41_decode_out.txt
+if $PY scripts/check_rs41_decode.py /tmp/rs41_decode_out.txt >/dev/null 2>&1; then r=OK; else r=BAD; fi
+ck "rs41 full-chain decode (serial/ECEF/WGS84)" "$r" "OK"
+# RS41-6 two-receipt attest: DECODE fact + INFERENCE bound to it (verify=1 tamper=0 derived_from=chainA)
+$PY scripts/gen_rs41_attest.py --snr 25 >/dev/null 2>&1
+o=$(bash scripts/railrun.sh $GD/src/rs41_attest.rail 2>/dev/null); echo "$o" > /tmp/rs41_attest_out.txt
+if $PY scripts/check_rs41_attest.py /tmp/rs41_attest_out.txt >/dev/null 2>&1; then r=OK; else r=BAD; fi
+ck "rs41 attest (DECODE fact + INFERENCE bound)" "$r" "OK"
+# BIASTEE-1 fail-closed interlock: 'on' with no LNA declared REFUSES (exit 1, rtl_biast NOT invoked)
+rm -f /tmp/st_biast_calls.log; printf '#!/bin/bash\necho "$*" >> /tmp/st_biast_calls.log\n' > /tmp/st_biast_stub.sh; chmod +x /tmp/st_biast_stub.sh
+HOME=/tmp/st_fake_home_none RTL_BIAST=/tmp/st_biast_stub.sh bash scripts/autocap/bias_tee.sh on >/dev/null 2>&1; rc=$?
+ncalls=$(wc -l < /tmp/st_biast_calls.log 2>/dev/null | tr -d ' '); ncalls=${ncalls:-0}
+if [ "$rc" = 1 ] && [ "$ncalls" = 0 ]; then b=OK; else b=BAD; fi
+ck "biastee fail-closed (refuse, no rtl_biast)" "$b" "OK"
+# rs41_capture.sh refuses on the 137 MHz halo (no fabricated 400 MHz capture)
+o=$(bash scripts/rs41_capture.sh 2>&1); rc=$?
+if [ "$rc" = 2 ] && echo "$o" | grep -q "BLOCKER: needs 400 MHz antenna"; then c=OK; else c=BAD; fi
+ck "rs41_capture antenna-blocker (refuse on halo)" "$c" "OK"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

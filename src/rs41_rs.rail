@@ -1,0 +1,264 @@
+-- ledaticground RS41 rung 4: RS(255,231) shortened/full error-correct (pure Rail).
+-- Reuses the GF(256)/0x11D Reed-Solomon engine of src/rs.rail VERBATIM (the field is
+-- IDENTICAL to RS41: GF(256), primitive poly 0x11D=285, alpha=2). The ONLY RS41 deltas:
+--   * NPAR = 24 (not 32)  -> RS(255,231), corrects up to 12 byte errors per codeword
+--   * FCR  = 0  (RS41 first-consecutive-root 0, vs LRPT's FCR=1)
+--   * I    = 2 interleave (not 4)
+-- The Berlekamp-Massey / Chien / Forney algebra is field-generic and UNCHANGED; only the
+-- syndrome root exponent (FCR+j) and the Forney first-root factor X^(1-FCR) move with FCR.
+--
+-- FCR=0 Forney correction: e_i = X_i^(1-FCR) * Omega(X_i^-1) / Lambda'(X_i^-1), where
+-- X_i = alpha^i is the error locator. For FCR=1 (rs.rail) X_i^0 = 1 (no factor). For
+-- FCR=0 the magnitude carries an extra factor X_i = alpha^i. This is the single algebraic
+-- change from the LRPT engine; everything else is copied.
+--
+-- A 510-byte RS block (= 2 x 255, 2-interleaved) carries cw0/cw1 column-interleaved:
+-- cw_k[i] = cadu[i*2 + k]. Reads /tmp/rs41_rs_in.s8 (510 bytes). Emits per codeword:
+--   "CW<k> nerr=<e> L=<L> corrected_ok=<0|1> DATA <231 decimal bytes>"
+-- (the rs.rail line contract, 231 data bytes for RS41 instead of 223).
+--
+-- RAIL traps: every recursion carries int indices, loop-carried scalars live in 1-element
+-- int array cells, GF arithmetic via bit_xor builtin; malloc/free/byte_at are BUILTINS,
+-- never declared foreign -> int (would tag the 64-bit pointer as a 63-bit int).
+--
+-- Run: bash scripts/railrun.sh <ledaticground>/src/rs41_rs.rail
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+
+-- ---- GF(256): exp[0..511] (doubled for index wrap), log[0..255]. alpha=2, poly 0x11D=285.
+gf_build expt logt i x =
+  if i >= 255 then 0
+  else
+    let _ = arr_set expt i x
+    let _ = arr_set logt x i
+    let dbl = shl x 1
+    let nx = if dbl >= 256 then bit_xor dbl 285 else dbl
+    gf_build expt logt (i + 1) nx
+gf_ext expt i =
+  if i >= 512 then 0
+  else
+    let _ = arr_set expt i (arr_get expt (i - 255))
+    gf_ext expt (i + 1)
+
+gmul expt logt a b =
+  if a == 0 then 0
+  else if b == 0 then 0
+  else arr_get expt (((arr_get logt a) + (arr_get logt b)) % 255)
+gdiv expt logt a b =
+  if a == 0 then 0
+  else arr_get expt (((arr_get logt a) - (arr_get logt b) + 255) % 255)
+galpha expt p = arr_get expt (p % 255)
+
+-- ---- I=2 column de-interleave: codeword k, byte i = cadu[i*I + k] ----
+deinterleave cadu cw ii k i =
+  if i >= 255 then 0
+  else
+    let _ = arr_set cw i (arr_get cadu (i * ii + k))
+    deinterleave cadu cw ii k (i + 1)
+
+-- ---- Syndromes S[j] = cw(alpha^(FCR+j)) via Horner; cw[0]=highest degree (x^254) ----
+syn_horner expt logt cw root i scell =
+  if i >= 255 then 0
+  else
+    let _ = arr_set scell 0 (bit_xor (gmul expt logt (arr_get scell 0) root) (arr_get cw i))
+    syn_horner expt logt cw root (i + 1) scell
+calc_syndromes expt logt cw synd npar fcr j =
+  if j >= npar then 0
+  else
+    let root = galpha expt (fcr + j)
+    let sc = arr_new 1 0
+    let _ = syn_horner expt logt cw root 0 sc
+    let _ = arr_set synd j (arr_get sc 0)
+    calc_syndromes expt logt cw synd npar fcr (j + 1)
+syndromes_nonzero synd npar j =
+  if j >= npar then 0
+  else if (arr_get synd j) != 0 then 1
+  else syndromes_nonzero synd npar (j + 1)
+
+-- ---- Berlekamp-Massey (field-generic, copied from rs.rail) ----
+poly_copy src dst n i = if i > n then 0 else let _ = arr_set dst i (arr_get src i) in poly_copy src dst n (i + 1)
+poly_zero a n i = if i > n then 0 else let _ = arr_set a i 0 in poly_zero a n (i + 1)
+
+bm_disc expt logt lam synd r ll i dcell =
+  if i > ll then 0
+  else
+    let _ = arr_set dcell 0 (bit_xor (arr_get dcell 0) (gmul expt logt (arr_get lam i) (arr_get synd (r - i))))
+    bm_disc expt logt lam synd r ll (i + 1) dcell
+bm_shift expt logt lam b t coef m npar i =
+  if i > npar then 0
+  else
+    let bsh = if (i - m) < 0 then 0 else arr_get b (i - m)
+    let _ = arr_set t i (bit_xor (arr_get lam i) (gmul expt logt coef bsh))
+    bm_shift expt logt lam b t coef m npar (i + 1)
+
+berlekamp expt logt synd npar lam b t lcell mcell =
+  let _ = poly_zero lam npar 0
+  let _ = poly_zero b npar 0
+  let _ = arr_set lam 0 1
+  let _ = arr_set b 0 1
+  let _ = arr_set lcell 0 0
+  let _ = arr_set mcell 0 1
+  let bdc = arr_new 1 1
+  let _ = bm_loop expt logt synd npar lam b t lcell mcell bdc 0
+  0
+bm_loop expt logt synd npar lam b t lcell mcell bdc r =
+  if r >= npar then 0
+  else
+    let ll = arr_get lcell 0
+    let dc = arr_new 1 0
+    let _ = arr_set dc 0 (arr_get synd r)
+    let _ = bm_disc expt logt lam synd r ll 1 dc
+    let d = arr_get dc 0
+    let m = arr_get mcell 0
+    let _ = if d == 0 then
+              let _ = arr_set mcell 0 (m + 1)
+              0
+            else
+              let coef = gdiv expt logt d (arr_get bdc 0)
+              let _ = poly_copy lam t npar 0
+              let _ = bm_shift expt logt lam b t coef m npar 0
+              let _ = if (2 * ll) <= r then
+                        let _ = poly_copy lam b npar 0
+                        let _ = poly_copy t lam npar 0
+                        let _ = arr_set lcell 0 (r + 1 - ll)
+                        let _ = arr_set bdc 0 d
+                        let _ = arr_set mcell 0 1
+                        0
+                      else
+                        let _ = poly_copy t lam npar 0
+                        let _ = arr_set mcell 0 (m + 1)
+                        0
+              0
+    bm_loop expt logt synd npar lam b t lcell mcell bdc (r + 1)
+
+-- ---- Chien search: positions i (0..254) where lam(alpha^-i)=0 ----
+lam_eval expt logt lam ll x j acc =
+  if j > ll then acc
+  else lam_eval expt logt lam ll x (j + 1) (bit_xor acc (gmul expt logt (arr_get lam j) (galpha expt (((arr_get logt x) * j) % 255))))
+chien expt logt lam ll epos ecell i =
+  if i >= 255 then 0
+  else
+    let x = galpha expt ((255 - i) % 255)
+    let v = lam_eval expt logt lam ll x 0 0
+    let _ = if v == 0 then
+              let nn = arr_get ecell 0
+              let _ = arr_set epos nn i
+              let _ = arr_set ecell 0 (nn + 1)
+              0
+            else 0
+    chien expt logt lam ll epos ecell (i + 1)
+
+-- ---- Forney: Omega(x)=[S(x)*Lambda(x)] mod x^npar ----
+omega_inner expt logt synd lam d j oc =
+  if j > d then 0
+  else
+    let _ = arr_set oc 0 (bit_xor (arr_get oc 0) (gmul expt logt (arr_get synd j) (arr_get lam (d - j))))
+    omega_inner expt logt synd lam d (j + 1) oc
+calc_omega expt logt synd lam npar omega d =
+  if d >= npar then 0
+  else
+    let oc = arr_new 1 0
+    let _ = omega_inner expt logt synd lam d 0 oc
+    let _ = arr_set omega d (arr_get oc 0)
+    calc_omega expt logt synd lam npar omega (d + 1)
+poly_eval expt logt p deg x j acc =
+  if j > deg then acc
+  else poly_eval expt logt p deg x (j + 1) (bit_xor acc (gmul expt logt (arr_get p j) (galpha expt (((arr_get logt x) * j) % 255))))
+lamprime_eval expt logt lam ll x j acc =
+  if j > ll then acc
+  else
+    let term = if (bit_and j 1) == 1 then gmul expt logt (arr_get lam j) (galpha expt (((arr_get logt x) * (j - 1)) % 255)) else 0
+    lamprime_eval expt logt lam ll x (j + 1) (bit_xor acc term)
+
+-- in-place correction using epos[0..nerr). FCR-aware Forney first-root factor X^(1-FCR).
+forney_fix expt logt cw lam omega npar ll epos nerr fcr k =
+  if k >= nerr then 0
+  else
+    let i = arr_get epos k
+    let xinv = galpha expt ((255 - i) % 255)   -- alpha^-i  (= X_i^-1)
+    let om = poly_eval expt logt omega (npar - 1) xinv 0 0
+    let lp = lamprime_eval expt logt lam ll xinv 1 0
+    let base = if lp == 0 then 0 else gdiv expt logt om lp
+    -- Forney first-root factor X_i^(1-FCR); X_i = alpha^i. For fcr=1 -> ^0=1 (no factor),
+    -- for fcr=0 -> ^1 = alpha^i. General: multiply by alpha^(i*(1-fcr)).
+    let xfac = galpha expt ((i * (1 - fcr)) % 255)
+    let mag = gmul expt logt base xfac
+    let bidx = 254 - i
+    let _ = arr_set cw bidx (bit_xor (arr_get cw bidx) mag)
+    forney_fix expt logt cw lam omega npar ll epos nerr fcr (k + 1)
+
+decs a i n acc = if i >= n then acc else decs a (i + 1) n (cat [acc, show (arr_get a i), " "])
+
+-- decode one length-255 codeword; ndata = number of leading data bytes to print (231).
+decode_cw expt logt cw npar fcr ndata k =
+  let synd = arr_new npar 0
+  let _ = calc_syndromes expt logt cw synd npar fcr 0
+  if (syndromes_nonzero synd npar 0) == 0 then
+    let _ = print (cat ["CW", show k, " nerr=0 L=0 corrected_ok=1 DATA ", decs cw 0 ndata ""])
+    0
+  else
+    let lam = arr_new (npar + 1) 0
+    let b = arr_new (npar + 1) 0
+    let t = arr_new (npar + 1) 0
+    let lcell = arr_new 1 0
+    let mcell = arr_new 1 0
+    let _ = berlekamp expt logt synd npar lam b t lcell mcell
+    let ll = arr_get lcell 0
+    let epos = arr_new 255 0
+    let ecell = arr_new 1 0
+    let _ = chien expt logt lam ll epos ecell 0
+    let nerr = arr_get ecell 0
+    let omega = arr_new npar 0
+    let _ = calc_omega expt logt synd lam npar omega 0
+    let _ = forney_fix expt logt cw lam omega npar ll epos nerr fcr 0
+    let synd2 = arr_new npar 0
+    let _ = calc_syndromes expt logt cw synd2 npar fcr 0
+    let ok = if (syndromes_nonzero synd2 npar 0) == 0 then 1 else 0
+    let _ = print (cat ["CW", show k, " nerr=", show nerr, " L=", show ll, " corrected_ok=", show ok, " DATA ", decs cw 0 ndata ""])
+    0
+
+decode_all expt logt cadu ii npar fcr ndata k =
+  if k >= ii then 0
+  else
+    let cw = arr_new 255 0
+    let _ = deinterleave cadu cw ii k 0
+    let _ = decode_cw expt logt cw npar fcr ndata k
+    decode_all expt logt cadu ii npar fcr ndata (k + 1)
+
+main =
+  let expt = arr_new 512 0
+  let logt = arr_new 256 0
+  let _ = gf_build expt logt 0 1
+  let _ = gf_ext expt 255
+  let cadu = read_bytes "/tmp/rs41_rs_in.s8"
+  let ii = 2
+  let npar = 24
+  let fcr = 0
+  let ndata = 231
+  let _ = print (cat ["INFO rs_bytes=", show (arr_len cadu), " I=", show ii, " npar=", show npar, " fcr=", show fcr, " field=0x11D RS(255,231)"])
+  let _ = decode_all expt logt cadu ii npar fcr ndata 0
+  0

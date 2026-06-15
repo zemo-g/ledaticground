@@ -1,0 +1,145 @@
+-- ledaticground: attested ORBCOMM reception receipt (pure Rail) — CONTRACT v=2.
+-- Binds an ORBCOMM decode batch to the receiving node under an Ed25519 signature, REAL
+-- hash-chained, beacon-anchored, with round-trip verify + tamper detection.
+--
+-- ORBCOMM is a LEO subscriber-messaging constellation in 137.2–137.8 MHz. Two FACT
+-- receipt families are emitted into the SAME orbcomm fact ledger (both type=FACT per
+-- docs/RECEIPT_CONTRACT.md A.5), chained in sequence:
+--
+--   (1) ORBCOMM_RECEIPT       — the CRC-verified frame-decode FACT. honesty bit crc_ok=<0|1>
+--                               (CRC-16/X-25 block-decode verdict from orbcomm_frame.rail).
+--   (2) ORBCOMM_POR_RECEIPT   — the PROOF-OF-RECEPTION variant. ORBCOMM user data is
+--                               commercial / partly-encrypted with NO public message
+--                               dictionary, so we attest RECEPTION ONLY and emit
+--                               payload=NONE_proprietary. We NEVER invent message field
+--                               semantics. The POR carries the same crc_ok honesty bit.
+--
+-- HONESTY (operator standing rules):
+--   * crc_ok is the CRC verdict honesty bit. A frame that fails CRC is STILL a fact
+--     ("received, CRC failed") — recorded with crc_ok=0, NEVER dropped. The verdict is
+--     staged by the rollup driver into /tmp/orbcomm_crc_ok.txt; the signer FAILS CLOSED
+--     (default "0") if absent — it never assumes a pass it did not observe.
+--   * payload semantics are PROPRIETARY: the POR variant attests reception, never content.
+--     No decoded message field (MMSI/lat/lon/msg) is ever emitted in the receipt.
+--   * geo stays PENDING_needs_GPS_PPS until GPS-PPS lands. Never fabricated.
+--   * pulse fetch failure -> pulse_id=PENDING_beacon_unreachable (NEVER 0, NEVER wall-clock).
+--   * pulse_hex / product travel as HEX STRINGS (char_from_int(0)=="" NUL-drop trap avoided).
+--   * cross-pol + no-LNA deficit means many passes read no carrier; that honest-empty
+--     outcome is handled by the rollup driver (no decode -> no receipt), not here.
+--
+-- DEV signing key: a distinct, clearly-labeled ORBCOMM DEV seed (NOT a production
+-- attestation authority; production authority keys are a future V100 rung).
+--
+-- Run via the flock-serialized wrapper so stdlib crypto's nested relative imports resolve:
+--   bash scripts/railrun.sh <ledaticground>/src/orbcomm_attest.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+
+-- read one config line, strip newline, fall back to a safe default (verbatim idiom).
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+main =
+  -- DEV signing key — a distinct, clearly-labeled ORBCOMM DEV seed (64-hex), visually
+  -- tagged with the 0c-b0 ("orbcomm") byte pattern and distinct from every other stream's
+  -- seed (AIS a15a.., ACARS ac3a.., beacon 9012..). NOT a production attestation authority.
+  let seed = hex_to_bytes "0cb00cb00cb00cb00cb00cb00cb00cb00cb00cb00cb00cb00cb00cb00cb00c00"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- product = the pure-Rail ORBCOMM decode output (UW pos, opaque region len, CRC verdict).
+  -- product_sha256 commits to the literal batch text; the source is the evidence.
+  let product = read_file "/tmp/orbcomm_decode_out.txt"
+  let product_hash = sha256_hex product
+
+  -- beacon pulse (SHARED staging, by the shell wrapper, per contract C). HONEST fallback.
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING_beacon_unreachable"
+
+  -- REAL hash-chaining: prev = chain_hash of the prior ledger line (GENESIS only on line 1).
+  let prev = field_or "/tmp/orbcomm_prev_sha.txt" "GENESIS"
+
+  -- batch provenance BOUNDS + count — staged by the driver. NOT the attestation clock.
+  let batch_start = field_or "/tmp/orbcomm_batch_start.txt" "PENDING_no_batch"
+  let batch_end = field_or "/tmp/orbcomm_batch_end.txt" "PENDING_no_batch"
+  let n = field_or "/tmp/orbcomm_batch_n.txt" "0"
+
+  -- CRC honesty bit — FAIL CLOSED: missing/unparsed verdict records crc_ok=0, never a pass.
+  let crc_ok = field_or "/tmp/orbcomm_crc_ok.txt" "0"
+
+  -- node identity is file-driven (sanitized). geo PENDING until GPS-PPS. Never fabricated.
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let node = sta
+  let band = "ORBCOMM-137.2-137.8MHz"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  -- ===================== (1) ORBCOMM_RECEIPT — CRC-verified FACT =====================
+  -- v=2 FACT receipt — field order is LOAD-BEARING (the signature is over this exact string).
+  let receipt = join "|" ["ORBCOMM_RECEIPT", "v=2", "type=FACT", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", n], cat ["crc_ok=", crc_ok], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sig = ed25519_sign seed msg mlen
+  let sig_hex = bytes_to_hex sig 64
+
+  let verify_ok = ed25519_verify pk msg mlen sig
+  let tstr = cat [receipt, "X"]
+  let tmsg = string_to_bytes tstr
+  let tlen = string_length_bytes tstr
+  let tamper_ok = ed25519_verify pk tmsg tlen sig
+  let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+  let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["CRC_OK   ", crc_ok])
+  let _ = print (cat ["SIG      ", sig_hex])
+  let _ = print (cat ["CHAIN    ", chain_hash])
+  let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+  let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+  let jsonline = cat ["{\"v\":2,\"type\":\"FACT\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/orbcomm_receipts.jsonl" jsonline
+  let _ = print "APPENDED data/orbcomm_receipts.jsonl (ORBCOMM_RECEIPT)"
+
+  -- legacy single-object backward-compat (latest FACT receipt).
+  let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/orbcomm_receipt.json" jrec
+  let _ = print "WROTE data/orbcomm_receipt.json"
+
+  -- ============ (2) ORBCOMM_POR_RECEIPT — proof-of-reception, payload=NONE ============
+  -- Chains directly off the FACT line above: prev = the FACT line's chain_hash. Attests
+  -- RECEPTION ONLY — ORBCOMM payload is proprietary, so payload=NONE_proprietary and NO
+  -- message field is ever emitted. Same crc_ok honesty bit (the physical-layer verdict).
+  let por_prev = chain_hash
+  let por_receipt = join "|" ["ORBCOMM_POR_RECEIPT", "v=2", "type=FACT", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", n], cat ["crc_ok=", crc_ok], "payload=NONE_proprietary", cat ["product_sha256=", product_hash], cat ["prev=", por_prev], cat ["signer=", pk_hex]]
+  let por_msg = string_to_bytes por_receipt
+  let por_mlen = string_length_bytes por_receipt
+  let por_sig = ed25519_sign seed por_msg por_mlen
+  let por_sig_hex = bytes_to_hex por_sig 64
+
+  let por_verify_ok = ed25519_verify pk por_msg por_mlen por_sig
+  let por_tstr = cat [por_receipt, "X"]
+  let por_tmsg = string_to_bytes por_tstr
+  let por_tlen = string_length_bytes por_tstr
+  let por_tamper_ok = ed25519_verify pk por_tmsg por_tlen por_sig
+  let por_chain_hash = sha256_hex (cat [por_receipt, "|sig=", por_sig_hex])
+
+  let _ = print (cat ["POR_RECEIPT ", por_receipt])
+  let _ = print (cat ["POR_SIG     ", por_sig_hex])
+  let _ = print (cat ["POR_CHAIN   ", por_chain_hash])
+  let _ = print (cat ["POR_VERIFY  own-sig accepted = ", show por_verify_ok, " (want 1)"])
+  let _ = print (cat ["POR_TAMPER  modified-msg accepted = ", show por_tamper_ok, " (want 0)"])
+
+  let por_jsonline = cat ["{\"v\":2,\"type\":\"FACT\",\"receipt\": \"", por_receipt, "\",\"sig\": \"", por_sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", por_chain_hash, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/orbcomm_receipts.jsonl" por_jsonline
+  let _ = print "APPENDED data/orbcomm_receipts.jsonl (ORBCOMM_POR_RECEIPT payload=NONE_proprietary)"
+
+  let por_jrec = join "\n" ["{", cat ["  \"receipt\": \"", por_receipt, "\","], cat ["  \"sig\": \"", por_sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", por_chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/orbcomm_por_receipt.json" por_jrec
+  let _ = print "WROTE data/orbcomm_por_receipt.json"
+  0

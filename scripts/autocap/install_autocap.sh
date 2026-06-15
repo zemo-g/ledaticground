@@ -11,6 +11,9 @@
 #     ledaticground-iqcap.service-> /etc/systemd/system/ledaticground-iqcap.service
 #     iqcap-retention            -> /etc/cron.d/iqcap-retention
 #     roofmon-deadman            -> /etc/cron.d/roofmon-deadman
+#     pi_characterize.py (FIXED) -> /home/ledatic/pi_characterize.py    (RFML-3 serving-path swap)
+#     audio_softmax.txt (v3-18f) -> /home/ledatic/audio_softmax.txt     (RFML-3)
+#     audio_novelty.txt (v3-18f) -> /home/ledatic/audio_novelty.txt     (RFML-3)
 #   The Pi reads a pushed ~/.iq/schedule.tsv, captures each pass on its OWN
 #   clock (preempting roofmon ONLY for the window, always restarting it),
 #   and KEEPS captures in ~/.iq/captures/ until the Mini pulls them.
@@ -57,6 +60,30 @@ PI_RETENTION_SRC="$STAGE/iqcap-retention"       # THIS component (cron snippet)
 PI_DEADMAN_SRC="$STAGE/roofmon-deadman"         # THIS component (cron snippet; roofmon resurrection w/ SDR guards)
 MINI_SCHED_SRC="$STAGE/com.ledatic.ledaticground-iqsched.plist"   # THIS component (wraps push_iq_schedule.sh)
 MINI_PULL_SRC="$STAGE/com.ledatic.ledaticground-iqpull.plist"     # THIS component (wraps pull_iq.sh)
+
+# ----------------------------------------------------------------------------
+# RFML-3 serving-path artifacts (RFML cluster, ticket RFML-3). Deploys the FIXED
+# 18-feature serving characterizer + the v3-18f model so the Pi computes the
+# SAME feature coordinate system the model was trained in (zero train/serve
+# skew). This closes the 155/155-all-unknown regression: the Pi had the v3 MODEL
+# but the OLD 10-feature pi_characterize.py, so 6 of 16 standardized dims were
+# garbage and every window tripped novelty. The fixed pi_characterize.py
+# (scripts/pi_characterize.py) parses the `# COLS` header, indexes F[cols[j]],
+# and FAIL-LOUD crashes on a dimension mismatch (never silently all-unknown).
+#   - scripts/pi_characterize.py  -> Pi /home/ledatic/pi_characterize.py
+#   - models/audio_softmax.txt    -> Pi /home/ledatic/audio_softmax.txt   (v3, # COLS 0..17, 18-wide)
+#   - models/audio_novelty.txt    -> Pi /home/ledatic/audio_novelty.txt   (v3, # COLS 0..17, 18-wide)
+# These are the EXACT paths ais_monitor.sh's CHAR call invokes every CHAR_EVERY
+# cycle (`python3 /home/ledatic/pi_characterize.py /tmp/char.s16
+#  /home/ledatic/audio_softmax.txt /home/ledatic/audio_novelty.txt`), so a file
+# SWAP is all that's needed — no ais_monitor.sh edit.
+RFML_CHAR_SRC="$GD/scripts/pi_characterize.py"      # the FIXED 18-feature serving extractor (RFML-2)
+RFML_SOFTMAX_SRC="$GD/models/audio_softmax.txt"     # v3-18f softmax (# COLS 0..17)
+RFML_NOVELTY_SRC="$GD/models/audio_novelty.txt"     # v3-18f open-set novelty (# COLS 0..17)
+# Pi-side install paths (match ais_monitor.sh CHAR invocation verbatim).
+RFML_CHAR_DST="/home/ledatic/pi_characterize.py"
+RFML_SOFTMAX_DST="/home/ledatic/audio_softmax.txt"
+RFML_NOVELTY_DST="/home/ledatic/audio_novelty.txt"
 
 # systemd unit + Pi service NAME (note: ledaticground- prefixed, NOT bare iqcap).
 PI_UNIT_NAME="ledaticground-iqcap.service"
@@ -123,7 +150,14 @@ require_files(){
   else
     PI_CAP_PRESENT=1
   fi
+  # RFML-3 serving-path artifacts (warn, don't abort — autocap proper does not
+  # depend on them; the RFML deploy step self-skips if any are missing).
+  RFML_PRESENT=1
+  for f in "$RFML_CHAR_SRC" "$RFML_SOFTMAX_SRC" "$RFML_NOVELTY_SRC"; do
+    if [ ! -f "$f" ]; then warn "RFML-3 artifact not staged: $f"; RFML_PRESENT=0; fi
+  done
 }
+RFML_PRESENT=0   # set by require_files(); 1 iff all three RFML-3 artifacts are staged
 
 # ---------------------------------------------------------------------------
 # UNINSTALL (Mini only): bootout the new agents + remove their plists. Pi left
@@ -200,6 +234,49 @@ if [ "$PI_UP" = 1 ]; then
   say "[Pi] -> /etc/cron.d/roofmon-deadman"
   run scp -q "$PI_DEADMAN_SRC" "$PI:/tmp/roofmon-deadman.new"
   runssh "sudo install -m 0644 -o root -g root /tmp/roofmon-deadman.new /etc/cron.d/roofmon-deadman && rm -f /tmp/roofmon-deadman.new"
+
+  # =========================================================================
+  # 3c) RFML-3 SERVING-PATH SWAP (ticket RFML-3) — fixed pi_characterize.py + v3 model.
+  # -------------------------------------------------------------------------
+  # !! OPERATOR-RUN ONLY — THIS DEPLOYS TO THE LIVE ROOF PI. !!
+  # The scp/ssh below execute ONLY when YOU (the operator) run this installer
+  # with the Pi reachable. They are NOT run autonomously by any agent/build —
+  # the build that wired this step never touches the live node. (Under
+  # --dry-run they only PRINT; see run()/runssh().)
+  #
+  # WHAT THIS DOES (and why it is safe): a pure FILE SWAP of three artifacts to
+  # the paths ais_monitor.sh's CHAR call already invokes. It does NOT touch the
+  # SDR, does NOT start/stop any service, does NOT contend for the radio — it
+  # only replaces the inference script + model on disk. The next CHAR_EVERY
+  # cycle of the already-running ais_monitor.sh picks them up. The fixed
+  # pi_characterize.py is dimension-self-guarding: if the model COLS and the
+  # serving feature count ever disagree it EXITS NONZERO with an explicit error
+  # JSON rather than silently degrading to all-unknown (the regression this
+  # ticket closes). atomic-rename install (temp -> mv) so a CHAR cycle never
+  # reads a half-written file.
+  # =========================================================================
+  if [ "$RFML_PRESENT" = 1 ]; then
+    say "[Pi] RFML-3: swapping fixed 18-feature serving path (characterizer + v3 model)."
+    say "[Pi] -> $RFML_CHAR_DST"
+    run scp -q "$RFML_CHAR_SRC" "$PI:/tmp/pi_characterize.py.new"
+    runssh "install -m 0755 /tmp/pi_characterize.py.new '$RFML_CHAR_DST' && rm -f /tmp/pi_characterize.py.new"
+    say "[Pi] -> $RFML_SOFTMAX_DST"
+    run scp -q "$RFML_SOFTMAX_SRC" "$PI:/tmp/audio_softmax.txt.new"
+    runssh "install -m 0644 /tmp/audio_softmax.txt.new '$RFML_SOFTMAX_DST' && rm -f /tmp/audio_softmax.txt.new"
+    say "[Pi] -> $RFML_NOVELTY_DST"
+    run scp -q "$RFML_NOVELTY_SRC" "$PI:/tmp/audio_novelty.txt.new"
+    runssh "install -m 0644 /tmp/audio_novelty.txt.new '$RFML_NOVELTY_DST' && rm -f /tmp/audio_novelty.txt.new"
+    # Sanity: confirm the deployed model COLS width matches the deployed serving feats.
+    # ais_monitor.sh runs CHAR every CHAR_EVERY cycles; no monitor edit needed.
+    if [ "$DRY" != 1 ]; then
+      runssh "head -3 '$RFML_SOFTMAX_DST' | grep -q '# COLS' && echo '[Pi] v3 model COLS header present' || echo '[Pi] WARN: deployed model lacks COLS header'"
+    fi
+    say "[Pi] RFML-3 swap done — next ais_monitor.sh CHAR cycle uses the fixed path (tag rail-trained-audio-softmax-v3-18f+novelty)."
+  else
+    warn "[Pi] RFML-3 artifacts not all staged — SKIPPING the serving-path swap."
+    warn "[Pi] The Pi keeps its current pi_characterize.py/model. Stage all three"
+    warn "[Pi] (scripts/pi_characterize.py, models/audio_softmax.txt, models/audio_novelty.txt) and re-run."
+  fi
 
   # 4) reload systemd + ENABLE (so it auto-starts after the nightly power-cycle)
   #    but DO NOT start now — starting is the contention moment, done at cutover.
@@ -291,6 +368,20 @@ else
   step "$SSH $PI 'sudo systemctl start $PI_UNIT_NAME'   # 5. LAST: start Pi capture"
   echo  "  ---------------------------------------------------------------------"
   say "Full procedure, verification, and ROLLBACK: $STAGE/CUTOVER.md"
+fi
+
+# RFML-3 verification hint (the serving-path swap already happened in the Pi-side
+# block above, independent of --go — it's a non-SDR file swap, safe any time the
+# Pi is reachable). Confirm the fixed path is live on the next CHAR cycle:
+if [ "$PI_UP" = 1 ] && [ "$RFML_PRESENT" = 1 ]; then
+  echo
+  say "RFML-3 verify (after the next ais_monitor.sh CHAR cycle, ~CHAR_EVERY=6 cycles):"
+  step "$SSH $PI 'tail -1 ~/projects/ledaticground/data/characterize_log.jsonl 2>/dev/null'   # expect tag rail-trained-audio-softmax-v3-18f+novelty, unknown_windows<<155"
+  step "$SSH $PI \"python3 $RFML_CHAR_DST /tmp/char.s16 $RFML_SOFTMAX_DST $RFML_NOVELTY_DST\"   # one-shot on the last CHAR capture"
+elif [ "$RFML_PRESENT" = 1 ] && [ "$PI_UP" != 1 ]; then
+  echo
+  warn "RFML-3: Pi was offline — the serving-path swap was SKIPPED. Re-run this installer"
+  warn "        when the Pi is reachable to deploy the fixed pi_characterize.py + v3 model."
 fi
 
 echo

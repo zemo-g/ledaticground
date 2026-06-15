@@ -1,0 +1,181 @@
+-- ledaticground ORBCOMM Doppler-fingerprint PROOF-OF-RECEPTION receipt (pure Rail) —
+-- RECEIPT_CONTRACT.md v=2. IS-5: the INDEPENDENT cross-check ORBCOMM cannot fake.
+--
+-- WHY THIS IS A SEPARATE SIGNER FROM src/orbcomm_attest.rail's ORBCOMM_POR_RECEIPT:
+--   * src/orbcomm_attest.rail (AC-2) emits the CRC-frame proof-of-reception: a FACT receipt
+--     (ORBCOMM_POR_RECEIPT, type=FACT, payload=NONE_proprietary, crc_ok bit) chained in the
+--     FACT ledger data/orbcomm_receipts.jsonl. It attests "a CRC-decodable frame was heard."
+--   * THIS signer (IS-5) emits the DOPPLER-FINGERPRINT proof-of-reception: a LABELED
+--     INFERENCE receipt that binds the physically-MEASURED carrier facts (carrier_present /
+--     offset / SNR / symrate, from orbcomm_char.rail) to the DERIVED kinematics (which sat,
+--     TCA, doppler_fit correlation r, predicted-curve digest) that the SGP4 Doppler match
+--     PRODUCES. The match is physics that cannot be faked: a genuine LEO carrier rides the
+--     SGP4-predicted downward S-curve through TCA, so a high doppler_fit r PROVES the node
+--     heard THAT satellite on THAT pass — without ever decoding the proprietary payload.
+--
+-- THE FACT/INFERENCE WALL (RECEIPT_CONTRACT.md A.2 / E.1-E.2, docs/CHANNEL_INTELLIGENCE.md §1):
+--   The carrier_present/offset/snr/symrate observables are MEASURED facts and are carried
+--   in the signed string verbatim. The Doppler-fit kinematics (sat_id/tca_unix/doppler_fit_r/
+--   predicted_curve_sha256) are COMPUTED, not measured, so they live in a clearly-segregated
+--   `LABEL=INFERENCE` block within the SAME signed string, and the receipt is type=INFERENCE
+--   carrying a mandatory derived_from=<orbcomm FACT chain_hash> that points back at the FACT
+--   receipt this product rests on. A verifier that sees type=INFERENCE with an unresolvable
+--   derived_from MUST reject (verify.rail check (d)). Modeled on src/vessel_inference_attest.rail
+--   (the AIS->vessel INFERENCE precedent) + src/beacon_por.rail (the freq/snr/pulse POR shape).
+--
+-- SEPARATE LEDGER FAMILY (RECEIPT_CONTRACT.md B.6 — NEVER mixed with the FACT ledgers):
+--   appends to data/orbcomm_por_receipts.jsonl (the INFERENCE family). Also writes the legacy
+--   single-object data/orbcomm_por_attest_receipt.json — DISTINCT from AC-2's
+--   data/orbcomm_por_receipt.json (that file is AC-2's FACT ORBCOMM_POR_RECEIPT; this signer
+--   must NOT clobber it). Advances data/chain/orbcomm_por_prev.txt.
+--
+-- HONESTY (operator standing rules):
+--   * payload semantics are PROPRIETARY — payload=NONE_proprietary, and NO decoded ORBCOMM
+--     message field (MMSI/lat/lon/msg) is ever emitted. This receipt attests RECEPTION, not
+--     content. (verify path / acceptance greps the receipt string for MMSI/LAT=/LON=/MSG and
+--     asserts they are ABSENT.)
+--   * carrier_present 0 or 1 are BOTH honest outcomes; the driver only drives this signer
+--     after a carrier_present=1 characterization (a Doppler fingerprint needs a carrier to
+--     track). No carrier -> the monitor signs nothing here (honest-empty).
+--   * crc_ok is carried as the physical-layer honesty bit, FAIL CLOSED to 0 if unobserved.
+--   * THE WALL IS FAIL-LOUD: if no FACT root resolves (derived_from would be UNCHAINED_NO_FACT)
+--     we DO NOT sign — an inference receipt with no fact root is a wall violation
+--     (paos-deep-audit: fail-loud at every attestation boundary).
+--   * geo stays the literal PENDING_needs_GPS_PPS until GPS-PPS lands. Never fabricated.
+--     (NODE_LAT/NODE_LON in the driver are used for SGP4 pass GEOMETRY only, NOT receiver geo.)
+--   * pulse fetch failure -> pulse_id=PENDING_beacon_unreachable (NEVER 0, NEVER wall-clock).
+--   * pulse_hex / predicted_curve digest travel as HEX STRINGS (char_from_int(0)=="" NUL-drop
+--     trap avoided — same discipline beacon_por.rail uses for payloads).
+--
+-- DEV signing key: a distinct, clearly-labeled ORBCOMM-POR DEV seed (NOT a production
+-- attestation authority; production authority keys are a future V100 rung).
+--
+-- Run via the flock-serialized wrapper so stdlib crypto's nested relative imports resolve:
+--   bash scripts/railrun.sh <ledaticground>/src/orbcomm_por_attest.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+
+-- read one config/staging line, strip newline, fall back to a safe default (verbatim idiom).
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+main =
+  -- DEV signing key — a distinct, clearly-labeled ORBCOMM-POR DEV seed (64-hex), visually
+  -- tagged with the d0-pp ("doppler proof") byte pattern, distinct from every other stream's
+  -- seed (AIS a15a.., ACARS ac3a.., beacon 9012.., orbcomm-FACT 0cb0..). NOT a production key.
+  let seed = hex_to_bytes "d0ppd0ppd0ppd0ppd0ppd0ppd0ppd0ppd0ppd0ppd0ppd0ppd0ppd0ppd0pp0c00"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- ===== product the digest commits to =====
+  -- The hashed product is the MEASUREMENT BLOCK (orbcomm_char carrier facts) + the Doppler
+  -- drift curve — NOT content. The driver stages the concatenated char-block + drift-curve
+  -- text to /tmp/orbcomm_por_product.txt. product_sha256 commits to that exact text.
+  let product = read_file "/tmp/orbcomm_por_product.txt"
+  let product_hash = sha256_hex product
+
+  -- ===== THE FACT-vs-INFERENCE WALL: resolve derived_from (fail-loud if no fact root) =====
+  -- 1st choice: the ORBCOMM FACT chain_hash (a true chain link), staged by the driver from
+  -- the tail of data/orbcomm_receipts.jsonl into /tmp/orbcomm_fact_chain.txt.
+  let fact_chain = field_or "/tmp/orbcomm_fact_chain.txt" ""
+  -- Nested if/then/else — NO &&/|| (both sides always evaluate; no short-circuit).
+  let derived_from =
+    if fact_chain == "" then "UNCHAINED_NO_FACT" else fact_chain
+  let have_fact = if derived_from == "UNCHAINED_NO_FACT" then 0 else 1
+
+  -- ===== beacon anchor (RECEIPT_CONTRACT.md C) — unified staging, honest PENDING =====
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING_beacon_unreachable"
+
+  -- REAL hash-chaining within the POR inference ledger: prev = chain_hash of the prior POR
+  -- line (GENESIS only on line 1), staged by the driver from data/chain/orbcomm_por_prev.txt.
+  let prev = field_or "/tmp/orbcomm_por_prev_sha.txt" "GENESIS"
+
+  -- batch provenance BOUNDS + count — staged by the driver. NOT the attestation clock.
+  let batch_start = field_or "/tmp/orbcomm_por_batch_start.txt" "PENDING_no_batch"
+  let batch_end = field_or "/tmp/orbcomm_por_batch_end.txt" "PENDING_no_batch"
+  let n = field_or "/tmp/orbcomm_por_batch_n.txt" "0"
+
+  -- ===== (a) MEASURED FACTS (physical observables from orbcomm_char.rail) =====
+  -- FAIL CLOSED on every absent field: carrier_present default 0, crc_ok default 0, the
+  -- numeric observables default PENDING (never a fabricated measurement).
+  let carrier_present = field_or "/tmp/orbcomm_por_carrier_present.txt" "0"
+  let offset_hz = field_or "/tmp/orbcomm_por_offset_hz.txt" "PENDING_no_meas"
+  let snr_db = field_or "/tmp/orbcomm_por_snr_db.txt" "PENDING_no_meas"
+  let symrate = field_or "/tmp/orbcomm_por_symrate.txt" "PENDING_no_meas"
+  let crc_ok = field_or "/tmp/orbcomm_por_crc_ok.txt" "0"
+
+  -- ===== (b) DERIVED kinematics (Doppler-fit INFERENCE — computed, not measured) =====
+  -- The driver stages these from scripts/doppler_fit.py + the SGP4 prediction. The
+  -- predicted-curve digest travels as a HEX STRING (no NUL-drop). PENDING-honest if absent.
+  let sat_id = field_or "/tmp/orbcomm_por_sat_id.txt" "PENDING_no_fit"
+  let tca_unix = field_or "/tmp/orbcomm_por_tca_unix.txt" "PENDING_no_fit"
+  let doppler_fit_r = field_or "/tmp/orbcomm_por_fit_r.txt" "PENDING_no_fit"
+  let predicted_curve_sha256 = field_or "/tmp/orbcomm_por_predicted_curve_sha256.txt" "PENDING_no_fit"
+
+  -- node identity is file-driven (sanitized). geo PENDING until GPS-PPS. Never fabricated.
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let node = sta
+  let band = "ORBCOMM-137.2-137.8MHz"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  -- THE WALL: refuse to sign an inference receipt with no fact root (fail-loud boundary).
+  if have_fact == 0 then
+    let _ = print "ABORT  no ORBCOMM FACT root resolved (derived_from=UNCHAINED_NO_FACT)."
+    let _ = print "       An INFERENCE receipt with no FACT root is a wall violation — NOT signing."
+    let _ = print "       Stage the ORBCOMM FACT chain_hash to /tmp/orbcomm_fact_chain.txt first"
+    let _ = print "       (the driver reads it from the tail of data/orbcomm_receipts.jsonl)."
+    1
+  else
+    -- ===== the LABELED-INFERENCE receipt string — field order is LOAD-BEARING =====
+    -- Canonical A.2 INFERENCE skeleton (type=INFERENCE + mandatory derived_from=) carrying
+    -- BOTH the measured FACT block AND a clearly-segregated LABEL=INFERENCE block, plus the
+    -- proof-of-reception markers (kind=PROOF_OF_RECEPTION, payload=NONE_proprietary). The
+    -- signature is computed over this EXACT pipe-joined string — emit it verbatim.
+    let receipt = join "|" ["ORBCOMM_POR_RECEIPT", "v=2", "type=INFERENCE", "kind=PROOF_OF_RECEPTION", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", n], cat ["carrier_present=", carrier_present], cat ["offset_hz=", offset_hz], cat ["snr_db=", snr_db], cat ["symrate=", symrate], cat ["crc_ok=", crc_ok], "payload=NONE_proprietary", "LABEL=INFERENCE", cat ["sat_id=", sat_id], cat ["tca_unix=", tca_unix], cat ["doppler_fit_r=", doppler_fit_r], cat ["predicted_curve_sha256=", predicted_curve_sha256], cat ["derived_from=", derived_from], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+    let msg = string_to_bytes receipt
+    let mlen = string_length_bytes receipt
+    let sig = ed25519_sign seed msg mlen
+    let sig_hex = bytes_to_hex sig 64
+
+    -- round-trip: own signature must verify (=1); a tampered message must NOT verify (=0).
+    let verify_ok = ed25519_verify pk msg mlen sig
+    let tstr = cat [receipt, "X"]
+    let tmsg = string_to_bytes tstr
+    let tlen = string_length_bytes tstr
+    let tamper_ok = ed25519_verify pk tmsg tlen sig
+    let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+    let _ = print (cat ["RECEIPT  ", receipt])
+    let _ = print (cat ["DERIVED  derived_from=", derived_from])
+    let _ = print (cat ["CARRIER  carrier_present=", carrier_present, " crc_ok=", crc_ok])
+    let _ = print (cat ["FIT      doppler_fit_r=", doppler_fit_r, " sat_id=", sat_id])
+    let _ = print (cat ["SIG      ", sig_hex])
+    let _ = print (cat ["CHAIN    ", chain_hash])
+    let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+    let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+    -- v=2 JSON ledger line — one physical line; SPACE after each colon so verify.rail's
+    -- field_val matches (`"key": "`, RECEIPT_CONTRACT.md B.2). Append via append_line
+    -- (NEVER append_file — not a runtime symbol). SEPARATE inference ledger family (B.6).
+    let jline = cat ["{\"v\":2,\"type\":\"INFERENCE\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+    let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/orbcomm_por_receipts.jsonl" jline
+    let _ = print "APPENDED data/orbcomm_por_receipts.jsonl (ORBCOMM_POR_RECEIPT LABELED-INFERENCE)"
+
+    -- legacy single-object backward-compat for verify.rail — DISTINCT path from AC-2's
+    -- data/orbcomm_por_receipt.json (do NOT clobber the FACT POR's single-object file).
+    let jrec = join "\n" ["{", "  \"type\": \"INFERENCE\",", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"derived_from\": \"", derived_from, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+    let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/orbcomm_por_attest_receipt.json" jrec
+    let _ = print "WROTE data/orbcomm_por_attest_receipt.json"
+
+    -- advance the POR inference chain tail for the NEXT line's prev=.
+    let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/chain/orbcomm_por_prev.txt" chain_hash
+    let _ = print "WROTE data/chain/orbcomm_por_prev.txt"
+    0

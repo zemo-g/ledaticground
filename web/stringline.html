@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ledaticground — Detroit River string-line</title>
+<!--
+  L4 time-distance (Marey / string-line) diagram for the attested Detroit-River
+  vessel feed. Hand-rolled <canvas>, hand-rolled JS — no React/Vue/d3, no external
+  CDN, no framework runtime. Ledatic public aesthetic (CRT-green Neuromancer, mono).
+
+  x = time (last window), y = mile-position along the channel (0 = Lake Erie mouth,
+  ~32 = Lake St. Clair). One polyline per vessel; slope = speed; flat = holding.
+  Up-bound (green) x down-bound (amber) line crossings = meets in the narrows.
+
+  DATA: tries fetch('stringline.json') first (when served over http). When opened
+  from file:// (fetch blocked by CORS), falls back to the inlined data island below
+  (#stringline-data) which gen_stringline.py can populate with --inline. Honest empty:
+  no data -> explicit "no transits in window" state, never a fabricated line.
+
+  PROVENANCE: the footer trust strip carries the REAL receipt chain_hash, the beacon
+  pulse_id, and the derived_from fact root — read from the product, never invented.
+-->
+<style>
+  :root{
+    --bg:#04070a; --panel:#070d12; --grid:#0e2b22; --grid2:#081511;
+    --green:#00ff9c; --amber:#ffb454; --dim:#2a6e58; --txt:#9be8cf;
+    --faint:#16584a; --warn:#ff5c5c;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font-family:"SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;}
+  body{display:flex;flex-direction:column;min-height:100vh;
+    background-image:
+      repeating-linear-gradient(0deg,transparent 0 3px,rgba(0,255,156,.018) 3px 4px);}
+  header{padding:14px 18px 6px;border-bottom:1px solid var(--faint);}
+  header h1{margin:0;font-size:15px;letter-spacing:.18em;color:var(--green);
+    text-transform:uppercase;text-shadow:0 0 8px rgba(0,255,156,.35);}
+  header .sub{margin-top:4px;font-size:11px;color:var(--dim);letter-spacing:.05em;}
+  .legend{display:flex;gap:18px;align-items:center;font-size:11px;margin-top:8px;
+    flex-wrap:wrap;color:var(--txt);}
+  .legend .sw{display:inline-block;width:22px;height:0;border-top:2px solid;
+    vertical-align:middle;margin-right:6px;}
+  .up{color:var(--green);} .up .sw{border-color:var(--green);}
+  .down{color:var(--amber);} .down .sw{border-color:var(--amber);}
+  .hold{color:var(--dim);} .hold .sw{border-color:var(--dim);border-top-style:dotted;}
+  .meet{color:var(--warn);}
+  main{flex:1;position:relative;padding:8px 8px 0;}
+  canvas{display:block;width:100%;height:100%;
+    image-rendering:pixelated;}
+  #empty{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+    text-align:center;color:var(--dim);font-size:13px;letter-spacing:.1em;}
+  #empty b{color:var(--amber);display:block;margin-bottom:8px;font-size:15px;}
+  footer{border-top:1px solid var(--faint);padding:8px 18px;font-size:10.5px;
+    color:var(--dim);letter-spacing:.04em;line-height:1.7;
+    background:linear-gradient(0deg,rgba(0,255,156,.03),transparent);}
+  footer .k{color:var(--faint);} footer .v{color:var(--txt);}
+  footer .chain{color:var(--green);} footer .pulse{color:var(--amber);}
+  footer .pending{color:var(--warn);}
+  .nowrap{white-space:nowrap;}
+</style>
+</head>
+<body>
+<header>
+  <h1>Detroit River &mdash; vessel string-line</h1>
+  <div class="sub">time &times; channel-mile &middot; attested AIS &rarr; labeled kinematic inference &middot; ledaticground</div>
+  <div class="legend">
+    <span class="up"><span class="sw"></span>up-bound (toward Lk St Clair)</span>
+    <span class="down"><span class="sw"></span>down-bound (toward Lk Erie)</span>
+    <span class="hold"><span class="sw"></span>holding / moored</span>
+    <span class="meet">&#9679; meet in the narrows</span>
+  </div>
+</header>
+<main>
+  <canvas id="cv"></canvas>
+  <div id="empty"><div><b>no transits in window</b>the channel was quiet for this batch &mdash; no fabricated lines</div></div>
+</main>
+<footer id="trust">loading provenance&hellip;</footer>
+
+<!-- INLINE DATA ISLAND: gen_stringline.py --inline replaces the {} below with the
+     product JSON so the page renders from file:// without a server. Default empty
+     -> the page tries fetch('stringline.json'), then falls back to honest-empty. -->
+<script id="stringline-data" type="application/json">{}</script>
+
+<script>
+"use strict";
+(function(){
+  var cv = document.getElementById("cv");
+  var ctx = cv.getContext("2d");
+  var emptyEl = document.getElementById("empty");
+  var trustEl = document.getElementById("trust");
+
+  // ---- color tokens (read from CSS so the aesthetic stays single-sourced) ----
+  var CSS = getComputedStyle(document.documentElement);
+  function tok(n){ return (CSS.getPropertyValue(n)||"").trim(); }
+  var COL = {
+    bg: tok("--bg")||"#04070a", panel: tok("--panel")||"#070d12",
+    grid: tok("--grid")||"#0e2b22", green: tok("--green")||"#00ff9c",
+    amber: tok("--amber")||"#ffb454", dim: tok("--dim")||"#2a6e58",
+    txt: tok("--txt")||"#9be8cf", faint: tok("--faint")||"#16584a",
+    warn: tok("--warn")||"#ff5c5c"
+  };
+
+  var DATA = null;
+
+  function shortHash(h){
+    if(!h) return "—";
+    h = String(h);
+    if(h.indexOf("PENDING")===0) return h;
+    return h.length>14 ? h.slice(0,10)+"…"+h.slice(-4) : h;
+  }
+  function isPending(h){ return !h || String(h).indexOf("PENDING")===0; }
+
+  function fmtClock(unix){
+    if(unix===null||unix===undefined) return "—";
+    var d = new Date(unix*1000);
+    function p(n){ return (n<10?"0":"")+n; }
+    return p(d.getUTCHours())+":"+p(d.getUTCMinutes())+"Z";
+  }
+
+  // ---------------------------------------------------------------- render
+  function render(){
+    var dpr = window.devicePixelRatio||1;
+    var rect = cv.parentNode.getBoundingClientRect();
+    var W = Math.max(640, Math.floor(rect.width-16));
+    var H = Math.max(360, Math.floor(rect.height-8));
+    cv.width = W*dpr; cv.height = H*dpr;
+    cv.style.width = W+"px"; cv.style.height = H+"px";
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+
+    ctx.fillStyle = COL.bg; ctx.fillRect(0,0,W,H);
+
+    var vessels = (DATA && DATA.vessels) ? DATA.vessels : [];
+    if(!vessels.length){
+      emptyEl.style.display = "flex";
+      return;
+    }
+    emptyEl.style.display = "none";
+
+    // plot box
+    var padL = 64, padR = 120, padT = 18, padB = 34;
+    var plotW = W-padL-padR, plotH = H-padT-padB;
+    var x0 = padL, y0 = padT;
+
+    // axes ranges
+    var lenMi = (DATA.channel_geom && DATA.channel_geom.length_mi) ? DATA.channel_geom.length_mi : 32;
+    var win = DATA.window || {};
+    var tMin = win.t_min, tMax = win.t_max;
+    if(tMin===null||tMin===undefined){
+      // recompute from points
+      tMin = Infinity; tMax = -Infinity;
+      vessels.forEach(function(v){ v.pts.forEach(function(p){ if(p[0]<tMin)tMin=p[0]; if(p[0]>tMax)tMax=p[0]; }); });
+    }
+    if(tMax<=tMin) tMax = tMin+1;
+
+    // mile increasing UP the screen (mile 0 at bottom = Lake Erie, top = Lk St Clair)
+    function X(ts){ return x0 + (ts-tMin)/(tMax-tMin)*plotW; }
+    function Y(mi){ return y0 + plotH - (mi/lenMi)*plotH; }
+
+    // ---- mile grid + landmark labels ----
+    ctx.lineWidth = 1;
+    ctx.font = "10px monospace";
+    var wps = (DATA.channel_geom && DATA.channel_geom.waypoints) ? DATA.channel_geom.waypoints : [];
+    // faint integer mile gridlines every ~8 mi
+    ctx.strokeStyle = COL.grid;
+    for(var m=0;m<=lenMi;m+=8){
+      var gy = Y(m);
+      ctx.beginPath(); ctx.moveTo(x0,gy); ctx.lineTo(x0+plotW,gy); ctx.stroke();
+    }
+    // landmark lines (brighter, labelled)
+    ctx.fillStyle = COL.dim;
+    wps.forEach(function(w){
+      var gy = Y(w.mile);
+      ctx.strokeStyle = COL.faint;
+      ctx.setLineDash([2,4]);
+      ctx.beginPath(); ctx.moveTo(x0,gy); ctx.lineTo(x0+plotW,gy); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = COL.dim;
+      ctx.textAlign = "right"; ctx.textBaseline = "middle";
+      ctx.fillText(w.name.length>22? w.name.slice(0,20)+"…":w.name, x0-6, gy);
+      ctx.textAlign = "left";
+      ctx.fillStyle = COL.faint;
+      ctx.fillText(w.mile.toFixed(0)+"mi", x0+plotW+4, gy);
+    });
+
+    // ---- time axis ticks (UTC HH:MM) ----
+    ctx.strokeStyle = COL.grid;
+    ctx.fillStyle = COL.dim;
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    var nTicks = 6;
+    for(var i=0;i<=nTicks;i++){
+      var ts = tMin + (tMax-tMin)*i/nTicks;
+      var gx = X(ts);
+      ctx.beginPath(); ctx.moveTo(gx,y0); ctx.lineTo(gx,y0+plotH); ctx.stroke();
+      ctx.fillText(fmtClock(Math.round(ts)), gx, y0+plotH+5);
+    }
+
+    // axis frame
+    ctx.strokeStyle = COL.faint; ctx.lineWidth = 1;
+    ctx.strokeRect(x0,y0,plotW,plotH);
+
+    // ---- meet detection: up x down polyline segment intersections ----
+    // (deterministic; small dot + label). Collect first, draw after vessels.
+    var meets = [];
+    function segInt(a1,a2,b1,b2){
+      // a*,b* = [ts, mile] in DATA space; returns intersection [ts,mile] or null
+      var x1=a1[0],y1=a1[1],x2=a2[0],y2=a2[1],x3=b1[0],y3=b1[1],x4=b2[0],y4=b2[1];
+      var den=(x1-x2)*(y3-y4)-(y1-y2)*(x3-x4);
+      if(den===0) return null;
+      var t=((x1-x3)*(y3-y4)-(y1-y3)*(x3-x4))/den;
+      var u=((x1-x3)*(y1-y2)-(y1-y3)*(x1-x2))/den;
+      if(t<0||t>1||u<0||u>1) return null;
+      return [x1+t*(x2-x1), y1+t*(y2-y1)];
+    }
+    var ups = vessels.filter(function(v){return v.dir==="up";});
+    var downs = vessels.filter(function(v){return v.dir==="down";});
+    ups.forEach(function(a){
+      downs.forEach(function(b){
+        for(var ia=1;ia<a.pts.length;ia++){
+          for(var ib=1;ib<b.pts.length;ib++){
+            var hit=segInt(a.pts[ia-1],a.pts[ia],b.pts[ib-1],b.pts[ib]);
+            if(hit) meets.push(hit);
+          }
+        }
+      });
+    });
+
+    // ---- vessel polylines ----
+    ctx.lineWidth = 1.6;
+    ctx.lineJoin = "round";
+    vessels.forEach(function(v){
+      var col = v.dir==="up"?COL.green : (v.dir==="down"?COL.amber:COL.dim);
+      ctx.strokeStyle = col;
+      if(v.dir==="hold"){ ctx.setLineDash([2,4]); } else { ctx.setLineDash([]); }
+      ctx.beginPath();
+      v.pts.forEach(function(p,idx){
+        var gx=X(p[0]), gy=Y(p[1]);
+        if(idx===0) ctx.moveTo(gx,gy); else ctx.lineTo(gx,gy);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // glow for moving vessels
+      if(v.dir!=="hold"){
+        ctx.save(); ctx.shadowColor=col; ctx.shadowBlur=6; ctx.stroke(); ctx.restore();
+      }
+      // label at leading end (last pt)
+      var last=v.pts[v.pts.length-1];
+      var lx=X(last[0]), ly=Y(last[1]);
+      var label=(v.name&&v.name.length)?v.name:String(v.mmsi);
+      if(label.length>18) label=label.slice(0,17)+"…";
+      ctx.fillStyle=col; ctx.textAlign="left"; ctx.textBaseline="middle";
+      ctx.font="10px monospace";
+      // keep label inside the canvas
+      var tx = lx+5; if(tx > x0+plotW-2) tx = lx-5, ctx.textAlign="right";
+      ctx.fillText(label, tx, ly);
+      // leading dot
+      ctx.beginPath(); ctx.arc(lx,ly,2.2,0,6.283); ctx.fill();
+    });
+
+    // ---- meet markers ----
+    ctx.fillStyle = COL.warn;
+    meets.forEach(function(mh){
+      var gx=X(mh[0]), gy=Y(mh[1]);
+      ctx.beginPath(); ctx.arc(gx,gy,3,0,6.283); ctx.fill();
+    });
+    if(meets.length){
+      ctx.save(); ctx.shadowColor=COL.warn; ctx.shadowBlur=8;
+      meets.forEach(function(mh){ var gx=X(mh[0]),gy=Y(mh[1]); ctx.beginPath();ctx.arc(gx,gy,3,0,6.283);ctx.fill();});
+      ctx.restore();
+    }
+
+    // axis titles
+    ctx.fillStyle = COL.dim; ctx.font="10px monospace";
+    ctx.textAlign="left"; ctx.textBaseline="bottom";
+    ctx.save();
+    ctx.translate(12, y0+plotH/2); ctx.rotate(-Math.PI/2);
+    ctx.textAlign="center"; ctx.fillText("channel mile  (0 = Lake Erie · "+lenMi.toFixed(0)+" = Lk St Clair)",0,0);
+    ctx.restore();
+    ctx.textAlign="right"; ctx.textBaseline="bottom";
+    ctx.fillText("time (UTC) →", x0+plotW, y0+plotH+18+10);
+  }
+
+  // ---------------------------------------------------------------- trust strip
+  function renderTrust(){
+    var d = DATA||{};
+    // honest placeholders if a field is absent — NEVER show "undefined", "0", or a
+    // wall-clock. An empty/absent value means the producer has not signed yet.
+    var ch = d.receipt_chain || "PENDING_no_receipt";
+    var pulse = d.pulse_id || "PENDING_beacon_unreachable";
+    var df = d.derived_from || "PENDING_no_fact";
+    var nv = (d.vessels?d.vessels.length:0);
+    function span(cls,txt){ return '<span class="'+cls+'">'+txt+'</span>'; }
+    var chCls = isPending(ch)?"pending":"chain";
+    var plCls = isPending(pulse)?"pending":"pulse";
+    var dfCls = (isPending(df)||df==="UNCHAINED_NO_FACT")?"pending":"v";
+    var parts = [
+      '<span class="k">derived inference</span> · '+nv+' vessels',
+      'signed '+span(chCls, shortHash(ch)),
+      'anchored to beacon pulse '+span(plCls, pulse),
+      'facts: '+span(dfCls, shortHash(df))
+    ];
+    trustEl.innerHTML = parts.join(' &nbsp;<span class="k">—</span>&nbsp; ');
+  }
+
+  // ---------------------------------------------------------------- load
+  function boot(data){
+    DATA = data || {vessels:[]};
+    renderTrust();
+    render();
+  }
+
+  function tryInline(){
+    try{
+      var el=document.getElementById("stringline-data");
+      if(el){
+        var txt=el.textContent.trim();
+        if(txt && txt!=="{}"){
+          var j=JSON.parse(txt);
+          if(j && (j.vessels||j.receipt_chain)) return j;
+        }
+      }
+    }catch(e){}
+    return null;
+  }
+
+  // Prefer fetch (served); fall back to inline data island (file://); then honest empty.
+  var inlined = tryInline();
+  if(window.location.protocol==="file:"){
+    // file:// — fetch is blocked by CORS in most browsers; use inline if present.
+    if(inlined) boot(inlined);
+    else {
+      // last-ditch attempt at a same-dir fetch (some browsers allow it); else empty.
+      fetch("stringline.json").then(function(r){return r.json();}).then(boot)
+        .catch(function(){ boot(inlined||{vessels:[]}); });
+    }
+  } else {
+    fetch("stringline.json",{cache:"no-store"}).then(function(r){
+      if(!r.ok) throw new Error("http "+r.status);
+      return r.json();
+    }).then(boot).catch(function(){ boot(inlined||{vessels:[]}); });
+  }
+
+  var rt;
+  window.addEventListener("resize", function(){ clearTimeout(rt); rt=setTimeout(render,120); });
+})();
+</script>
+</body>
+</html>

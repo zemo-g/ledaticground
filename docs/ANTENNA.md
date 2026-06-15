@@ -110,3 +110,21 @@ elements, run it, read the SNR + decode count, adjust, re-run. Baselines accumul
 has to beat. Since AIS already works and 137 weather imaging waits on the **new** antenna
 anyway, a sane interim is: tune the kit for **162 vertical** now (lock in the Lakes vessel
 feed), and let the incoming antenna own 137.
+
+## LNA — closing the ~8 dB deficit (the gain-budget path)
+
+The ~8 dB sensitivity gap diagnosed above is **LNA-sized** — a low-noise preamp at the
+antenna feedpoint sets the system noise figure before coax loss, not a different antenna
+alone. The full procurement spec + gain-budget math (NF ≤1 dB, ~20 dB gain, SAW-filtered,
+bias-tee powered, placed at the feedpoint) is in **[`docs/LNA_SPEC.md`](LNA_SPEC.md)**.
+
+Key points cross-referenced here:
+- **Two bands, two LNAs.** 137-138 MHz (Sawbird+ 137 variant) is the **priority buy** — it
+  improves AIS/Orbcomm/137-beacon/weather, all of which run today. **400-406 MHz** (RS41
+  radiosondes) is a **separate LNA + a separate 400 MHz antenna** — this halo is 137-only
+  and cannot hear 400 MHz (`data/antenna_band.txt` gates `scripts/rs41_capture.sh`, which
+  refuses to capture an empty 400 MHz spectrum on the halo).
+- **Software is ready now.** The bias-tee interlock (`scripts/autocap/bias_tee.sh`, fail-
+  closed, coupled to active-capture-only in `pi_iq_capture.sh`) feeds the LNA +4.5 V up the
+  existing coax. The LNA part is the only procurement blocker for live gain. The RS41
+  decoder chain (`src/rs41_*.rail`) validates synthetically now (`scripts/selftest.sh`).

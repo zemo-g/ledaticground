@@ -1,0 +1,157 @@
+-- ledaticground VESSEL: attested DERIVED-product receipt (pure Rail) -- RECEIPT_CONTRACT v=2.
+-- Signs the kinematic vessel product (data/vessels.jsonl: per-vessel summary + ts-ordered
+-- track) as a LABELED INFERENCE under an Ed25519 signature, hash-chained + beacon-anchored,
+-- with round-trip verify + tamper detection. This is the INFERENCE half of the FACT/INFERENCE
+-- wall (RECEIPT_CONTRACT.md sec A.2 / sec E.1-E.2): the raw AIS frames were signed FACT by
+-- ais_attest.rail (type=FACT, AIS_RECEIPT); the derived kinematics/tracks are signed here as
+-- type=INFERENCE and MUST cryptographically point back at the FACT they were computed from.
+--
+-- THE WALL (the soul of this signer):
+--   derived_from = the chain_hash of the AIS FACT receipt, read from data/ais_fact_chain.txt
+--   (written by AC-1 / ais_attest.rail line 102). If that file is absent/empty, fall back to
+--   the raw-frame file digest src_ais_sha256 read from data/vessels.meta.json (a weaker but
+--   still-real fact anchor binding the product to the exact ais.jsonl it derived from). If
+--   BOTH are missing we DO NOT silently sign -- we set derived_from=UNCHAINED_NO_FACT and
+--   ABORT before signing, because an inference receipt with no fact root is a wall violation
+--   and a verifier MUST reject it (fail-loud at the attestation boundary, paos-deep-audit rule).
+--
+-- SEPARATE LEDGER FAMILY (RECEIPT_CONTRACT.md sec B.6): appends to
+-- data/vessel_inference_receipts.jsonl -- the inference family, NEVER mixed with the FACT
+-- ledgers (data/ais_receipts.jsonl etc.). Also writes the legacy single-object
+-- data/vessel_receipt.json for verify.rail backward compat, and advances data/chain/vessel_prev.txt.
+--
+-- Pulse from the unified beacon staging file (sec C); absent -> PENDING_beacon_unreachable
+-- (still signed+chained; the hash-chain is the local clock). NEVER pulse_id=0, NEVER wall-clock.
+-- geo stays PENDING_needs_GPS_PPS until GPS-PPS lands (no fabricated receiver coords).
+--
+-- Run via the flock-serialized wrapper:  bash scripts/railrun.sh <abs>/src/vessel_inference_attest.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+
+-- field_or: read a staging/identity file, strip trailing newline; honest default if absent/empty.
+-- Same idiom every ledaticground signer uses (ais_attest.rail line 34).
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+-- json_str_val: extract a quoted string value for `"<key>": "..."` from a JSON blob.
+-- Used ONLY for the vessels.meta.json src_ais_sha256 fallback. Returns "" if the key is
+-- absent (str_find -> -1) so the caller can decide UNCHAINED. Single-purpose, no lambda
+-- (filter-with-lambda segfault trap); builtins str_find/str_sub/string_length_bytes only.
+json_str_val blob key =
+  let pat = cat ["\"", key, "\": \""]
+  let i = str_find pat blob
+  if i < 0 then ""
+  else
+    let after = str_sub blob (i + (string_length_bytes pat)) (string_length_bytes blob)
+    let q = str_find "\"" after
+    if q < 0 then "" else str_sub after 0 q
+
+main =
+  -- VESSEL_INFERENCE DEV signing key -- distinct, clearly labeled (RECEIPT_CONTRACT.md sec E.3:
+  -- new INFERENCE signers MUST pick their own seed, never reuse a stream's seed). NOT a
+  -- production attestation authority -- production keys are the future V100 rung.
+  let seed = hex_to_bytes "1f5e551f5e551f5e551f5e551f5e551f5e551f5e551f5e551f5e551f5e550000"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- product = the canonical signed channel product (VP-1): per-vessel summary + track arrays.
+  -- product_sha256 commits to the LITERAL product bytes -- the receipt can never claim a
+  -- vessel set the file did not contain. Honest placeholder if the product is not yet built.
+  let product = field_or "/Users/ledaticempire/projects/ledaticground/data/vessels.jsonl" "PENDING_no_product"
+  let product_hash = sha256_hex product
+
+  -- ===== THE FACT-vs-INFERENCE WALL: resolve derived_from (fail-loud if no fact root) =====
+  -- 1st choice: the AIS FACT chain_hash (a true chain link) from data/ais_fact_chain.txt.
+  let fact_chain = field_or "/Users/ledaticempire/projects/ledaticground/data/ais_fact_chain.txt" ""
+  -- 2nd choice: the raw-frame file digest src_ais_sha256 from vessels.meta.json (weaker anchor).
+  let meta_blob = read_file "/Users/ledaticempire/projects/ledaticground/data/vessels.meta.json"
+  let meta_sha = json_str_val meta_blob "src_ais_sha256"
+  -- Nested if/then/else -- NO &&/|| (both sides always evaluate, no short-circuit).
+  let derived_from =
+    if fact_chain == "" then
+      (if meta_sha == "" then "UNCHAINED_NO_FACT" else cat ["src_ais_sha256:", meta_sha])
+    else fact_chain
+  let have_fact = if derived_from == "UNCHAINED_NO_FACT" then 0 else 1
+
+  -- beacon anchor (RECEIPT_CONTRACT.md sec C): unified staging files. Honest PENDING on fetch
+  -- failure (the shell wrapper owns the curl; absent file -> PENDING). NEVER 0, NEVER wall-clock.
+  -- pulse_hex travels as a hex string (avoids the char_from_int(0)=="" NUL-drop trap).
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING_beacon_unreachable"
+
+  -- real hash-chain: prev= is the prior vessel-inference chain_hash (advances across refresh
+  -- cycles via data/chain/vessel_prev.txt), or GENESIS for line 1.
+  let prev = field_or "/Users/ledaticempire/projects/ledaticground/data/chain/vessel_prev.txt" "GENESIS"
+
+  -- batch provenance BOUNDS (source-row scrubbed unix seconds + vessel count). These are NOT
+  -- the attestation clock (that is pulse_id); they bound which source rows the product covers.
+  -- Staged by the VP-4 wrapper; honest PENDING / 0 if unstaged.
+  let batch_start = field_or "/tmp/vessel_batch_start.txt" "PENDING"
+  let batch_end = field_or "/tmp/vessel_batch_end.txt" "PENDING"
+  let nstr = field_or "/tmp/vessel_n.txt" "0"
+
+  -- node / station identity is file-driven (sanitized: region only). geo PENDING until GPS-PPS.
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let node = sta
+  let band = "AIS-derived-vessel-kinematics"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  -- ===== FAIL-LOUD GUARD: never sign an inference with no fact root =====
+  -- Per the wall rule, if derived_from could not be resolved we ABORT before signing.
+  -- The verifier-side rule (E.2) also rejects derived_from=UNCHAINED_NO_FACT, but we refuse
+  -- to even emit a signed line in that state (fail at the attestation boundary, not downstream).
+  if have_fact == 0 then
+    let _ = print "FATAL  UNCHAINED_NO_FACT: no AIS fact chain_hash AND no vessels.meta.json src_ais_sha256."
+    let _ = print "FATAL  refusing to sign an inference receipt with no fact root (FACT/INFERENCE wall)."
+    let _ = print (cat ["       checked: data/ais_fact_chain.txt (empty) + data/vessels.meta.json src_ais_sha256 (", meta_sha, ")"])
+    1
+  else
+    -- v=2 INFERENCE receipt -- field order is LOAD-BEARING (the sig is over this EXACT string).
+    -- Canonical A.2 INFERENCE skeleton: type=INFERENCE + mandatory derived_from= naming the
+    -- FACT chain_hash this product rests on.
+    let receipt = join "|" ["VESSEL_INFERENCE_RECEIPT", "v=2", "type=INFERENCE", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["derived_from=", derived_from], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+    let msg = string_to_bytes receipt
+    let mlen = string_length_bytes receipt
+    let sig = ed25519_sign seed msg mlen
+    let sig_hex = bytes_to_hex sig 64
+
+    let verify_ok = ed25519_verify pk msg mlen sig
+    let tstr = cat [receipt, "X"]
+    let tmsg = string_to_bytes tstr
+    let tlen = string_length_bytes tstr
+    let tamper_ok = ed25519_verify pk tmsg tlen sig
+    let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+    let _ = print (cat ["DERIVED  derived_from=", derived_from])
+    let _ = print (cat ["RECEIPT  ", receipt])
+    let _ = print (cat ["SIG      ", sig_hex])
+    let _ = print (cat ["CHAIN    ", chain_hash])
+    let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+    let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+    -- v=2 chained JSONL line into the SEPARATE inference ledger family (sec B.6 -- never mixed
+    -- with FACT ledgers). SPACE-AFTER-COLON on every string field verify.rail reads is
+    -- LOAD-BEARING (its field_val matches `"key": "` WITH a space). Append via append_line
+    -- (NEVER append_file -- not a runtime symbol).
+    let jline = cat ["{\"v\":2,\"type\":\"INFERENCE\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+    let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/vessel_inference_receipts.jsonl" jline
+    let _ = print "APPENDED data/vessel_inference_receipts.jsonl (v=2 INFERENCE, separate family)"
+
+    -- legacy single-object data/vessel_receipt.json (latest) for verify.rail backward compat.
+    -- carries derived_from explicitly so a cold reader sees the fact root without re-parsing
+    -- the pipe string.
+    let jrec = join "\n" ["{", "  \"type\": \"INFERENCE\",", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"derived_from\": \"", derived_from, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+    let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/vessel_receipt.json" jrec
+    let _ = print "WROTE data/vessel_receipt.json"
+
+    -- advance the chain: this receipt's chain_hash becomes the next run's prev=.
+    let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/chain/vessel_prev.txt" chain_hash
+    let _ = print "WROTE data/chain/vessel_prev.txt (chain advanced)"
+    0

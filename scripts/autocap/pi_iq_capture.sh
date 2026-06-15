@@ -39,8 +39,14 @@ resume_roofmon(){               # ALWAYS bring AIS back; retry hard
   log "!! WARNING roofmon not confirmed active — Pi-side deadman should recover it"; return 1
 }
 
-# If stopped/killed mid-capture, free the SDR and restore AIS before exiting.
-trap 'log "signal -> free SDR + restore AIS"; [ "$DRY" = 1 ] || pkill -f "rtl_sdr -f" 2>/dev/null; resume_roofmon; exit 143' TERM INT
+# BIASTEE-1: bias-tee toggle (fail-closed; no-op/REFUSED if no LNA declared present).
+HEREDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bias_off(){ DRY_RUN="$DRY" bash "$HEREDIR/bias_tee.sh" off >/dev/null 2>&1 || true; }
+bias_on(){  DRY_RUN="$DRY" bash "$HEREDIR/bias_tee.sh" on  >/dev/null 2>&1 || true; }
+
+# If stopped/killed mid-capture, free the SDR, DE-ENERGIZE the bias-tee, and restore AIS.
+# bias_off is in the trap so the tee is never left hot when the SDR is released.
+trap 'log "signal -> free SDR + bias-tee OFF + restore AIS"; [ "$DRY" = 1 ] || pkill -f "rtl_sdr -f" 2>/dev/null; bias_off; resume_roofmon; exit 143' TERM INT
 
 captured(){                     # idempotency by AOS_EPOCH (survives reboot via the manifest file)
   [ -f "$MAN" ] && grep -q "^$1	" "$MAN"
@@ -49,6 +55,25 @@ captured(){                     # idempotency by AOS_EPOCH (survives reboot via 
 do_capture(){                   # $1=aos $2=dur $3=el $4=freq $5=mode $6=sat
   local aos="$1" dur="$2" el="$3" freq="$4" mode="$5" sat="$6"
   local satns ts name out tmp rdur sz rc
+
+  # RS41-7: MODE-tag dispatch (additive; does NOT touch the orbital path or the bias hooks).
+  # RS41 radiosondes are balloon-launched at 400-406 MHz with NO orbital TLE, so enum_passes.py
+  # (SGP4-driven) never emits an RS41 row -- but if one is manually seeded into the schedule, an
+  # orbital rtl_sdr at a bogus 137-band frequency/elevation would be wrong. Route it to the
+  # SCAN-based capture (scripts/rs41_capture.sh), which owns its OWN roofmon-preempt + bias-tee +
+  # antenna-band interlock (refuses on the 137 halo, exits non-zero, no fabricated 400 MHz capture).
+  case "$mode" in
+    RS41|RS41_*|*_RS41_*)
+      log "RS41 mode row -> scan capture (no TLE/orbit; rs41_capture.sh owns roofmon+bias+band interlock)"
+      DRY_RUN="$DRY" GAIN="$GAIN" bash "$HEREDIR/../rs41_capture.sh" "$(( (dur + 0) * 60 ))" ; rc=$?
+      # idempotency: mark this AOS row done regardless of capture/interlock outcome so the loop
+      # advances (a hardware-blocked RS41 row must not wedge the orbital scheduler).
+      printf '%s\t%s\t%s\t%s\n' "$aos" "RS41_scan_${mode}" "rs41_scan_rc${rc}" "$(date +%s)" >> "$MAN"
+      log "RS41 scan row consumed (rc=$rc); orbital scheduler continues"
+      return 0
+      ;;
+  esac
+
   satns=$(printf '%s' "$sat" | tr -d ' ')
   ts=$(date -u -d "@$aos" +%Y%m%dT%H%MZ 2>/dev/null || date -u +%Y%m%dT%H%MZ)
   name="iq_${satns}_el${el}_${mode}_${ts}.bin"
@@ -56,13 +81,16 @@ do_capture(){                   # $1=aos $2=dur $3=el $4=freq $5=mode $6=sat
   rdur=$(( (dur + 3) * 60 ))
   log "PASS $sat $mode el${el} @${freq}Hz ~${dur}min -> $name (window ${rdur}s, g${GAIN})"
   if [ "$DRY" = 1 ]; then
-    log "DRY: stop roofmon; timeout -k 10 $rdur rtl_sdr -f $freq -s $SR -g $GAIN $tmp; mv -> $out; manifest += $aos"
+    log "DRY: stop roofmon; bias_tee on; timeout -k 10 $rdur rtl_sdr -f $freq -s $SR -g $GAIN $tmp; bias_tee off; mv -> $out; manifest += $aos"
+    bias_on; bias_off            # exercise the DRY-path toggle (logs intent, no hardware)
     return 0
   fi
   sudo systemctl stop roofmon.service || { log "could not stop roofmon; abort pass"; return 1; }
   sleep 1
+  bias_on                        # BIASTEE-1: energize ONLY for the capture window (no-op/REFUSED if no LNA)
   timeout -k 10 "$rdur" rtl_sdr -f "$freq" -s "$SR" -g "$GAIN" "$tmp" >/tmp/iqcap_rtl.log 2>&1
   rc=$?
+  bias_off                       # de-energize the moment the SDR is released -- never left hot
   resume_roofmon                # free SDR + restore AIS ASAP, regardless of capture outcome
   sz=$(stat -c%s "$tmp" 2>/dev/null || echo 0)
   if [ "${sz:-0}" -lt 1000000 ]; then log "capture too small (${sz}B rc=$rc) — discarding $tmp"; rm -f "$tmp"; return 1; fi

@@ -1,13 +1,25 @@
--- ledaticground: attested AIS reception receipt (pure Rail).
--- Binds a vessel/AtoN observation set to the receiving node, under an Ed25519 signature,
--- hash-chained, with round-trip verify + tamper detection. The proof-of-reception soul
--- applied to ship traffic: "this node received exactly these messages at this time."
--- Run from the rail repo dir so stdlib crypto's nested relative imports resolve:
---   cd ~/projects/rail && ./rail_native run <ledaticground>/src/ais_attest.rail
+-- ledaticground: attested AIS reception receipt (pure Rail) -- RECEIPT_CONTRACT v=2.
+-- Binds a vessel/AtoN observation BATCH to the receiving node, under an Ed25519 signature,
+-- HASH-CHAINED (real prev= from the tail of data/ais_receipts.jsonl), beacon-anchored, with
+-- round-trip verify + tamper detection. The proof-of-reception soul applied to ship traffic:
+-- "this node received exactly these messages in this batch window, chained to all prior batches."
 --
--- The product = the pure-Rail decode output (/tmp/ais_decoded.txt). Precise receiver
--- geolocation is a labeled-PENDING field until the node has GPS-PPS (the v100 rung) —
--- the same honest-pending pattern attest.rail uses for the Doppler residual.
+-- v=2 changes from v=1 (per docs/RECEIPT_CONTRACT.md sections A/B/C/D):
+--   * receipt string: AIS_RECEIPT|v=2|type=FACT|node=..|station=..|band=..|geo=..|
+--     pulse_id=..|pulse_hex=..|batch_start=..|batch_end=..|n=..|
+--     product_sha256=..|prev=..|signer=..   (field order is LOAD-BEARING; AIS has no honesty bit)
+--   * real hash-chaining: prev= read from /tmp/ais_prev_sha.txt (the tail chain_hash, or GENESIS).
+--   * beacon anchor: pulse_id/pulse_hex read from the unified /tmp/lg_pulse_id.txt + /tmp/lg_pulse_hex.txt
+--     staged by scripts/fetch_beacon_pulse.sh. On fetch failure -> PENDING_beacon_unreachable (still signed+chained).
+--   * APPENDS one v=2 JSON line to data/ais_receipts.jsonl via stdlib/file.rail append_line.
+--   * ALSO keeps writing the legacy single-object data/ais_receipt.json for verify.rail backward compat.
+--   * writes the tail chain_hash to data/ais_fact_chain.txt (VP-2 / vessel-inference derived_from source).
+--
+-- The product = the deterministic newline-join of canonical per-frame strings
+-- (/tmp/ais_batch_frames.txt, staged by scripts/attest_ais_rollup.sh, sorted (ts,mmsi)).
+-- The source jsonl IS the evidence the product_sha256 commits to; frames are NOT embedded.
+-- Precise receiver geolocation stays geo=PENDING_needs_GPS_PPS until the node has GPS-PPS.
+-- Run via the flock-serialized wrapper:  bash scripts/railrun.sh <abs>/src/ais_attest.rail
 
 import "stdlib/sha256.rail"
 import "stdlib/sha512.rail"
@@ -15,32 +27,48 @@ import "stdlib/x25519.rail"
 import "stdlib/ed25519.rail"
 import "stdlib/ed25519_scalar.rail"
 import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
 
+-- field_or: read a /tmp staging file (set by the shell roll-up driver), strip trailing
+-- newline; if absent/empty fall back to the honest default. Same idiom every signer uses.
 field_or path def =
   let v = str_replace "\n" "" (read_file path)
   if v == "" then def else v
 
 main =
-  -- DEV signing key (NOT a production attestation authority — clearly labeled).
+  -- DEV signing key (NOT a production attestation authority -- clearly labeled).
+  -- AIS shares this seed with RFML per the contract dev-seed table (E.3); KIND/band disambiguate.
   let seed = hex_to_bytes "a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a15a1500"
   let pk = ed25519_pk_from_sk seed
   let pk_hex = bytes_to_hex pk 32
 
-  -- product = the pure-Rail AIS decode (one line per CRC-valid message); hash its content
-  let product = read_file "/tmp/ais_decoded.txt"
+  -- product = the deterministic canonical-frame digest source staged by the roll-up driver.
+  let product = read_file "/tmp/ais_batch_frames.txt"
   let product_hash = sha256_hex product
 
-  -- capture pulse (unix time stand-in; should anchor to ledatic.org/entropy in prod)
-  let pulse = field_or "/tmp/ais_pulse.txt" "PENDING_no_pulse"
-  let prev = "GENESIS"
+  -- beacon pulse: unified staging files (contract section C). Honest PENDING on fetch failure.
+  -- pulse_hex always travels as a hex string -- avoids the char_from_int(0)=="" NUL-drop trap.
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING_beacon_unreachable"
 
-  -- node identity is file-driven (defaults to the roof node). Precise lat/lon is PENDING
-  -- until GPS-PPS — receiver geolocation is not asserted, only the node identity + band.
+  -- real hash-chain: prev= is the tail line's chain_hash (staged by the driver), or GENESIS.
+  let prev = field_or "/tmp/ais_prev_sha.txt" "GENESIS"
+
+  -- batch bounds: source-row scrubbed unix seconds (provenance BOUNDS only, NOT the attestation
+  -- clock). Staged by the driver from the selected source rows; PENDING if unstaged.
+  let batch_start = field_or "/tmp/ais_batch_start.txt" "PENDING"
+  let batch_end = field_or "/tmp/ais_batch_end.txt" "PENDING"
+  let nstr = field_or "/tmp/ais_batch_n.txt" "0"
+
+  -- node identity is file-driven (sanitized: region only, no street address). Precise lat/lon
+  -- is PENDING until GPS-PPS -- receiver geolocation is not asserted, only node identity + band.
   let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
   let band = "AIS-161.975MHz"
   let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
 
-  let receipt = join "|" ["AIS_RECEIPT", cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse=", pulse], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  -- v=2 receipt string -- field order LOAD-BEARING (sig is over this exact string).
+  -- AIS_RECEIPT carries NO per-batch honesty bit (contract A.3: AIS slot omitted).
+  let receipt = join "|" ["AIS_RECEIPT", "v=2", "type=FACT", cat ["node=", sta], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
   let msg = string_to_bytes receipt
   let mlen = string_length_bytes receipt
   let sig = ed25519_sign seed msg mlen
@@ -59,7 +87,18 @@ main =
   let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
   let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
 
+  -- v=2 chained JSONL ledger line. Space-after-colon on every string field verify.rail reads
+  -- (receipt/sig/signer/chain_hash) -- the cold verifier's field_val matches `"key": "`.
+  let jsonline = cat ["{\"v\":2,\"type\":\"FACT\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/ais_receipts.jsonl" jsonline
+  let _ = print "APPENDED data/ais_receipts.jsonl (v=2 chained line)"
+
+  -- legacy single-object data/ais_receipt.json (latest) for verify.rail backward compat.
   let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
   let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/ais_receipt.json" jrec
   let _ = print "WROTE data/ais_receipt.json"
+
+  -- the latest AIS fact chain_hash -> data/ais_fact_chain.txt (VP-2 / vessel-inference derived_from).
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/ais_fact_chain.txt" chain_hash
+  let _ = print "WROTE data/ais_fact_chain.txt"
   0

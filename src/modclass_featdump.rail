@@ -1,0 +1,418 @@
+-- RFML-4 parity oracle: dump the Rail 18-feature vectors for the first N windows of a
+-- capture, so they can be diffed byte-for-byte against the Python featlib_v3.feats().
+-- Reuses the EXACT feature path of src/modclass.rail (same feat_store/feat_store_v3).
+-- Run from ledaticground root: ./rail_native run src/modclass_featdump.rail
+-- Writes /tmp/rail_feat_dump.txt : one line per window, 18 space-joined floats.
+
+foreign fopen path mode -> int
+foreign fclose fp
+foreign fread buf size count fp
+foreign fseek fp offset whence
+foreign ftell fp -> int
+foreign cos x -> float
+foreign sin x -> float
+foreign sqrt x -> float
+foreign atan2 y x -> float
+foreign log x -> float
+foreign exp x -> float
+foreign fabs x -> float
+
+read_bytes path =
+  let fp = fopen path "rb"
+  if fp == 0 then arr_new 0 0
+  else
+    let _ = fseek fp 0 2
+    let n = ftell fp
+    let _ = fseek fp 0 0
+    let buf = malloc n
+    let _ = fread buf 1 n fp
+    let _ = fclose fp
+    let arr = arr_new n 0
+    let _ = copy_bytes buf arr 0 n
+    let _ = free buf
+    arr
+copy_bytes buf arr i n =
+  if i >= n then 0
+  else
+    let _ = arr_set arr i (byte_at buf i)
+    copy_bytes buf arr (i + 1) n
+s16_at bytes i =
+  let lo = arr_get bytes (2 * i)
+  let hi = arr_get bytes (2 * i + 1)
+  let u = bit_or lo (shl hi 8)
+  if u >= 32768 then u - 65536 else u
+
+brev_one i bits acc =
+  let bit = i % 2
+  brev_loop (i / 2) (bits - 1) (acc * 2 + bit)
+brev_loop i bits acc =
+  if bits == 0 then acc
+  else brev_one i bits acc
+bitrev i bits = brev_loop i bits 0
+log2i n = if n <= 1 then 0 else 1 + log2i (n / 2)
+reorder re im n bits i =
+  if i >= n then 0
+  else
+    let r = bitrev i bits
+    let _ = if i < r then
+              let tr = float_arr_get re i
+              let ti = float_arr_get im i
+              let _ = float_arr_set re i (float_arr_get re r)
+              let _ = float_arr_set im i (float_arr_get im r)
+              let _ = float_arr_set re r tr
+              let _ = float_arr_set im r ti
+              0
+            else 0
+    reorder re im n bits (i + 1)
+bfly re im len half i j twopi =
+  if j >= half then 0
+  else
+    let ang = (0.0 - twopi) * (int_to_float j) / (int_to_float len)
+    let wr = cos ang
+    let wi = sin ang
+    let a = i + j
+    let b = i + j + half
+    let ur = float_arr_get re a
+    let ui = float_arr_get im a
+    let xr = float_arr_get re b
+    let xi = float_arr_get im b
+    let vr = xr * wr - xi * wi
+    let vi = xr * wi + xi * wr
+    let _ = float_arr_set re a (ur + vr)
+    let _ = float_arr_set im a (ui + vi)
+    let _ = float_arr_set re b (ur - vr)
+    let _ = float_arr_set im b (ui - vi)
+    bfly re im len half i (j + 1) twopi
+grp re im n len half i twopi =
+  if i >= n then 0
+  else
+    let _ = bfly re im len half i 0 twopi
+    grp re im n len half (i + len) twopi
+stage re im n len twopi =
+  if len > n then 0
+  else
+    let half = len / 2
+    let _ = grp re im n len half 0 twopi
+    stage re im n (len * 2) twopi
+fft re im n =
+  let bits = log2i n
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let _ = reorder re im n bits 0
+  let _ = stage re im n 2 twopi
+  0
+
+fsign x = if x > 0.0 then 1.0 else (if x < 0.0 then (0.0 - 1.0) else 0.0)
+
+sumf f i n cell =
+  if i >= n then 0
+  else
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get f i))
+    sumf f (i + 1) n cell
+sumsq f i n mean cell =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + d * d)
+    sumsq f (i + 1) n mean cell
+sumabsdiff f i n cell =
+  if i >= (n - 1) then 0
+  else
+    let d = (float_arr_get f (i + 1)) - (float_arr_get f i)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (fabs d))
+    sumabsdiff f (i + 1) n cell
+sumsgnchg f i n mean cell =
+  if i >= (n - 1) then 0
+  else
+    let s1 = fsign ((float_arr_get f i) - mean)
+    let s2 = fsign ((float_arr_get f (i + 1)) - mean)
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (fabs (s2 - s1)))
+    sumsgnchg f (i + 1) n mean cell
+summoments f i n mean sd c3 c4 =
+  if i >= n then 0
+  else
+    let z = ((float_arr_get f i) - mean) / sd
+    let z2 = z * z
+    let _ = float_arr_set c3 0 ((float_arr_get c3 0) + z * z2)
+    let _ = float_arr_set c4 0 ((float_arr_get c4 0) + z2 * z2)
+    summoments f (i + 1) n mean sd c3 c4
+fill_spec f re im i n mean sd twopi =
+  if i >= n then 0
+  else
+    let z = ((float_arr_get f i) - mean) / sd
+    let w = 0.5 - 0.5 * (cos (twopi * (int_to_float i) / (int_to_float (n - 1))))
+    let _ = float_arr_set re i (z * w)
+    let _ = float_arr_set im i 0.0
+    fill_spec f re im (i + 1) n mean sd twopi
+spec_pass re im k nb acc =
+  if k >= nb then 0
+  else
+    let pr = float_arr_get re k
+    let pii = float_arr_get im k
+    let p = pr * pr + pii * pii
+    let _ = float_arr_set acc 0 ((float_arr_get acc 0) + p)
+    let _ = float_arr_set acc 1 ((float_arr_get acc 1) + (int_to_float k) * p)
+    let _ = if p > (float_arr_get acc 2) then
+              let _ = float_arr_set acc 2 p
+              float_arr_set acc 3 (int_to_float k)
+            else 0
+    let _ = float_arr_set acc 4 ((float_arr_get acc 4) + (log (p + 0.000000000001)))
+    let _ = float_arr_set acc 5 ((float_arr_get acc 5) + 1.0)
+    let _ = if k >= (nb / 3) then float_arr_set acc 6 ((float_arr_get acc 6) + p) else 0
+    let _ = if k < 170 then float_arr_set acc 7 ((float_arr_get acc 7) + p) else 0
+    spec_pass re im (k + 1) nb acc
+
+fill_power re im P k nb =
+  if k >= nb then 0
+  else
+    let pr = float_arr_get re k
+    let pii = float_arr_get im k
+    let _ = float_arr_set P k (pr * pr + pii * pii)
+    fill_power re im P (k + 1) nb
+bw_acc P k nb mu_bin cell =
+  if k >= nb then 0
+  else
+    let dk = (int_to_float k) - mu_bin
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + (float_arr_get P k) * dk * dk)
+    bw_acc P (k + 1) nb mu_bin cell
+fill_smooth P Sm k nb =
+  if k >= nb then 0
+  else
+    let lo = if (k - 1) >= 1 then float_arr_get P (k - 1) else 0.0
+    let hi = if (k + 1) <= (nb - 1) then float_arr_get P (k + 1) else 0.0
+    let _ = float_arr_set Sm k ((lo + (float_arr_get P k) + hi) / 3.0)
+    fill_smooth P Sm (k + 1) nb
+smax_acc Sm k nb cell =
+  if k >= nb then 0
+  else
+    let _ = if (float_arr_get Sm k) > (float_arr_get cell 0) then float_arr_set cell 0 (float_arr_get Sm k) else 0
+    smax_acc Sm (k + 1) nb cell
+npk_acc Sm k nb thr smx cell =
+  if k >= nb then 0
+  else
+    let _ = if smx > 0.0 then
+              (if (float_arr_get Sm k) >= thr then float_arr_set cell 0 ((float_arr_get cell 0) + 1.0) else 0)
+            else 0
+    npk_acc Sm (k + 1) nb thr smx cell
+shift_top1 v p1 p2 p3 =
+  let _ = float_arr_set p3 0 (float_arr_get p2 0)
+  let _ = float_arr_set p2 0 (float_arr_get p1 0)
+  float_arr_set p1 0 v
+shift_top2 v p2 p3 =
+  let _ = float_arr_set p3 0 (float_arr_get p2 0)
+  float_arr_set p2 0 v
+ins_top3 v p1 p2 p3 =
+  if v > (float_arr_get p1 0) then shift_top1 v p1 p2 p3
+  else (if v > (float_arr_get p2 0) then shift_top2 v p2 p3
+        else (if v > (float_arr_get p3 0) then float_arr_set p3 0 v else 0))
+locmax_scan P Sm k nb p1 p2 p3 =
+  if k >= nb then 0
+  else
+    let lo = if (k - 1) >= 1 then float_arr_get Sm (k - 1) else 0.0
+    let hi = if (k + 1) <= (nb - 1) then float_arr_get Sm (k + 1) else 0.0
+    let _ = if (float_arr_get Sm k) > lo then
+              (if (float_arr_get Sm k) >= hi then ins_top3 (float_arr_get P k) p1 p2 p3 else 0)
+            else 0
+    locmax_scan P Sm (k + 1) nb p1 p2 p3
+occ_scan P k nb pthr locell hicell =
+  if k >= nb then 0
+  else
+    let _ = if (float_arr_get P k) >= pthr then
+              let _ = if (int_to_float k) < (float_arr_get locell 0) then float_arr_set locell 0 (int_to_float k) else 0
+              (if (int_to_float k) > (float_arr_get hicell 0) then float_arr_set hicell 0 (int_to_float k) else 0)
+            else 0
+    occ_scan P (k + 1) nb pthr locell hicell
+sumsqsig f i n mean cell =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + d * d)
+    sumsqsig f (i + 1) n mean cell
+sumsqvar f i n mean ym cell =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let y = d * d
+    let yc = y - ym
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + yc * yc)
+    sumsqvar f (i + 1) n mean ym cell
+fill_sqspec f re2 im2 i n mean ym ysd twopi =
+  if i >= n then 0
+  else
+    let d = (float_arr_get f i) - mean
+    let y = d * d
+    let yc = (y - ym) / ysd
+    let w = 0.5 - 0.5 * (cos (twopi * (int_to_float i) / (int_to_float (n - 1))))
+    let _ = float_arr_set re2 i (yc * w)
+    let _ = float_arr_set im2 i 0.0
+    fill_sqspec f re2 im2 (i + 1) n mean ym ysd twopi
+sq_total re2 im2 k nb cell =
+  if k >= nb then 0
+  else
+    let pr = float_arr_get re2 k
+    let pii = float_arr_get im2 k
+    let _ = float_arr_set cell 0 ((float_arr_get cell 0) + pr * pr + pii * pii)
+    sq_total re2 im2 (k + 1) nb cell
+sq_band re2 im2 k khi mxcell argcell =
+  if k >= khi then 0
+  else
+    let pr = float_arr_get re2 k
+    let pii = float_arr_get im2 k
+    let p = pr * pr + pii * pii
+    let _ = if p > (float_arr_get mxcell 0) then
+              let _ = float_arr_set mxcell 0 p
+              float_arr_set argcell 0 (int_to_float k)
+            else 0
+    sq_band re2 im2 (k + 1) khi mxcell argcell
+
+feat_store_v3 f n re im re2 im2 P Sm twopi nbins ps mx mu_bin F off =
+  let _ = fill_power re im P 1 nbins
+  let bwcell = float_arr_new 1 0.0
+  let _ = bw_acc P 1 nbins mu_bin bwcell
+  let bw = (sqrt ((float_arr_get bwcell 0) / ps)) / (int_to_float nbins)
+  let _ = fill_smooth P Sm 1 nbins
+  let smxcell = float_arr_new 1 0.0
+  let _ = smax_acc Sm 1 nbins smxcell
+  let smx = float_arr_get smxcell 0
+  let npkcell = float_arr_new 1 0.0
+  let _ = npk_acc Sm 1 nbins (0.25 * smx) smx npkcell
+  let npeaks = (float_arr_get npkcell 0) / (int_to_float nbins)
+  let p1c = float_arr_new 1 0.0
+  let p2c = float_arr_new 1 0.0
+  let p3c = float_arr_new 1 0.0
+  let _ = locmax_scan P Sm 1 nbins p1c p2c p3c
+  let p1 = float_arr_get p1c 0
+  let p2 = float_arr_get p2c 0
+  let p3 = float_arr_get p3c 0
+  let peak2 = p2 / ps
+  let peak3 = p3 / ps
+  let p2p1 = p2 / (p1 + 0.000000000001)
+  let locell = float_arr_new 1 (int_to_float nbins)
+  let hicell = float_arr_new 1 0.0
+  let _ = occ_scan P 1 nbins (0.25 * mx) locell hicell
+  let occ_lo = float_arr_get locell 0
+  let occ_hi = float_arr_get hicell 0
+  let occ_bins = if occ_hi >= occ_lo then (occ_hi - occ_lo) else 0.0
+  let occ_norm = (occ_bins * (48000.0 / (int_to_float n))) / (48000.0 / 2.0)
+  let smean = float_arr_new 1 0.0
+  let _ = sumf f 0 n smean
+  let mean = (float_arr_get smean 0) / (int_to_float n)
+  let symc = float_arr_new 1 0.0
+  let _ = sumsqsig f 0 n mean symc
+  let ym = (float_arr_get symc 0) / (int_to_float n)
+  let yvc = float_arr_new 1 0.0
+  let _ = sumsqvar f 0 n mean ym yvc
+  let ysd = (sqrt ((float_arr_get yvc 0) / (int_to_float n))) + 0.000000001
+  let _ = fill_sqspec f re2 im2 0 n mean ym ysd twopi
+  let _ = fft re2 im2 n
+  let sqtc = float_arr_new 1 0.0
+  let _ = sq_total re2 im2 1 nbins sqtc
+  let p2tot = (float_arr_get sqtc 0) + 0.000000000001
+  let klo0 = (200 * n) / 48000
+  let klo = if klo0 < 1 then 1 else klo0
+  let khi0 = (12000 * n) / 48000
+  let khi = if khi0 > nbins then nbins else khi0
+  let mxbcell = float_arr_new 1 0.0
+  let argbcell = float_arr_new 1 0.0
+  let _ = sq_band re2 im2 klo khi mxbcell argbcell
+  let sq_sharp = (float_arr_get mxbcell 0) / p2tot
+  let argb = float_arr_get argbcell 0
+  let baud_hz = if argb > 0.0 then (argb * (48000.0 / (int_to_float n))) else 0.0
+  let baud_norm = baud_hz / (48000.0 / 2.0)
+  let _ = float_arr_set F (off + 10) peak2
+  let _ = float_arr_set F (off + 11) npeaks
+  let _ = float_arr_set F (off + 12) bw
+  let _ = float_arr_set F (off + 13) p2p1
+  let _ = float_arr_set F (off + 14) peak3
+  let _ = float_arr_set F (off + 15) sq_sharp
+  let _ = float_arr_set F (off + 16) occ_norm
+  let _ = float_arr_set F (off + 17) baud_norm
+  0
+
+feat_store f n re im re2 im2 P Sm twopi F off =
+  let cm = float_arr_new 1 0.0
+  let _ = sumf f 0 n cm
+  let mean = (float_arr_get cm 0) / (int_to_float n)
+  let cv = float_arr_new 1 0.0
+  let _ = sumsq f 0 n mean cv
+  let var = (float_arr_get cv 0) / (int_to_float n)
+  let sd = (sqrt var) + 0.000000001
+  let cr = float_arr_new 1 0.0
+  let _ = sumabsdiff f 0 n cr
+  let rough = ((float_arr_get cr 0) / (int_to_float (n - 1))) / sd
+  let cz = float_arr_new 1 0.0
+  let _ = sumsgnchg f 0 n mean cz
+  let zcr = ((float_arr_get cz 0) / (int_to_float (n - 1))) / 2.0
+  let c3 = float_arr_new 1 0.0
+  let c4 = float_arr_new 1 0.0
+  let _ = summoments f 0 n mean sd c3 c4
+  let m3 = (float_arr_get c3 0) / (int_to_float n)
+  let m4 = (float_arr_get c4 0) / (int_to_float n)
+  let kurt = m4 - 3.0
+  let bimod = (m3 * m3 + 1.0) / (m4 + 0.000000001)
+  let _ = fill_spec f re im 0 n mean sd twopi
+  let _ = fft re im n
+  let nbins = (n / 2) + 1
+  let acc = float_arr_new 8 0.0
+  let _ = spec_pass re im 1 nbins acc
+  let ps = (float_arr_get acc 0) + 0.000000000001
+  let peak = (float_arr_get acc 2) / ps
+  let cent = ((float_arr_get acc 1) / ps) / (int_to_float nbins)
+  let hf = (float_arr_get acc 6) / ps
+  let lf = (float_arr_get acc 7) / ps
+  let dom = (float_arr_get acc 3) / (int_to_float nbins)
+  let cnt = float_arr_get acc 5
+  let geomean = exp ((float_arr_get acc 4) / cnt)
+  let amean = (float_arr_get acc 0) / cnt
+  let flat = geomean / (amean + 0.000000000001)
+  let _ = float_arr_set F (off + 0) rough
+  let _ = float_arr_set F (off + 1) zcr
+  let _ = float_arr_set F (off + 2) flat
+  let _ = float_arr_set F (off + 3) peak
+  let _ = float_arr_set F (off + 4) cent
+  let _ = float_arr_set F (off + 5) kurt
+  let _ = float_arr_set F (off + 6) bimod
+  let _ = float_arr_set F (off + 7) hf
+  let _ = float_arr_set F (off + 8) lf
+  let _ = float_arr_set F (off + 9) dom
+  let mx = float_arr_get acc 2
+  let mu_bin = (float_arr_get acc 1) / ps
+  let _ = feat_store_v3 f n re im re2 im2 P Sm twopi nbins ps mx mu_bin F off
+  0
+
+load_win bytes f base i n =
+  if i >= n then 0
+  else
+    let _ = float_arr_set f i (int_to_float (s16_at bytes (base + i)))
+    load_win bytes f base (i + 1) n
+
+-- emit one window's 18 features as a space-joined line, appended to acc
+emit_feats F off i acc =
+  if i >= 18 then acc
+  else emit_feats F off (i + 1) (cat [acc, " ", show_float (float_arr_get F (off + i))])
+dump_loop bytes f re im re2 im2 P Sm twopi F nwin w out =
+  if w >= nwin then out
+  else
+    let _ = load_win bytes f (w * 4096) 0 4096
+    let _ = feat_store f 4096 re im re2 im2 P Sm twopi F 0
+    let line = emit_feats F 0 0 ""
+    dump_loop bytes f re im re2 im2 P Sm twopi F nwin (w + 1) (cat [out, line, "\n"])
+
+main =
+  let twopi = (atan2 0.0 (0.0 - 1.0)) * 2.0
+  let f = float_arr_new 4096 0.0
+  let re = float_arr_new 4096 0.0
+  let im = float_arr_new 4096 0.0
+  let re2 = float_arr_new 4096 0.0
+  let im2 = float_arr_new 4096 0.0
+  let P = float_arr_new 4096 0.0
+  let Sm = float_arr_new 4096 0.0
+  let F = float_arr_new 18 0.0
+  let bytes = read_bytes "data/ais_clean_a.s16"
+  let ns = (arr_len bytes) / 2
+  let nwinAll = ns / 4096
+  -- dump only the first 8 windows (keep the string small; bump-allocator note in CLAUDE.md)
+  let nwin = if nwinAll > 8 then 8 else nwinAll
+  let out = dump_loop bytes f re im re2 im2 P Sm twopi F nwin 0 ""
+  let _ = write_file "/tmp/rail_feat_dump.txt" out
+  let _ = print (cat ["WROTE /tmp/rail_feat_dump.txt windows=", show nwin])
+  0

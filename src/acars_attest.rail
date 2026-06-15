@@ -1,16 +1,31 @@
--- ledaticground: attested ACARS reception receipt (pure Rail).
--- Binds a decoded ACARS message (mode/reg/label/blkid/text + BCS verdict) to the receiving
--- node under an Ed25519 signature, hash-chained, with round-trip verify + tamper detection.
--- The proof-of-reception soul applied to aircraft VHF data: "this node received exactly this
--- ACARS block at this time, and its block-check passed."
--- Run from the rail repo dir so stdlib crypto's nested relative imports resolve:
---   cd ~/projects/rail && ./rail_native run <ledaticground>/src/acars_attest.rail
+-- ledaticground: attested ACARS reception receipt (pure Rail) — CONTRACT v=2.
+-- Binds a decoded ACARS deframe batch (mode/reg/label/blkid/text + BCS verdict) to the
+-- receiving node under an Ed25519 signature, REAL hash-chained, beacon-anchored, with
+-- round-trip verify + tamper detection. The proof-of-reception soul applied to aircraft
+-- VHF data: "this node received exactly this ACARS block at this pulse, and here is
+-- whether its block-check passed."
 --
--- The product = the pure-Rail deframe output (/tmp/acars_deframe_out.txt). Precise receiver
--- geolocation is a labeled-PENDING field until the node has GPS-PPS — same honest-pending
--- pattern ais_attest.rail / attest.rail use. Cross-pol caveat: a horizontal antenna on this
--- vertical terrestrial signal means low SNR, so the receipt records SNR honesty, not a claim
--- of perfect copy — the BCS verdict is what is attested.
+-- v=2 upgrade (docs/RECEIPT_CONTRACT.md sections A–G):
+--   * receipt string carries v=2|type=FACT|node=|...|pulse_id=|pulse_hex=|batch_*|n=|bcs_ok=|...
+--   * REAL prev_sha chaining (read from /tmp/acars_prev_sha.txt, GENESIS on first line)
+--   * beacon pulse via the SHARED /tmp/lg_pulse_id.txt + /tmp/lg_pulse_hex.txt staging
+--   * appends ONE chained line to data/acars_receipts.jsonl (stdlib/file.rail append_line)
+--   * STILL overwrites the legacy single-object data/acars_receipt.json for verify.rail
+--
+-- HONESTY (operator standing rules):
+--   * bcs_ok is the BCS (block-check-sequence) verdict honesty bit. A frame that fails the
+--     block-check is STILL a fact ("received, BCS failed") — it is recorded with bcs_ok=0,
+--     NEVER dropped. The verdict is staged by the rollup driver into /tmp/acars_bcs_ok.txt;
+--     the Rail signer reads it via field_or and FAILS CLOSED (default "0") if absent — it
+--     never assumes a pass it did not observe.
+--   * geo stays the literal PENDING_needs_GPS_PPS until GPS-PPS lands. Never fabricated.
+--   * pulse fetch failure -> pulse_id=PENDING_beacon_unreachable (NEVER 0, NEVER wall-clock).
+--   * pulse_hex travels as a HEX STRING (char_from_int(0)=="" NUL-drop trap avoided).
+--   * cross-pol caveat: a horizontal halo on this vertical terrestrial signal means low SNR,
+--     so the receipt records the BCS verdict honesty, not a claim of perfect copy.
+--
+-- Run via the flock-serialized wrapper so stdlib crypto's nested relative imports resolve:
+--   bash scripts/railrun.sh <ledaticground>/src/acars_attest.rail
 
 import "stdlib/sha256.rail"
 import "stdlib/sha512.rail"
@@ -18,7 +33,9 @@ import "stdlib/x25519.rail"
 import "stdlib/ed25519.rail"
 import "stdlib/ed25519_scalar.rail"
 import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
 
+-- read one config line, strip newline, fall back to a safe default (verbatim idiom).
 field_or path def =
   let v = str_replace "\n" "" (read_file path)
   if v == "" then def else v
@@ -29,21 +46,36 @@ main =
   let pk = ed25519_pk_from_sk seed
   let pk_hex = bytes_to_hex pk 32
 
-  -- product = the pure-Rail ACARS deframe output (parsed fields + BCS verdict)
+  -- product = the pure-Rail ACARS deframe output (parsed fields + BCS verdict).
+  -- product_sha256 commits to the literal batch text; the source is the evidence.
   let product = read_file "/tmp/acars_deframe_out.txt"
   let product_hash = sha256_hex product
 
-  -- capture pulse (unix time stand-in; should anchor to ledatic.org/entropy in prod)
-  let pulse = field_or "/tmp/acars_pulse.txt" "PENDING_no_pulse"
-  let prev = "GENESIS"
+  -- beacon pulse (SHARED staging, by the shell wrapper, per contract C). HONEST fallback.
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING_beacon_unreachable"
 
-  -- node identity is file-driven (defaults to the roof node). Precise lat/lon is PENDING
-  -- until GPS-PPS — receiver geolocation is not asserted, only node identity + band.
+  -- REAL hash-chaining: prev = chain_hash of the prior ledger line (GENESIS only on line 1).
+  let prev = field_or "/tmp/acars_prev_sha.txt" "GENESIS"
+
+  -- batch provenance BOUNDS (scrubbed source-row unix seconds) + count — staged by driver.
+  -- These are NOT the attestation clock (that is pulse_id); they bound which rows were signed.
+  let batch_start = field_or "/tmp/acars_batch_start.txt" "PENDING_no_batch"
+  let batch_end = field_or "/tmp/acars_batch_end.txt" "PENDING_no_batch"
+  let n = field_or "/tmp/acars_batch_n.txt" "0"
+
+  -- BCS honesty bit — FAIL CLOSED: a missing/unparsed verdict records bcs_ok=0, never a
+  -- fabricated pass. A bcs_ok=0 frame is recorded, never dropped.
+  let bcs_ok = field_or "/tmp/acars_bcs_ok.txt" "0"
+
+  -- node identity is file-driven (sanitized, no street address). geo PENDING until GPS-PPS.
   let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
-  let band = "ACARS-136.975MHz"
+  let node = sta
+  let band = "ACARS-VHF-multi[136.700,136.800,136.850,136.975]"
   let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
 
-  let receipt = join "|" ["ACARS_RECEIPT", cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse=", pulse], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  -- v=2 FACT receipt — field order is LOAD-BEARING (the signature is over this exact string).
+  let receipt = join "|" ["ACARS_RECEIPT", "v=2", "type=FACT", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", n], cat ["bcs_ok=", bcs_ok], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
   let msg = string_to_bytes receipt
   let mlen = string_length_bytes receipt
   let sig = ed25519_sign seed msg mlen
@@ -57,11 +89,18 @@ main =
   let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
 
   let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["BCS_OK   ", bcs_ok])
   let _ = print (cat ["SIG      ", sig_hex])
   let _ = print (cat ["CHAIN    ", chain_hash])
   let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
   let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
 
+  -- v=2 JSON ledger line (one physical line; SPACE after each colon so verify.rail matches).
+  let jsonline = cat ["{\"v\":2,\"type\":\"FACT\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/acars_receipts.jsonl" jsonline
+  let _ = print "APPENDED data/acars_receipts.jsonl"
+
+  -- legacy single-object backward-compat for verify.rail (overwrite latest).
   let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
   let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/acars_receipt.json" jrec
   let _ = print "WROTE data/acars_receipt.json"

@@ -1,8 +1,34 @@
 -- ledaticground: independent receipt verifier (pure Rail) — "the verifier is Rail".
--- Reads data/receipt.json COLD (no shared state with the signer) and re-checks:
---   (1) the Ed25519 signature over the receipt string under the stated signer key
---   (2) the SHA-256 chain hash = sha256(receipt | "|sig=" | sig)
--- Anyone can run this to verify a proof-of-reception. Run from the rail repo dir.
+-- COLD re-checks a signed receipt with NO shared state with the signer. Two modes:
+--
+--   (1) SINGLE-OBJECT (backward compat, default). Reads data/receipt.json (one
+--       {receipt,sig,signer,chain_hash} object) and re-checks:
+--         (a) the Ed25519 signature over the receipt string under the stated signer key
+--         (b) the SHA-256 chain hash = sha256(receipt | "|sig=" | sig)
+--
+--   (2) JSONL LEDGER WALK (AC-3). When /tmp/lg_verify_target.txt names a per-stream
+--       chained ledger (e.g. data/ais_receipts.jsonl), walk EVERY line and verify:
+--         (a) each line's Ed25519 signature over its receipt string
+--         (b) each line's chain_hash = sha256(receipt | "|sig=" | sig)  (re-derived)
+--         (c) the prev= POINTER links the chain: line[0].receipt has prev=GENESIS,
+--             and line[k].receipt has prev=<line[k-1].chain_hash>. A broken link or a
+--             bad sig = FAIL with the offending line index.
+--         (d) cross-ledger derived_from resolution: a type=INFERENCE line carries
+--             derived_from=<fact_chain_hash>; that hash MUST appear as a chain_hash in
+--             one of the FACT ledgers listed in /tmp/lg_verify_facts.txt. An
+--             unresolvable derived_from = REJECT at that line.
+--
+-- Anyone can run this to verify a proof-of-reception. Run from the rail repo dir via:
+--   bash scripts/railrun.sh /Users/ledaticempire/projects/ledaticground/src/verify.rail
+--
+-- Config is FILE-BASED (Rail's shell() inherits no env/PATH; same field_or idiom the
+-- signers use). To select JSONL-walk mode, stage:
+--   /tmp/lg_verify_target.txt  -> abs path of the ledger to walk (one line)
+--   /tmp/lg_verify_facts.txt   -> newline-separated abs paths of FACT ledgers whose
+--                                 chain_hashes resolve INFERENCE derived_from (optional;
+--                                 absent => derived_from resolves against the target ledger
+--                                 itself, which still catches dangling pointers).
+-- Absent/empty /tmp/lg_verify_target.txt => single-object mode on data/receipt.json.
 
 import "stdlib/sha256.rail"
 import "stdlib/sha512.rail"
@@ -11,7 +37,12 @@ import "stdlib/ed25519.rail"
 import "stdlib/ed25519_scalar.rail"
 import "stdlib/ed25519_sign.rail"
 
--- extract a JSON string field value:  "<key>": "<value>"
+-- field_or: read a /tmp staging file, strip trailing newline; absent/empty -> default.
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+-- extract a JSON string field value:  "<key>": "<value>"  (space-after-colon, per contract B.2)
 field_val json key =
   let pat = cat ["\"", key, "\": \""]
   let i = str_find pat json
@@ -22,26 +53,162 @@ field_val json key =
     let q = str_find "\"" rest
     if q < 0 then rest else str_sub rest 0 q
 
-main =
+-- extract a |key=value| field from the pipe-joined RECEIPT string. Value runs to the
+-- next "|" or to end-of-string. Returns "" if the key is absent.
+pipe_field receipt key =
+  let pat = cat ["|", key, "="]
+  let i = str_find pat receipt
+  if i < 0 then ""
+  else
+    let start = i + (string_length_bytes pat)
+    let rest = str_sub receipt start (string_length_bytes receipt - start)
+    let bar = str_find "|" rest
+    if bar < 0 then rest else str_sub rest 0 bar
+
+-- ===== CORE CHECK: re-derive sig + chain over one receipt line/object =====
+-- returns (sigok, chainok) for the given receipt/sig/signer/stored-chain quartet.
+check_sig receipt sighex signerhex =
+  let pk = hex_to_bytes signerhex
+  let sig = hex_to_bytes sighex
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  ed25519_verify pk msg mlen sig
+
+calc_chain receipt sighex = sha256_hex (cat [receipt, "|sig=", sighex])
+
+-- ===== SINGLE-OBJECT MODE (backward compat) =====
+verify_single =
   let json = read_file "/Users/ledaticempire/projects/ledaticground/data/receipt.json"
   let receipt = field_val json "receipt"
   let sighex = field_val json "sig"
   let signerhex = field_val json "signer"
   let chainstored = field_val json "chain_hash"
 
-  let pk = hex_to_bytes signerhex
-  let sig = hex_to_bytes sighex
-  let msg = string_to_bytes receipt
-  let mlen = string_length_bytes receipt
-  let sigok = ed25519_verify pk msg mlen sig
-
-  let chaincalc = sha256_hex (cat [receipt, "|sig=", sighex])
+  let sigok = check_sig receipt sighex signerhex
+  let chaincalc = calc_chain receipt sighex
   let chainok = if chaincalc == chainstored then 1 else 0
 
   let _ = print (cat ["receipt: ", receipt])
   let _ = print (cat ["signer:  ", signerhex])
-  let _ = print (cat ["signature valid   = ", show sigok, "  (want 1)"])
-  let _ = print (cat ["chain hash matches = ", show chainok, "  (want 1)"])
+  let _ = print (cat ["signature valid    = ", show sigok, "  (want 1)"])
+  let _ = print (cat ["chain hash matches  = ", show chainok, "  (want 1)"])
   let verdict = if sigok == 1 then (if chainok == 1 then 1 else 0) else 0
   let _ = print (cat ["==> RECEIPT ", if verdict == 1 then "VALID" else "INVALID"])
+  verdict
+
+-- ===== JSONL LEDGER WALK MODE (AC-3) =====
+
+-- A line is "real" if it contains a receipt field. (Trailing blank line from the file
+-- read is skipped.) Use a named predicate — filter-with-lambda can segfault.
+is_ledger_line s = str_contains "\"receipt\": \"" s
+
+-- Load every FACT-ledger chain_hash into one blob for derived_from resolution. The blob
+-- is a "\n"-joined list of chain_hash values wrapped in markers so a substring search for
+-- "[<hash>]" cannot be fooled by a prefix collision. We accumulate over the FACT ledger
+-- paths named (newline-separated) in /tmp/lg_verify_facts.txt.
+chain_marker h = cat ["[", h, "]"]
+
+-- collect markers for every chain_hash JSON field across one ledger's lines
+ledger_markers_for lines =
+  if lines == [] then ""
+  else
+    let ln = head lines
+    let rest = ledger_markers_for (tail lines)
+    if is_ledger_line ln then
+      let ch = field_val ln "chain_hash"
+      cat [chain_marker ch, "\n", rest]
+    else rest
+
+-- build the FACT chain-hash lookup blob from the newline-separated fact-ledger path list
+build_fact_blob paths =
+  if paths == [] then ""
+  else
+    -- split "\n" leaves no newline in the entry; guard the trailing empty token only.
+    -- (trim is compile-only, NOT a runtime symbol — same trap as append_file.)
+    let p = head paths
+    let rest_blob = build_fact_blob (tail paths)
+    if p == "" then rest_blob
+    else
+      let content = read_file p
+      let lines = split "\n" content
+      cat [ledger_markers_for lines, rest_blob]
+
+-- resolve one derived_from hash against the fact blob. 1 if [<hash>] present, else 0.
+resolve_derived_from fact_blob h =
+  if str_contains (chain_marker h) fact_blob then 1 else 0
+
+-- walk the ledger line list, threading the expected prev pointer.
+--   idx        = 0-based index of head lines (for error reporting)
+--   expect_prev= the chain_hash the current line's prev= MUST equal ("GENESIS" for line 0)
+--   fact_blob  = FACT chain-hash lookup blob for INFERENCE derived_from resolution
+-- returns 1 if the whole remaining chain verifies, 0 (with a printed FAIL line) otherwise.
+walk_lines lines idx expect_prev fact_blob =
+  if lines == [] then 1
+  else
+    let ln = head lines
+    if not (is_ledger_line ln) then
+      -- non-receipt line (e.g. trailing blank): skip without advancing idx semantics
+      walk_lines (tail lines) idx expect_prev fact_blob
+    else
+      let receipt = field_val ln "receipt"
+      let sighex = field_val ln "sig"
+      let signerhex = field_val ln "signer"
+      let chainstored = field_val ln "chain_hash"
+
+      -- (a) signature
+      let sigok = check_sig receipt sighex signerhex
+      -- (b) chain_hash re-derive
+      let chaincalc = calc_chain receipt sighex
+      let chainok = if chaincalc == chainstored then 1 else 0
+      -- (c) prev pointer links to the previous line's chain_hash
+      let prev = pipe_field receipt "prev"
+      let linkok = if prev == expect_prev then 1 else 0
+      -- (d) INFERENCE derived_from resolution (FACT lines skip this check -> 1)
+      let rtype = pipe_field receipt "type"
+      let dfrom = pipe_field receipt "derived_from"
+      let dfok =
+        if rtype == "INFERENCE" then
+          if dfrom == "" then 0
+          else resolve_derived_from fact_blob dfrom
+        else 1
+
+      let _ = print (cat ["line ", show idx, "  type=", rtype, "  sig=", show sigok, " chain=", show chainok, " link=", show linkok, " derived_from=", (if rtype == "INFERENCE" then show dfok else "n/a")])
+
+      if sigok == 0 then
+        let _ = print (cat ["==> FAIL at line ", show idx, ": bad signature"])
+        0
+      else if chainok == 0 then
+        let _ = print (cat ["==> FAIL at line ", show idx, ": chain_hash mismatch (stored ", chainstored, " calc ", chaincalc, ")"])
+        0
+      else if linkok == 0 then
+        let _ = print (cat ["==> FAIL at line ", show idx, ": broken prev link (prev=", prev, " expected ", expect_prev, ")"])
+        0
+      else if dfok == 0 then
+        let _ = print (cat ["==> FAIL at line ", show idx, ": unresolved inference parent (derived_from=", dfrom, ")"])
+        0
+      else
+        -- this line is good; next line's prev must equal THIS line's (verified) chain_hash
+        walk_lines (tail lines) (idx + 1) chaincalc fact_blob
+
+verify_jsonl target =
+  let _ = print (cat ["LEDGER WALK  ", target])
+  let content = read_file target
+  let lines = split "\n" content
+  -- FACT chain-hash lookup blob for INFERENCE derived_from resolution. If the facts list
+  -- is absent, resolve against the target ledger itself (catches dangling pointers; a
+  -- pure-INFERENCE ledger with no listed FACT source would then reject every line, which
+  -- is the honest outcome — name the FACT ledgers).
+  let facts_list = read_file "/tmp/lg_verify_facts.txt"
+  let fact_blob =
+    if facts_list == "" then build_fact_blob [target]
+    else build_fact_blob (split "\n" facts_list)
+  let verdict = walk_lines lines 0 "GENESIS" fact_blob
+  let _ = print (cat ["==> LEDGER ", if verdict == 1 then "VALID (chain intact, all sigs + links + derived_from check out)" else "INVALID"])
+  verdict
+
+main =
+  let target = field_or "/tmp/lg_verify_target.txt" ""
+  let verdict =
+    if target == "" then verify_single
+    else verify_jsonl target
   0
