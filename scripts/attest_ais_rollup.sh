@@ -102,17 +102,36 @@ with open(src, 'r') as f:
             o = json.loads(ln)
         except Exception:
             continue
-        ts = o.get('ts')
-        if not isinstance(ts, int):
+        # ts may be a unix int (synthetic fixtures) OR an ISO-8601 string with a Z suffix
+        # (the LIVE node emits "2026-06-15T20:51:42Z"). Normalize to unix seconds.
+        ts_raw = o.get('ts')
+        ts = None
+        if isinstance(ts_raw, int):
+            ts = ts_raw
+        elif isinstance(ts_raw, str):
+            s = ts_raw.strip().replace('Z', '+00:00')
+            try:
+                if 'T' in s:
+                    from datetime import datetime
+                    ts = int(datetime.fromisoformat(s).timestamp())
+                else:
+                    ts = int(float(s))
+            except Exception:
+                ts = None
+        if ts is None:         # missing / unparseable clock -> drop (clean_ts discipline)
             continue
-        if ts < 1000000000:   # pre-NTP / unscrubbed outlier -> drop (clean_ts discipline)
+        if ts < 1000000000:    # pre-NTP / unscrubbed outlier -> drop
             continue
         if ts <= last_end:     # already covered by a prior signed batch
             continue
-        mmsi = o.get('mmsi', '')
-        typ  = o.get('type', '')
-        lat  = o.get('lat', '')
-        lon  = o.get('lon', '')
+        # AIS decode fields are nested under "msg" on the live node; fall back to flat (fixtures).
+        m = o.get('msg')
+        if not isinstance(m, dict):
+            m = o
+        mmsi = m.get('mmsi', '')
+        typ  = m.get('type', '')
+        lat  = m.get('lat', '')
+        lon  = m.get('lon', '')
         rows.append((ts, str(mmsi), str(typ), str(lat), str(lon)))
 
 if not rows:

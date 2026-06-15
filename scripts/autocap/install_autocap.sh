@@ -11,9 +11,9 @@
 #     ledaticground-iqcap.service-> /etc/systemd/system/ledaticground-iqcap.service
 #     iqcap-retention            -> /etc/cron.d/iqcap-retention
 #     roofmon-deadman            -> /etc/cron.d/roofmon-deadman
-#     pi_characterize.py (FIXED) -> /home/ledatic/pi_characterize.py    (RFML-3 serving-path swap)
-#     audio_softmax.txt (v3-18f) -> /home/ledatic/audio_softmax.txt     (RFML-3)
-#     audio_novelty.txt (v3-18f) -> /home/ledatic/audio_novelty.txt     (RFML-3)
+#     pi_characterize.py (FIXED) -> /home/ledatic/pi_characterize_v3.py  (RFML-3 serving-path swap)
+#     audio_softmax.txt (v3-18f) -> /home/ledatic/audio_softmax_v3.txt   (RFML-3)
+#     audio_novelty.txt (v3-18f) -> /home/ledatic/audio_novelty_v3.txt   (RFML-3)
 #   The Pi reads a pushed ~/.iq/schedule.tsv, captures each pass on its OWN
 #   clock (preempting roofmon ONLY for the window, always restarting it),
 #   and KEEPS captures in ~/.iq/captures/ until the Mini pulls them.
@@ -70,20 +70,23 @@ MINI_PULL_SRC="$STAGE/com.ledatic.ledaticground-iqpull.plist"     # THIS compone
 # garbage and every window tripped novelty. The fixed pi_characterize.py
 # (scripts/pi_characterize.py) parses the `# COLS` header, indexes F[cols[j]],
 # and FAIL-LOUD crashes on a dimension mismatch (never silently all-unknown).
-#   - scripts/pi_characterize.py  -> Pi /home/ledatic/pi_characterize.py
-#   - models/audio_softmax.txt    -> Pi /home/ledatic/audio_softmax.txt   (v3, # COLS 0..17, 18-wide)
-#   - models/audio_novelty.txt    -> Pi /home/ledatic/audio_novelty.txt   (v3, # COLS 0..17, 18-wide)
-# These are the EXACT paths ais_monitor.sh's CHAR call invokes every CHAR_EVERY
-# cycle (`python3 /home/ledatic/pi_characterize.py /tmp/char.s16
-#  /home/ledatic/audio_softmax.txt /home/ledatic/audio_novelty.txt`), so a file
-# SWAP is all that's needed — no ais_monitor.sh edit.
+#   - scripts/pi_characterize.py  -> Pi /home/ledatic/pi_characterize_v3.py  (NOTE _v3 suffix)
+#   - models/audio_softmax.txt    -> Pi /home/ledatic/audio_softmax_v3.txt   (v3, # COLS 0..17, 18-wide)
+#   - models/audio_novelty.txt    -> Pi /home/ledatic/audio_novelty_v3.txt   (v3, # COLS 0..17, 18-wide)
+# These are the EXACT _v3 paths the RUNNING monitor (roof_monitor.sh, the roofmon
+# service ExecStart) invokes each cycle: CHAR=$HOME_DIR/pi_characterize_v3.py,
+# SMODEL=audio_softmax_v3.txt, NMODEL=audio_novelty_v3.txt. (Verified live 2026-06-15:
+# the non-_v3 names are NOT read by the service — deploying there is inert.) A file
+# SWAP of the three _v3 files is all that's needed — no roof_monitor.sh edit. All three
+# MUST be swapped together (the 18-feat extractor + 18-col models stay dim-consistent;
+# the fail-loud guard fires for one cycle if they momentarily mismatch, then self-heals).
 RFML_CHAR_SRC="$GD/scripts/pi_characterize.py"      # the FIXED 18-feature serving extractor (RFML-2)
 RFML_SOFTMAX_SRC="$GD/models/audio_softmax.txt"     # v3-18f softmax (# COLS 0..17)
 RFML_NOVELTY_SRC="$GD/models/audio_novelty.txt"     # v3-18f open-set novelty (# COLS 0..17)
-# Pi-side install paths (match ais_monitor.sh CHAR invocation verbatim).
-RFML_CHAR_DST="/home/ledatic/pi_characterize.py"
-RFML_SOFTMAX_DST="/home/ledatic/audio_softmax.txt"
-RFML_NOVELTY_DST="/home/ledatic/audio_novelty.txt"
+# Pi-side install paths — the _v3 names the RUNNING roof_monitor.sh CHAR call reads verbatim.
+RFML_CHAR_DST="/home/ledatic/pi_characterize_v3.py"
+RFML_SOFTMAX_DST="/home/ledatic/audio_softmax_v3.txt"
+RFML_NOVELTY_DST="/home/ledatic/audio_novelty_v3.txt"
 
 # systemd unit + Pi service NAME (note: ledaticground- prefixed, NOT bare iqcap).
 PI_UNIT_NAME="ledaticground-iqcap.service"
