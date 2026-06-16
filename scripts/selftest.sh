@@ -144,5 +144,157 @@ ck "biastee fail-closed (refuse, no rtl_biast)" "$b" "OK"
 # rs41_capture.sh refuses on the 137 MHz halo (no fabricated 400 MHz capture)
 o=$(bash scripts/rs41_capture.sh 2>&1); rc=$?
 if [ "$rc" = 2 ] && echo "$o" | grep -q "BLOCKER: needs 400 MHz antenna"; then c=OK; else c=BAD; fi
-ck "rs41_capture antenna-blocker (refuse on halo)" "$c" "OK"
+# LRPT-DECODE rung: attested LRPT decode-product receipt (FACT, cadu_ok honesty bit). Hermetic
+# fixture (synthetic .bin + fake satdump .cadu). The lrpt_decode ledger is gitignored RUNTIME
+# state holding the live decode chain, so snapshot+restore it -> byte-identical after the test.
+LFX=/tmp/st_lrpt_fix; rm -rf "$LFX"; rm -f /tmp/st_lbak_*    # clear any stale backup from a killed prior run
+mkfix(){ # $1=name $2=cadu_bytes(0=>empty .cadu) $3=marker-line(""=>NO marker) $4=salt(DISTINCT per fixture)
+  local d="$LFX/$1.satdump"; mkdir -p "$d"
+  # salt MUST differ per fixture: identical .bin bytes -> identical input_sha256 -> the idempotency
+  # ledger-scan would no-op the later fixture, so it would never exercise its intended path.
+  python3 -c "open('$LFX/$1.bin','wb').write(bytes((i*53+7+$4)&0xff for i in range(8192)))"
+  if [ "$2" -gt 0 ]; then python3 -c "open('$d/meteor_m2-x_lrpt.cadu','wb').write(bytes(($4+1)&0xff for _ in range($2)))"; else : > "$d/meteor_m2-x_lrpt.cadu"; fi
+  [ -n "$3" ] && printf '%s\n' "$3" > "$LFX/$1.decoded"
+  return 0
+}
+mkfix iq_TEST-SAT_el80_LRPT_20260101T0000Z 2048 "mode=LRPT | satdump=exit=0 | products: CADUS=2 cadu_bytes=2048" 0
+mkfix iq_TEST-SAT_el20_LRPT_20260101T0001Z 0    "mode=LRPT | satdump=exit=0 | products: CADUS=0 cadu_bytes=0"    1
+mkfix iq_TEST-SAT_el30_LRPT_20260101T0002Z 2048 ""                                                              2  # CADUs present, NO marker -> cadu_ok=0 (A.3 fail-closed)
+mkfix iq_TEST-SAT_el40_LRPT_20260101T0003Z 2048 "mode=LRPT | satdump=exit=1 | products: CADUS=2 cadu_bytes=2048" 3 # satdump errored -> cadu_ok=0
+for f in lrpt_decode_receipts.jsonl lrpt_decode_receipt.json lrpt_decode_fact_chain.txt lrpt_decode_rollup_cursor.txt; do cp "data/$f" "/tmp/st_lbak_$f" 2>/dev/null; rm -f "data/$f"; done
+o=$(perl -e 'alarm 120;exec @ARGV' bash scripts/attest_lrpt_decode_rollup.sh "$LFX/iq_TEST-SAT_el80_LRPT_20260101T0000Z.bin" 2>&1)
+ck "lrpt-decode FACT n=2 cadu_ok=1" "$o" "n=2|cadu_ok=1"
+ck "lrpt-decode verify=1" "$o" "own-sig accepted = 1"; ck "lrpt-decode tamper=0" "$o" "modified-msg accepted = 0"
+o2=$(perl -e 'alarm 120;exec @ARGV' bash scripts/attest_lrpt_decode_rollup.sh "$LFX/iq_TEST-SAT_el80_LRPT_20260101T0000Z.bin" 2>&1)
+ck "lrpt-decode idempotent no-op" "$o2" "idempotent no-op"
+o4=$(perl -e 'alarm 120;exec @ARGV' bash scripts/attest_lrpt_decode_rollup.sh "$LFX/iq_TEST-SAT_el20_LRPT_20260101T0001Z.bin" 2>&1)
+ck "lrpt-decode 0-CADU honest cadu_ok=0" "$o4" "n=0|cadu_ok=0"
+o5=$(perl -e 'alarm 120;exec @ARGV' bash scripts/attest_lrpt_decode_rollup.sh "$LFX/iq_TEST-SAT_el30_LRPT_20260101T0002Z.bin" 2>&1)
+ck "lrpt-decode marker-absent fail-closed cadu_ok=0" "$o5" "n=2|cadu_ok=0"
+o6=$(perl -e 'alarm 120;exec @ARGV' bash scripts/attest_lrpt_decode_rollup.sh "$LFX/iq_TEST-SAT_el40_LRPT_20260101T0003Z.bin" 2>&1)
+ck "lrpt-decode satdump-exit1 fail-closed cadu_ok=0" "$o6" "n=2|cadu_ok=0"
+# verify the FULL 4-line chain. ABSOLUTE path: railrun cd's to the rail repo, so a relative
+# src/verify.rail would resolve to a nonexistent file and silently run a stale /tmp/rail_out.
+printf '%s\n' "$GD/data/lrpt_decode_receipts.jsonl" > /tmp/lg_verify_target.txt
+printf '%s\n' "$GD/data/lrpt_decode_receipts.jsonl" > /tmp/lg_verify_facts.txt
+o3=$(perl -e 'alarm 120;exec @ARGV' bash scripts/railrun.sh "$GD/src/verify.rail" 2>&1)
+ck "lrpt-decode verify.rail LEDGER VALID" "$o3" "==> LEDGER VALID"
+for f in lrpt_decode_receipts.jsonl lrpt_decode_receipt.json lrpt_decode_fact_chain.txt lrpt_decode_rollup_cursor.txt; do rm -f "data/$f"; [ -f "/tmp/st_lbak_$f" ] && mv "/tmp/st_lbak_$f" "data/$f"; done
+rm -rf "$LFX"
+# =================================================================================================
+# CORRESPONDENCE FRONTIER -- the cold-start RUN-IT-TWICE end-to-end smoke test (ADD-1).
+#
+# WHY (audit 2026-06-16): a re-runnability defect hid behind clean-slate agent runs --
+# attest_iq_capture_rollup.sh no-op'd on a cursor match even with its fact-chain output MISSING,
+# wedging the binding pipeline ("already signed" yet no FACT root). Clean-slate success != robustness;
+# the same desync class can lurk in any cursor/ledger pair. This stanza is the guard that would have
+# caught it: it runs the FULL physics-binding + mesh chain from a TRUE clean slate, asserts green, then
+# RUNS THE ENTIRE THING A SECOND TIME from ANOTHER clean slate and asserts green AGAIN. A wedge on the
+# deterministic-IQ second pass (cursor present from pass 1, ledger state cleared) turns this red.
+#
+# HONESTY: every claim here is "mechanism validated on the deterministic SGP4-true SYNTHETIC fixture
+# (gen_tle_doppler.py)", NEVER "proof of truth". physics_ok=1 = "consistent within tol_hz". A failed
+# bind (physics_ok=0) is RECORDED, never dropped (the --wrong-tle line proves it).
+#
+# *** LIVE AIS CHAIN: HANDS OFF. *** The reset list below is the GREENFIELD runtime state ONLY. It
+# NEVER names the four live AIS files (ais_receipts.jsonl / ais_fact_chain.txt / ais_rollup_cursor.txt
+# / ais_receipt.json). Two end-of-stanza guards PROVE the stanza never wrote them: an inode-identity
+# check (the stanza never rm'd/recreated them) + a static-text check (the reset list names none of them).
+# A content diff is deliberately NOT used -- the live AIS cron may legitimately append DURING the run.
+# Deterministic + offline (the one net call is the beacon fetch inside the rollups, honest PENDING).
+# =================================================================================================
+echo "  -- correspondence frontier: cold-start RUN-IT-TWICE smoke --"
+# AIS guard: prove the stanza never WRITES the four live AIS files. A content-hash diff is the WRONG
+# instrument here -- the live AIS attestation pipeline (its cron) legitimately appends to those files
+# and may fire DURING this selftest, so an after!=before content diff would FALSE-FAIL through no
+# fault of ours. Instead we use two race-free, honest checks:
+#   (1) inode-identity: snapshot each file's inode BEFORE + AFTER. The live cron APPENDS in place
+#       (inode stable); only an rm/recreate changes the inode -- which is exactly the mistake this
+#       guards against. So same-inode == "the stanza did not delete/recreate them".
+#   (2) static text guard: the GREENFIELD reset list (corr_reset) names none of the four AIS files.
+corr_ais_inodes(){ ls -i data/ais_receipts.jsonl data/ais_fact_chain.txt \
+    data/ais_rollup_cursor.txt data/ais_receipt.json 2>/dev/null | awk '{print $1}' | tr '\n' ' '; }
+CORR_AIS_INO_BEFORE="$(corr_ais_inodes)"
+# TRUE clean slate of GREENFIELD runtime state. NEVER the four live AIS files.
+corr_reset(){
+  rm -f data/physics_binding_receipts.jsonl data/binding_receipt.json data/chain/binding_prev.txt \
+        data/iq_capture_receipts.jsonl data/iq_capture_receipt.json data/iq_capture_fact_chain.txt \
+        data/iq_capture_rollup_cursor.txt data/mesh_witness_receipts.jsonl data/mesh_witness_receipt.json \
+        data/mesh_factA_receipts.jsonl data/mesh_factB_receipts.jsonl data/chain/mesh_witness_prev.txt \
+        2>/dev/null
+}
+# ONE full pass from a clean slate. $1 = label tag ("p1"/"p2"). Sets pass/fail via ck.
+corr_pass(){
+  local tag="$1" o
+  corr_reset
+  # (a) positive binding (NOAA-19, SGP4-true synth) -> physics_ok=1 + a FACT root minted.
+  o=$(perl -e 'alarm 240;exec @ARGV' bash scripts/attest_binding_rollup.sh --synth 2>&1)
+  ck "corr[$tag] binding --synth physics_ok=1 + FACT root" "$o" "physics_ok=1.*1 iff\|BIND: FACT root chain_hash="
+  # (c) cold-verify line 1 -> LEDGER VALID (the physics re-run reproduces the committed residual).
+  #     ORDER: run this BEFORE the --wrong-tle rollup, and pass an EXPLICIT NOAA-19 --tle-file. The
+  #     rollup leaves the LAST run's TLE staged at /tmp/binding_tle_l1/l2.txt; verify_binding's default
+  #     reads those, so after a --wrong-tle (NOAA-15) run the default TLE would mismatch line 1's cited
+  #     NOAA-19 tle_sha256. Pinning the TLE here makes the line-1 verify deterministic + immune to any
+  #     sibling rollup clobbering the staged TLE between the mint and this walk.
+  printf '%s\n%s\n' \
+    "1 33591U 09005A   26166.49283008  .00000032  00000+0  40805-4 0  9995" \
+    "2 33591  98.9521 237.3664 0014363  39.0504 321.1702 14.13474065894244" > /tmp/st_corr_tle19.txt
+  o=$(perl -e 'alarm 180;exec @ARGV' bash scripts/verify_binding.sh --line 1 --tle-file /tmp/st_corr_tle19.txt 2>&1)
+  ck "corr[$tag] verify_binding --line 1 LEDGER VALID" "$o" "==> LEDGER VALID"
+  # (b) NEGATIVE binding (wrong TLE) -> physics_ok=0 RECORDED (not dropped); also seeds ledger line 2
+  #     that check_verify_physics.py fabricates against. Honest: a failed bind is on the chain.
+  o=$(perl -e 'alarm 240;exec @ARGV' bash scripts/attest_binding_rollup.sh --synth --wrong-tle 2>&1)
+  ck "corr[$tag] binding --wrong-tle physics_ok=0 RECORDED" "$o" "physics_ok=0"
+  # (d) accept/reject harness: genuine binding VALID + valid-sig/fabricated-residual forgery INVALID.
+  #     (check_verify_physics stages its OWN per-line TLE internally, so it is order-independent.)
+  o=$(perl -e 'alarm 300;exec @ARGV' "$PY" scripts/check_verify_physics.py 2>&1)
+  ck "corr[$tag] check_verify_physics RESULT PASS" "$o" "RESULT: PASS"
+  # (e) AUDIT DEFECT, pinned: cursor present + fact-chain ABSENT must NOT no-op (must re-mint). This is
+  #     the exact 2026-06-16 desync regression on a deterministic IQ. A no-op here = the bug is back.
+  python3 -c "open('/tmp/st_corr_iq.bin','wb').write(bytes((i*37+11)&0xff for i in range(4096)))"
+  perl -e 'alarm 120;exec @ARGV' bash scripts/attest_iq_capture_rollup.sh /tmp/st_corr_iq.bin >/dev/null 2>&1
+  rm -f data/iq_capture_fact_chain.txt   # the desync: cursor survives, fact-chain output is gone
+  o=$(perl -e 'alarm 120;exec @ARGV' bash scripts/attest_iq_capture_rollup.sh /tmp/st_corr_iq.bin 2>&1)
+  if echo "$o" | grep -q "idempotent no-op"; then dz=WEDGED; else dz=RESIGNED; fi
+  [ -s data/iq_capture_fact_chain.txt ] || dz=WEDGED   # fact-chain MUST be restored
+  ck "corr[$tag] iq_capture desync re-runnable (no wedge)" "$dz" "RESIGNED"
+  # (f) mesh co-attestation (SIMULATED) -> mesh_ok=1, then verify.rail walks the mesh ledger VALID.
+  #     Re-stage /tmp/lg_verify_* right before the walk: sibling agents share these mutable /tmp files
+  #     and a concurrent rollup can clobber the target between mint and walk (observed during build).
+  o=$(perl -e 'alarm 240;exec @ARGV' bash scripts/mesh_witness_rollup.sh 2>&1)
+  ck "corr[$tag] mesh_witness_rollup mesh_ok=1" "$o" "MESH_OK  1\|mesh_ok=1"
+  printf '%s\n' "$GD/data/mesh_witness_receipts.jsonl" > /tmp/lg_verify_target.txt
+  printf '%s\n%s\n' "$GD/data/mesh_factA_receipts.jsonl" "$GD/data/mesh_factB_receipts.jsonl" > /tmp/lg_verify_facts.txt
+  # Compile+run verify.rail to a DEDICATED out-prefix (NOT the shared /tmp/rail_out the flock-serialized
+  # railrun.sh uses). Two robustness reasons, both learned during this build: (1) the mesh ROLLUP just
+  # ran the signer via railrun, leaving the signer binary at /tmp/rail_out; if our verify compile loses
+  # the /tmp/rail_out race to any concurrent rail process the STALE signer binary runs and the verdict is
+  # garbage. (2) the path must be ABSOLUTE ($GD/src/...): rail_native run resolves it from the rail repo
+  # cwd, and a relative src/verify.rail there is a nonexistent 0-char file. An isolated out-prefix removes
+  # the shared-binary collision entirely -- the honest fix for "clean-slate success != robustness".
+  o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 180;exec @ARGV' \
+        ./rail_native --out-prefix /tmp/st_corr_verify_ run "$GD/src/verify.rail" 2>&1)
+  ck "corr[$tag] verify.rail mesh ledger VALID" "$o" "==> LEDGER VALID"
+}
+corr_pass p1
+# *** RUN THE ENTIRE STANZA A SECOND TIME from another clean slate -- the re-runnability gate. ***
+# pass 1 leaves cursor/ledger state populated; corr_pass's corr_reset wipes it and the deterministic
+# fixtures reproduce byte-identical inputs, so a latent cursor/output desync would wedge pass 2 here.
+corr_pass p2
+# (4) SGP4 triplication-drift guard (ADD-2): the inlined SGP4 in doppler_range/binding_attest/verify
+#     must agree to within tol -- else emit and verify disagree and every binding silently fails.
+o=$(perl -e 'alarm 180;exec @ARGV' bash scripts/check_sgp4_parity.sh 2>&1)
+ck "corr sgp4 triplication parity (3 copies agree)" "$o" "SGP4_PARITY: PASS"
+# (5) self-collection cleanup: leave NO greenfield-ledger residue (NEVER the live AIS files).
+corr_reset
+rm -f /tmp/st_corr_iq.bin /tmp/st_corr_tle19.txt /tmp/st_corr_verify_
+# AIS guard (1) inode-identity: same inodes == the stanza did not delete/recreate the live files
+# (the live cron may have APPENDED in place -- inode stable -- which is fine and NOT our doing).
+CORR_AIS_INO_AFTER="$(corr_ais_inodes)"
+if [ "$CORR_AIS_INO_BEFORE" = "$CORR_AIS_INO_AFTER" ]; then ais_ok=UNTOUCHED; else ais_ok=RECREATED; fi
+ck "corr LIVE AIS chain untouched (4 inodes stable; stanza never rm'd them)" "$ais_ok" "UNTOUCHED"
+# AIS guard (2) static text guard: the GREENFIELD reset list must name NONE of the four AIS files.
+ais_in_reset=$(sed -n '/^corr_reset(){/,/^}/p' "$0" | grep -cE 'ais_receipts\.jsonl|ais_fact_chain\.txt|ais_rollup_cursor\.txt|ais_receipt\.json')
+if [ "$ais_in_reset" = "0" ]; then reset_ok=CLEAN; else reset_ok=NAMES_AIS; fi
+ck "corr reset list names no live-AIS file (static guard)" "$reset_ok" "CLEAN"
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]

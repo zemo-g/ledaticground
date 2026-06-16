@@ -83,6 +83,7 @@ the bit=`0`, **never dropped** — "received, check failed" is itself a fact.
 | `ORBCOMM_RECEIPT` | `crc_ok=<0\|1>` | CRC block-decode verdict (orbcomm_frame.rail) |
 | `RFML_RECEIPT` | `health=<ok\|degraded>` **and** `model=<tag>` | classifier health + EXACT model tag from the source row |
 | `RS41_DECODE_RECEIPT` | `rs_ok=<0\|1>` | Reed-Solomon block-decode verdict |
+| `LRPT_DECODE_RECEIPT` | `cadu_ok=<0\|1>` | satdump RS-deframe verdict: `1` iff CADU count>0 (a CADU is an RS-corrected CCSDS VCDU) **and** satdump exit=0; a 0-CADU / no-Viterbi-lock pass is still signed with `cadu_ok=0` |
 | `ORBCOMM_POR_RECEIPT` | `crc_ok=<0\|1>` | proof-of-reception; `payload=NONE_proprietary` (no proprietary payload bytes emitted) |
 
 > `RFML_RECEIPT` carries **two** honesty fields in the honesty slot region:
@@ -114,13 +115,25 @@ source rows recomputes the identical digest. The per-kind contract product paths
 | ORBCOMM | `/tmp/orbcomm_decode_out.txt` |
 | RFML | `/tmp/modclass_result.txt` (label digest + model tag + health staged alongside) |
 | RS41 | `/tmp/rs41_decode_out.txt` |
+| LRPT_DECODE | `sha256` of `<bin>.satdump/*.cadu` (the RS-deframed CADU stream), staged **as hex** by the driver — the `.cadu` is binary/NUL-bearing, so it follows the IQ-capture hex-staging discipline (never pulled through a Rail string). `product_sha256` commits to the **CADU frames**, NOT the rendered MSU-MR PNGs — the imagery is a deterministic downstream render of the attested CADUs (anyone holding the CADUs + satdump reproduces it) |
 | VESSEL_INFERENCE | canonical sorted `transits.jsonl` rows |
 
 ### A.5 KIND sets — FACT vs INFERENCE
 
 **FACT kinds** (`type=FACT`, go in the per-stream fact ledgers):
 `AIS_RECEIPT`, `ACARS_RECEIPT`, `ORBCOMM_RECEIPT`, `RFML_RECEIPT`,
-`RS41_DECODE_RECEIPT`, `ORBCOMM_POR_RECEIPT` (`payload=NONE_proprietary`).
+`RS41_DECODE_RECEIPT`, `LRPT_DECODE_RECEIPT`, `ORBCOMM_POR_RECEIPT` (`payload=NONE_proprietary`).
+
+> `LRPT_DECODE_RECEIPT` is a FACT (an LRPT CADU is a Reed-Solomon-corrected CCSDS VCDU by
+> the time satdump emits it — a verified decode, exactly like `RS41_DECODE_RECEIPT`). It
+> carries custody `input_sha256` = the raw IQ `.bin` digest. **When the same `.bin` is also
+> attested by `iq_capture`**, this digest equals that capture FACT's `product_sha256` — the
+> shared value is a **checkable capture↔decode correspondence** (no `derived_from`; FACTs
+> carry custody directly). **Honest scope:** the correspondence is populated by the sweep
+> (`attest_lrpt_decode_all.sh` mints the `iq_capture` FACT before the decode FACT), and is
+> cross-checkable by hand, but `verify.rail` does **not** yet auto-resolve `input_sha256`
+> against another ledger's `product_sha256` — so it is a correspondence, not yet a
+> verifier-enforced guarantee. (Auto-resolution is a tracked follow-up.)
 
 **INFERENCE kinds** (`type=INFERENCE`, go in the separate inference ledger family, each
 carries `derived_from`): `VESSEL_INFERENCE_RECEIPT`, `RS41_INFERENCE_RECEIPT`, and the
@@ -238,6 +251,7 @@ data/acars_receipts.jsonl
 data/orbcomm_receipts.jsonl
 data/rfml_receipts.jsonl
 data/rs41_receipts.jsonl
+data/lrpt_decode_receipts.jsonl
 ```
 
 ### B.6 The separate INFERENCE ledger family (NEVER mixed with FACT ledgers)
@@ -266,6 +280,13 @@ pattern as B.5/B.7):
   - `data/iq_capture_receipts.jsonl` — chained v=2 ledger
   - `data/iq_capture_receipt.json` — legacy single-object
   - `data/iq_capture_fact_chain.txt` — fact-chain `prev` staging
+- **LRPT-decode** (Wave B0, NEW v=2 FACT decode-product stream — sibling to IQ-capture):
+  - `data/lrpt_decode_receipts.jsonl` — chained v=2 ledger (FACT, `cadu_ok` honesty bit)
+  - `data/lrpt_decode_receipt.json` — legacy single-object
+  - `data/lrpt_decode_fact_chain.txt` — latest fact `chain_hash` (a future MSU-MR
+    image-projection INFERENCE can name it as `derived_from`)
+  - `data/lrpt_decode_rollup_cursor.txt` — last-signed `input:product` (idempotency note;
+    the authoritative idempotency gate is a ledger scan for the `input_sha256`+`product_sha256` pair)
 
 ### B.7 Legacy single-object backward-compat
 
@@ -402,6 +423,7 @@ authorities):**
 | PHYSICS_BINDING (`binding_attest.rail`) | `b14d14b14d14b14d14b14d14b14d14b14d14b14d14b14d14b14d14b14d140000` |
 | MESH aggregator (`mesh_witness_attest.rail`) | `e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e540000` |
 | IQ_CAPTURE (`iq_capture_attest.rail`) | `c0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0de0000` |
+| LRPT_DECODE (`lrpt_decode_attest.rail`) | `1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad0000` |
 
 > The IQ_CAPTURE seed is a distinct, clearly-labeled DEV seed (`c0de…0000`) — not shared
 > with any other stream. **`nodeA` / `nodeB` simulation** in the Wave D mesh validator
