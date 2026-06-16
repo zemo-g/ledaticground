@@ -79,11 +79,16 @@ if [ "${#INPUT_HASH}" -ne 64 ]; then
 fi
 PRODUCT_HASH="$INPUT_HASH"   # product of a capture = the raw bytes (honest identity)
 
-# --- Idempotency: if the cursor already records THIS input hash, this IQ is already signed.
-if [ -f "$CURSOR" ]; then
+# --- Idempotency: no-op ONLY if the cursor records THIS input hash AND the consumer's dependency
+# (the FACT-chain pointer the binding rollup reads as derived_from) is actually present + non-empty.
+# A cursor match with a MISSING/empty fact-chain (e.g. ledger files cleared but the cursor left
+# behind) must NOT no-op -- otherwise the pipeline wedges ("already signed" yet no FACT root). In
+# that case fall through and re-sign, which rewrites the fact-chain. (Audit finding 2026-06-16.)
+FACT_CHAIN="$REPO/data/iq_capture_fact_chain.txt"
+if [ -f "$CURSOR" ] && [ -s "$FACT_CHAIN" ]; then
     LAST_INPUT="$(cat "$CURSOR" 2>/dev/null | tr -d '[:space:]')"
     if [ "$LAST_INPUT" = "$INPUT_HASH" ]; then
-        echo "IQCAP: input $INPUT_HASH already signed (cursor match) -- idempotent no-op (exit 0)"
+        echo "IQCAP: input $INPUT_HASH already signed (cursor match + fact-chain present) -- idempotent no-op (exit 0)"
         exit 0
     fi
 fi
