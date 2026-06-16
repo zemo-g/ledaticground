@@ -1,0 +1,151 @@
+-- ledaticground CORPUS_RECEIPT: the attested-corpus engine signer (PAOS-for-ourselves Rung 1, v=2).
+-- The moat = ARTIFACT-attestation. This signer emits ONE CORPUS_RECEIPT (type=INFERENCE) per source
+-- AIS FACT batch, carrying derived_from = a real AIS FACT chain_hash. A verifier (src/verify.rail,
+-- UNCHANGED, INFERENCE gate at verify.rail:653-659) walks each batch back to a signed off-air
+-- reception. SINGLE-PARENT only (verify.rail resolve_derived_multi handles exactly 2 parents; 3+
+-- silently ignored) -> derived_from is ONE 64-hex hash, never a ;-list. Supersedes the
+-- PAOS_LABEL_RECEIPT (type=FACT, no derived_from); the corpus chain starts fresh at GENESIS.
+--
+-- NON-NEGOTIABLE HONEST CLAIM (kept here, never regressed):
+--   * Provably-SOURCED corpus, NEVER true-labels/ground-truth beyond the decoder oracle.
+--   * The verifier walks RECEIPTS (batch granularity), NOT rows -- per-row walk is a FUTURE rung.
+--   * bound_rate_x1000=1000 (R2 rejects any unbindable row; every staged row HAS a real parent).
+--   * rejected_count carries the failed-oracle / unresolvable / pre-NTP count -- never invented,
+--     never silently dropped (the rows live in data/corpus/ais_rejects.jsonl with the verdict bit).
+--   * lat/lon in the rows = transmitter self-report; receiver geo stays PENDING_needs_GPS_PPS.
+--   * agree_count = PENDING (rfml has no per-burst join key; correct reason, not a dead classifier).
+--
+-- CRYPTO SHAPE: identical to src/ais_attest.rail / src/paos_label_attest.rail (Ed25519 DEV seed ->
+-- pk -> pipe-string sign -> sha256 chain_hash). NO crypto change. The ONLY deltas vs paos_label are:
+--   - DISTINCT CORPUS DEV seed (c025..0000, registered in the contract E.3 dev-seed table).
+--   - type=INFERENCE + derived_from (single AIS FACT chain_hash, FIRST field post-n per A.2).
+--   - the A.10 CORPUS_RECEIPT field set (field order LOAD-BEARING; the sig is over the exact bytes).
+--   - corpus_sha256 == product_sha256 = sha256 of the LC_ALL=C byte-sorted batch the extractor staged.
+--
+-- The product = the deterministic LC_ALL=C-sorted newline-join of THIS batch's corpus row lines,
+-- staged by scripts/corpus_extract.py at /tmp/paos_labels_batch.txt (digest-canonical-byte-order;
+-- mirrors attest_rfml_rollup.sh:201). The rows themselves are NOT embedded; the digest commits to
+-- them and the staged batch IS the evidence (a verifier with the same rows recomputes the digest).
+--
+-- WRITES ONLY the greenfield data/corpus/ tree:
+--   * APPENDS one v=2 space-after-colon JSON line to data/corpus/ais_corpus_receipts.jsonl.
+--   * keeps the legacy single-object data/corpus/ais_corpus_receipt.json for verify.rail compat.
+--   * writes the tail chain_hash to data/corpus/corpus_fact_chain.txt.
+-- NEVER touches the live AIS decode path or the 4 protected AIS ledger files.
+--
+-- Run via the flock-serialized wrapper from the rail repo root so stdlib imports resolve:
+--   bash scripts/railrun.sh /Users/ledaticempire/projects/ledaticground/src/corpus_attest.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+
+-- field_or: read a /tmp staging file (set by the L1 extractor / L2 driver), strip trailing
+-- newline; if absent/empty fall back to the honest default. Same idiom every signer uses.
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+main =
+  -- CORPUS DEV signing key -- DISTINCT from the AIS/RFML/PAOS seed (contract E.3 dev-seed table).
+  -- NOT a production attestation authority (clearly labeled DEV). The CORPUS_RECEIPT KIND token +
+  -- this distinct seed disambiguate the corpus chain from the FACT chains it derives from.
+  let seed = hex_to_bytes "c025c025c025c025c025c025c025c025c025c025c025c025c025c025c0250000"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- product = the canonical (LC_ALL=C-sorted) corpus-row batch the extractor staged. corpus_sha256
+  -- == product_sha256 = sha256_hex over the byte-sorted newline-join of THIS batch's rows. The rows
+  -- are NOT embedded; the digest commits to them and the staged batch file IS the evidence.
+  -- READ RAW (like ais_attest.rail:47) -- NOT through field_or, which strips the inter-row newlines
+  -- (str_replace "\n" "") and would collapse the multi-line batch into one line, changing the digest.
+  let product = read_file "/tmp/paos_labels_batch.txt"
+  let corpus_hash = sha256_hex product
+
+  -- beacon pulse: unified staging files (contract section C). Honest PENDING on fetch failure.
+  -- pulse_hex always travels as a hex string -- avoids the char_from_int(0)=="" NUL-drop trap.
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING_beacon_unreachable"
+
+  -- real hash-chain: prev= is the tail CORPUS line's chain_hash (staged by the driver), or GENESIS.
+  -- The corpus chain is its OWN ledger -- it starts at GENESIS, distinct from the AIS FACT chain.
+  let prev = field_or "/tmp/corpus_prev_sha.txt" "GENESIS"
+
+  -- batch provenance BOUNDS (source-row scrubbed unix seconds, NOT the attestation clock). Staged by
+  -- the extractor from the selected rows.
+  let batch_start = field_or "/tmp/paos_batch_start.txt" "PENDING"
+  let batch_end = field_or "/tmp/paos_batch_end.txt" "PENDING"
+
+  -- counts. n == label_count (the count of rows bound in THIS receipt). agree_count = PENDING (no
+  -- per-burst rfml join key). rejected_count rolls up the rejects ledger count for this pass.
+  let label_count = field_or "/tmp/paos_label_count.txt" "0"
+  let agree_count = field_or "/tmp/paos_agree_count.txt" "PENDING"
+  let rejected_count = field_or "/tmp/corpus_rejected_count.txt" "0"
+
+  -- THE single-parent derived_from: a real AIS FACT chain_hash (the resolver bound it from the row
+  -- ts -> covering AIS batch window). 64-hex, never a ;-list (single-parent only). NONE if the
+  -- extractor staged no batch -- but the driver only fires the signer when there IS a batch.
+  let derived_from = field_or "/tmp/corpus_derived_from.txt" "NONE"
+
+  -- A.6 custody (rung 3): commit to the attested CODE (this signer's .rail SOURCE, shasum'd by the
+  -- driver) + the raw INPUT bytes this batch decoded from (the extractor staged the AIS-source sha).
+  -- Honest PENDING defaults (never 0, never fabricated). Binds WHICH bytes produced the corpus, not
+  -- that the bytes are off-air-real -- provenance, not correspondence. code_sha256 binds SOURCE text.
+  let code_sha = field_or "/tmp/corpus_code_sha256.txt" "PENDING_no_code_hash"
+  let input_sha = field_or "/tmp/corpus_input_sha.txt" "PENDING_no_input_hash"
+
+  -- RECEIPTS carry node/station = data/station_name.txt (regional_MI); the corpus ROWS carry
+  -- node=ledaticground-roofv2 (from the live source). Surfaced honestly; provenance resolves by hash.
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let band = "AIS-161.975MHz-PAOS-labels"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  -- the feature-coordinate library tag (the corpus rows carry feat=[]; the tag names the schema).
+  let feat_lib = field_or "/tmp/paos_feat_lib.txt" "featlib_v3-18f"
+
+  -- A.10 CORPUS_RECEIPT (type=INFERENCE). Field order is LOAD-BEARING -- the sig is over this exact
+  -- pipe string, byte for byte. derived_from is the FIRST field after n (contract A.2). corpus_sha256
+  -- == product_sha256 (same value, both present per A.10). bound_rate_x1000=1000 + label_oracle=crc_ok
+  -- are literals (every staged row is bound; the oracle is the decoder's CRC pass).
+  let receipt = join "|" ["CORPUS_RECEIPT", "v=2", "type=INFERENCE", cat ["node=", sta], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", label_count], cat ["derived_from=", derived_from], "stream=ais", cat ["label_count=", label_count], cat ["agree_count=", agree_count], cat ["rejected_count=", rejected_count], "bound_rate_x1000=1000", "label_oracle=crc_ok", cat ["feat_lib=", feat_lib], cat ["code_sha256=", code_sha], cat ["input_sha256=", input_sha], cat ["corpus_sha256=", corpus_hash], cat ["product_sha256=", corpus_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sig = ed25519_sign seed msg mlen
+  let sig_hex = bytes_to_hex sig 64
+
+  let verify_ok = ed25519_verify pk msg mlen sig
+  let tstr = cat [receipt, "X"]
+  let tmsg = string_to_bytes tstr
+  let tlen = string_length_bytes tstr
+  let tamper_ok = ed25519_verify pk tmsg tlen sig
+  let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+  let _ = print (cat ["CORPUS   n=", label_count, " agree=", agree_count, " rejected=", rejected_count, " bound_rate_x1000=1000 feat_lib=", feat_lib])
+  let _ = print (cat ["PARENT   derived_from=", derived_from])
+  let _ = print (cat ["CORPSHA  ", corpus_hash])
+  let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["SIG      ", sig_hex])
+  let _ = print (cat ["CHAIN    ", chain_hash])
+  let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+  let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+  -- v=2 chained JSONL ledger line. SPACE-AFTER-COLON on receipt/sig/signer/chain_hash is LOAD-BEARING
+  -- for verify.rail's field_val (the cold verifier's matcher is `"key": "`). Append via append_line.
+  let jline = cat ["{\"v\":2,\"type\":\"INFERENCE\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/corpus/ais_corpus_receipts.jsonl" jline
+  let _ = print "APPENDED data/corpus/ais_corpus_receipts.jsonl (v=2 chained line)"
+
+  -- legacy single-object data/corpus/ais_corpus_receipt.json (latest) for verify.rail single-object compat.
+  let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/corpus/ais_corpus_receipt.json" jrec
+  let _ = print "WROTE data/corpus/ais_corpus_receipt.json"
+
+  -- the latest CORPUS chain_hash -> data/corpus/corpus_fact_chain.txt (the corpus chain tail; the L2
+  -- driver reads this to derive prev when the cursor is missing, and the wedge-guard checks it).
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/corpus/corpus_fact_chain.txt" chain_hash
+  let _ = print "WROTE data/corpus/corpus_fact_chain.txt"
+  0

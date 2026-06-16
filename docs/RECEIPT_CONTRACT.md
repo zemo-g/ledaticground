@@ -136,8 +136,9 @@ source rows recomputes the identical digest. The per-kind contract product paths
 > verifier-enforced guarantee. (Auto-resolution is a tracked follow-up.)
 
 **INFERENCE kinds** (`type=INFERENCE`, go in the separate inference ledger family, each
-carries `derived_from`): `VESSEL_INFERENCE_RECEIPT`, `RS41_INFERENCE_RECEIPT`, and the
-`LABEL=INFERENCE` sub-block of `ORBCOMM_POR_RECEIPT`.
+carries `derived_from`): `VESSEL_INFERENCE_RECEIPT`, `RS41_INFERENCE_RECEIPT`, the
+`LABEL=INFERENCE` sub-block of `ORBCOMM_POR_RECEIPT`, `PHYSICS_BINDING_RECEIPT` (A.7),
+`MESH_WITNESS_RECEIPT` (A.8), and `CORPUS_RECEIPT` (A.10).
 
 > A CRC/BCS/RS/UW-verified decode = **FACT** with its honesty bit. Derived kinematics /
 > geodetic transform / ETA / track / sat-id = **INFERENCE** in a separate ledger, bound
@@ -225,6 +226,78 @@ SPECTRUM_RECEIPT|v=2|type=FACT|node=<id>|station=<sta>|band=137-VHF-cu8-wideband
   Complementary to the LRPT-decode attestation (that signs the CADUs a capture decodes to; this
   signs what the band looked like). Register `SPECTRUM_RECEIPT` in the A.5 FACT kind set.
 
+### A.10 `CORPUS_RECEIPT` (PAOS-for-ourselves Rung 1 — attested training corpus)
+
+`type=INFERENCE`. The moat = artifact-attestation: every `CORPUS_RECEIPT` carries
+`derived_from=<single AIS FACT chain_hash>`, so a verifier walks each corpus batch back to a
+signed off-air AIS reception. It rides `verify.rail`'s **EXISTING** INFERENCE gate
+(`verify.rail` derived_from resolution, single-parent path) **UNCHANGED** — no crypto and no
+verifier change.
+
+```
+CORPUS_RECEIPT|v=2|type=INFERENCE|node=<sta>|station=<sta>|band=AIS-161.975MHz-PAOS-labels|geo=PENDING_needs_GPS_PPS|pulse_id=<pid>|pulse_hex=<vh16>|batch_start=<unix>|batch_end=<unix>|n=<label_count>|derived_from=<single_ais_fact_chain_hash_64hex>|stream=ais|label_count=<n>|agree_count=<n|PENDING>|rejected_count=<r>|bound_rate_x1000=1000|label_oracle=crc_ok|feat_lib=<tag>|code_sha256=<64hex|PENDING_no_code_hash>|input_sha256=<64hex>|corpus_sha256=<64hex>|product_sha256=<64hex>|prev=<prev_chain_hash>|signer=<pk_hex>
+```
+
+- `derived_from` is the **first post-`n` field** (matches the A.2 INFERENCE walk).
+- **SINGLE-PARENT ONLY.** `derived_from` is a single 64-hex AIS FACT `chain_hash`, **never** a
+  `;`-joined list. `verify.rail`'s `resolve_derived_multi` resolves exactly **2** parents; 3+ are
+  silently ignored — so the corpus engine emits **ONE `CORPUS_RECEIPT` per source AIS FACT batch
+  (1:1)** and stays under the 2-parent ceiling. (See the SINGLE-PARENT MANDATE note in E.2.)
+- `corpus_sha256` **==** `product_sha256` = `sha256_hex` over the **`LC_ALL=C` byte-sorted
+  newline-join of THIS batch's corpus-row lines** (digest-canonical-byte-order; mirrors
+  `attest_rfml_rollup.sh:201`). Both keys carry the same value so the existing `product_sha256`
+  verifier path keeps working AND the corpus-specific name is explicit.
+- All counts/rates are **ints** (Rail `to_int` is float-only — integer parsing happens in the
+  bash wrapper, never in Rail). `bound_rate_x1000=1000` is a **constant** (the engine rejects any
+  unbindable row to R2, so every committed row is bound — rate is identically 1.000).
+- `label_oracle=crc_ok` and `feat_lib=<tag>` are constants/tags. `agree_count` is `PENDING` for the
+  honest reason in the A.10 ROW schema (no per-burst rfml join key), never `0`.
+- `code_sha256` / `input_sha256` follow the A.6 custody discipline (`PENDING_no_code_hash` /
+  64-hex; never `0`). `code_sha256` = `shasum` of `src/corpus_attest.rail`; `input_sha256` =
+  `shasum` of the AIS source.
+
+#### A.10 ROW schema — `data/corpus/ais_corpus.jsonl` (one physical line per row, fixed key order)
+
+The committed training rows. `corpus_sha256`/`product_sha256` above is the digest of THIS batch's
+row lines. Fixed key order keeps diffs stable:
+
+```json
+{"v":2,"kind":"corpus_row","stream":"ais","example_id":"ais-<first12 of derived_from>-<ts_scrubbed>-<window_idx>","label_class":"msk","label_class_id":4,"oracle":{"src":"ais","verdict_field":"crc_pass","verdict":1,"mmsi":<int>,"msg_type":<int>},"label_fields":{"mmsi":<int>,"msg_type":<int>,"lat":"<text>","lon":"<text>"},"rfml_pred":"PENDING_no_overlay","agree":"PENDING","feat":[],"feat_lib":"featlib_v3-18f","feat_provenance":"PENDING_iq_not_co_captured","snr_db":null,"window_idx":0,"iq_ref":"PENDING_no_iq_ref","derived_from":"<single ais_fact_chain_hash 64hex>","node":"ledaticground-roofv2","pulse":"<pulse_id>","ts_scrubbed":<unix int>}
+```
+
+- `label_class_id` is the `modclass.rail` class space `{0 noise, 1 carrier, 2 afsk, 3 fsk, 4 msk}`.
+  AIS GMSK = **`msk` (4)**.
+- `oracle.verdict=1` is **SYNTHESIZED FROM PRESENCE** — `pi_ais_decode` emits a frame ONLY after
+  CRC-16/X-25 (`0xF0B8`) passes, so a present row inherits a passing oracle. **NEVER read
+  `o['crc_pass']`** (the live `ais.jsonl` keys are EXACTLY `[ch,kind,msg,node,ts]` — there is no
+  `crc_pass` key), **NEVER re-run** CRC.
+- `feat=[]` is an **empty array** — NEVER 18 zeros, NEVER fabricated features (the live source
+  carries no IQ / no features). `feat_provenance=PENDING_iq_not_co_captured`, `snr_db=null`,
+  `iq_ref=PENDING_no_iq_ref` for the same honest reason.
+- `rfml_pred=PENDING_no_overlay` / `agree=PENDING`: rfml is a real classifier (msk=63432 / fsk=10189
+  classes) but has **no per-burst join key** to this AIS stream — so the overlay is honestly
+  PENDING for a **correct reason** (no key), NOT a dead classifier and NOT a disagreement.
+- `lat`/`lon` are copied **VERBATIM as source text** (no float reformat) and are the
+  **transmitter's self-report** — NOT receiver geo; receiver `geo` stays `PENDING_needs_GPS_PPS`.
+- `node="ledaticground-roofv2"` on ROWS (from the live source), while the **RECEIPT** carries
+  `node=regional_MI` (from `data/station_name.txt`) — the node split is surfaced honestly; the
+  provenance bind resolves by `derived_from` hash, not by node string.
+- `ts_scrubbed` = `fromisoformat(ISO) -> int`; `clean_ts` drops `ts < 1e9` / unparseable rows.
+
+#### A.10 REJECT schema — `data/corpus/ais_rejects.jsonl` (failed-oracle, NEVER silently dropped)
+
+```json
+{"v":2,"kind":"corpus_reject","reason":"oracle_crc_fail|unresolvable_derived_from|ts_pre_ntp","oracle":{"src":"ais","verdict_field":"crc_pass","verdict":0},"ts_scrubbed":<unix>,"derived_from_attempt":"<hash|NONE>","node":"ledaticground-roofv2","pulse":"<pid>"}
+```
+
+- Rejects are **NOT signed per-row**; their COUNT rolls into `CORPUS_RECEIPT.rejected_count`.
+- A row whose `ts` lands in **NO** AIS receipt window → `REJECT(unresolvable_derived_from)` with
+  `derived_from_attempt=NONE` — **NEVER** a fabricated `derived_from` hash. This is the honest
+  failed-oracle policy: failed observations go to the rejects ledger with the bit, never invented
+  and never dropped.
+
+Register `CORPUS_RECEIPT` in the A.5 INFERENCE kind set.
+
 ---
 
 ## (B) THE JSON LEDGER LINE — shape, space-after-colon rule, chain_hash, filenames
@@ -308,6 +381,41 @@ pattern as B.5/B.7):
     image-projection INFERENCE can name it as `derived_from`)
   - `data/lrpt_decode_rollup_cursor.txt` — last-signed `input:product` (idempotency note;
     the authoritative idempotency gate is a ledger scan for the `input_sha256`+`product_sha256` pair)
+- **CORPUS** (PAOS-for-ourselves Rung 1, INFERENCE — the attested training corpus, A.10):
+  - `data/corpus/ais_corpus_receipts.jsonl` — chained v=2 INFERENCE ledger (the `CORPUS_RECEIPT`
+    lines; this is the `verify.rail` target)
+  - `data/corpus/ais_corpus.jsonl` — the committed corpus ROWS (A.10 ROW schema), one physical
+    line per row; the batch's `corpus_sha256`/`product_sha256` is the digest over these row lines
+  - `data/corpus/ais_rejects.jsonl` — the REJECT ledger (A.10 REJECT schema); failed-oracle /
+    unresolvable / pre-NTP rows, NEVER silently dropped; COUNT rolls into `rejected_count`
+  - `data/corpus/corpus_rollup_cursor.txt` — last-signed `batch_end` (missing → derive from the
+    CORPUS ledger tail; empty → 0)
+  - `data/corpus/corpus_fact_chain.txt` — latest CORPUS `chain_hash` (the `prev=` staging source;
+    GENESIS when empty)
+
+> **PAOS_LABEL_RECEIPT supersession.** The existing `src/paos_label_attest.rail` emitted a
+> `PAOS_LABEL_RECEIPT` as **`type=FACT` with NO `derived_from`** — it claimed the labels as
+> first-class truth, unbound to any decoded reception. That is the exact defect this corpus engine
+> fixes: a derived label product is an **INFERENCE**, and it MUST name the AIS FACT batch it was
+> computed from. `CORPUS_RECEIPT` (A.10, `type=INFERENCE`, mandatory single-parent `derived_from`)
+> **SUPERSEDES** `PAOS_LABEL_RECEIPT`; the new CORPUS chain starts at `prev=GENESIS` and lives in
+> its own `data/corpus/` family — it does NOT continue the `data/paos_label_receipts.jsonl` chain.
+>
+> **Node split (surfaced honestly).** The `CORPUS_RECEIPT` carries `node=regional_MI` /
+> `station=regional_MI` (read from `data/station_name.txt`, the receiving-node identity), while the
+> corpus ROWS carry `node=ledaticground-roofv2` (copied from the live source). These are different
+> strings for a real reason (receipt = the signing/receiving station; row = the source node tag);
+> the provenance bind is by `derived_from` **hash**, never by node string.
+>
+> **SINGLE-PARENT MANDATE (the 2-parent ceiling).** `verify.rail`'s `resolve_derived_multi`
+> resolves exactly **2** `;`-joined parents; a 3+-parent value silently ignores the extras. So the
+> corpus engine emits **ONE `CORPUS_RECEIPT` per source AIS FACT batch (1:1)**, with `derived_from`
+> a **single** 64-hex hash. **Never** a `;`-joined `derived_from` on a `CORPUS_RECEIPT`.
+>
+> **Per-row walk is a FUTURE rung.** Today the verifier walks RECEIPTS at **batch granularity** —
+> it resolves the receipt's single `derived_from` to a covering AIS FACT batch. A per-ROW provenance
+> walk (each `corpus_row` independently bound and verifier-resolved) is a **future rung**, stated
+> here in the future tense only — it is NOT a present-tense capability.
 
 ### B.7 Legacy single-object backward-compat
 
@@ -446,6 +554,11 @@ authorities):**
 | IQ_CAPTURE (`iq_capture_attest.rail`) | `c0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0de0000` |
 | SPECTRUM (`spectrum_attest.rail`) | `5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec0000` |
 | LRPT_DECODE (`lrpt_decode_attest.rail`) | `1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad0000` |
+| CORPUS (`corpus_attest.rail`, A.10) | `c025c025c025c025c025c025c025c025c025c025c025c025c025c025c0250000` |
+
+> The CORPUS seed (`c025…0250000`) is a **distinct, clearly-labeled DEV seed** — not shared with
+> AIS/RFML or any other stream. A `CORPUS_RECEIPT` is a NEW signer (`corpus_attest.rail`); per the
+> rule above, new signers pick their own seed and never reuse another stream's.
 
 > The IQ_CAPTURE seed is a distinct, clearly-labeled DEV seed (`c0de…0000`) — not shared
 > with any other stream. **`nodeA` / `nodeB` simulation** in the Wave D mesh validator
