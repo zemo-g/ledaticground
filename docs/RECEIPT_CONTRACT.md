@@ -204,6 +204,27 @@ MESH_WITNESS_RECEIPT|v=2|type=INFERENCE|node=<aggregator>|station=<sta>|band=<em
   correspondence needs `mesh_peer=REAL` + `clock_disc=PPS` (Wave F).
 - Register `MESH_WITNESS_RECEIPT` in the A.5 INFERENCE kind set.
 
+### A.9 `SPECTRUM_RECEIPT` (extract-more #2 — attested RF-environment spectrum)
+
+```
+SPECTRUM_RECEIPT|v=2|type=FACT|node=<id>|station=<sta>|band=137-VHF-cu8-wideband|geo=<geo>|pulse_id=|pulse_hex=|batch_start=<unix>|batch_end=<unix>|n=<n_fft_cols>|occ_pct=<float>|peak_excess_db=<int>|dyn_range_db=<int>|fs_hz=<int>|nfft=<int>|code_sha256=<64hex>|input_sha256=<64hex>|spectrum_sha256=<64hex>|product_sha256=<64hex>|prev=<prev_chain_hash>|signer=<pk_hex>
+```
+
+- A self-calibrating spectral SUMMARY of a **wideband cu8 IQ capture** (`raw_iq/*.bin` — the real
+  137-band RF environment, NOT the demod AIS audio). Every metric is relative to the capture's OWN
+  noise floor (cu8 has no absolute cal), so SDR gain + band-edge rolloff cancel — honest measured
+  values, signed as a FACT.
+- The **"meet in the middle"** hybrid: the receipt is a compact, queryable summary (occupancy, peak
+  excess, dynamic range) AND commits by hash to full fidelity — `input_sha256` (raw .bin),
+  `spectrum_sha256` (the fixed-grid binned spectrum, recomputable from the IQ), `product_sha256`
+  (the full summary JSON), `code_sha256` (generator + signer, A.6 custody). The light record stays
+  un-fakeable: recompute the bins from the retained IQ and check `spectrum_sha256`.
+- All DSP is in `gen_spectrum_summary.py` (mirrors `wb_proto.py`); the Rail signer does only string
+  assembly + crypto (no float math). **EPISODIC** (per retained wideband capture), NOT a continuous
+  series — continuous wideband would need dedicated periodic IQ grabs (SDR contention; future).
+  Complementary to the LRPT-decode attestation (that signs the CADUs a capture decodes to; this
+  signs what the band looked like). Register `SPECTRUM_RECEIPT` in the A.5 FACT kind set.
+
 ---
 
 ## (B) THE JSON LEDGER LINE — shape, space-after-colon rule, chain_hash, filenames
@@ -423,6 +444,7 @@ authorities):**
 | PHYSICS_BINDING (`binding_attest.rail`) | `b14d14b14d14b14d14b14d14b14d14b14d14b14d14b14d14b14d14b14d140000` |
 | MESH aggregator (`mesh_witness_attest.rail`) | `e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e540000` |
 | IQ_CAPTURE (`iq_capture_attest.rail`) | `c0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0de0000` |
+| SPECTRUM (`spectrum_attest.rail`) | `5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec0000` |
 | LRPT_DECODE (`lrpt_decode_attest.rail`) | `1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad1cad0000` |
 
 > The IQ_CAPTURE seed is a distinct, clearly-labeled DEV seed (`c0de…0000`) — not shared

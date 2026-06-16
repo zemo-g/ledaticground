@@ -1,0 +1,103 @@
+-- ledaticground: attested SPECTRUM receipt (pure Rail) -- RECEIPT_CONTRACT v=2 (extract-more #2).
+-- Binds a self-calibrating spectral SUMMARY of a wideband cu8 IQ capture (the real 137-band RF
+-- environment, NOT demod audio) to the receiving node under an Ed25519 signature, hash-chained,
+-- beacon-anchored. The artifact: "this node observed exactly this RF-environment spectrum at this
+-- pulse" -- a provable local radio-sky record, off captures we already take + retain.
+--
+-- The "meet in the middle" design: the receipt is a compact, queryable SUMMARY (occupancy, peak
+-- excess, dynamic range -- all self-calibrating, relative to the capture's own noise floor) AND it
+-- commits by hash to the FULL fidelity:
+--   input_sha256    = the raw cu8 .bin (the evidence)
+--   spectrum_sha256 = the fixed-grid binned spectrum (full bins -- recomputable from the IQ)
+--   product_sha256  = the full summary JSON (all params)
+--   code_sha256     = the generator + this signer source (A.6 custody)
+-- so the light record stays un-fakeable: anyone can recompute the bins from the retained IQ and
+-- check spectrum_sha256, or re-derive the summary and check product_sha256. NOTHING fabricated;
+-- the scalars are honest measured values. geo=PENDING_needs_GPS_PPS until GPS-PPS lands.
+--
+-- All DSP is done in Python (gen_spectrum_summary.py, mirrors wb_proto.py); this signer reads the
+-- pre-computed scalars + hashes as STRINGS and does pure assembly + crypto (no float math in Rail).
+-- Run via the flock wrapper:  bash scripts/railrun.sh <abs>/src/spectrum_attest.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+main =
+  -- SPECTRUM DEV signing key (clearly labeled -- NOT a production attestation authority).
+  let seed = hex_to_bytes "5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec5fec0000"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- node identity (sanitized). geo PENDING until GPS-PPS. Never fabricated.
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let band = "137-VHF-cu8-wideband"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  -- beacon pulse (shared staging, contract C). Honest PENDING on fetch failure.
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING_beacon_unreachable"
+
+  -- real hash-chain: prev = the tail line's chain_hash (staged by the driver), or GENESIS.
+  let prev = field_or "/tmp/spectrum_prev_sha.txt" "GENESIS"
+
+  -- provenance bounds (the capture's time window, staged by the driver). NOT the attestation clock.
+  let batch_start = field_or "/tmp/spectrum_batch_start.txt" "PENDING"
+  let batch_end = field_or "/tmp/spectrum_batch_end.txt" "PENDING"
+
+  -- headline summary scalars (computed by gen_spectrum_summary.py; integers on the wire).
+  let n_cols = field_or "/tmp/spectrum_n_cols.txt" "0"
+  let occ_pct = field_or "/tmp/spectrum_occ_pct.txt" "PENDING_no_summary"
+  let peak_excess = field_or "/tmp/spectrum_peak_excess_db.txt" "PENDING_no_summary"
+  let dyn_range = field_or "/tmp/spectrum_dyn_range_db.txt" "PENDING_no_summary"
+  let fs_hz = field_or "/tmp/spectrum_fs_hz.txt" "0"
+  let nfft = field_or "/tmp/spectrum_nfft.txt" "0"
+
+  -- A.6 custody + the hybrid full-fidelity commitments (all hex strings; honest PENDING defaults).
+  let code_sha = field_or "/tmp/spectrum_code_sha256.txt" "PENDING_no_code_hash"
+  let input_sha = field_or "/tmp/spectrum_input_sha256.txt" "PENDING_no_input_hash"
+  let spectrum_sha = field_or "/tmp/spectrum_spectrum_sha256.txt" "PENDING_no_spectrum_hash"
+  let product_sha = field_or "/tmp/spectrum_product_sha256.txt" "PENDING_no_product_hash"
+
+  -- v=2 FACT receipt -- field order LOAD-BEARING (sig is over this exact string).
+  let receipt = join "|" ["SPECTRUM_RECEIPT", "v=2", "type=FACT", cat ["node=", sta], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", n_cols], cat ["occ_pct=", occ_pct], cat ["peak_excess_db=", peak_excess], cat ["dyn_range_db=", dyn_range], cat ["fs_hz=", fs_hz], cat ["nfft=", nfft], cat ["code_sha256=", code_sha], cat ["input_sha256=", input_sha], cat ["spectrum_sha256=", spectrum_sha], cat ["product_sha256=", product_sha], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sig = ed25519_sign seed msg mlen
+  let sig_hex = bytes_to_hex sig 64
+
+  let verify_ok = ed25519_verify pk msg mlen sig
+  let tstr = cat [receipt, "X"]
+  let tmsg = string_to_bytes tstr
+  let tlen = string_length_bytes tstr
+  let tamper_ok = ed25519_verify pk tmsg tlen sig
+  let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+  let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["SIG      ", sig_hex])
+  let _ = print (cat ["CHAIN    ", chain_hash])
+  let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+  let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+  -- v=2 chained JSONL ledger line (space-after-colon on every string field verify.rail reads).
+  let jsonline = cat ["{\"v\":2,\"type\":\"FACT\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/spectrum_receipts.jsonl" jsonline
+  let _ = print "APPENDED data/spectrum_receipts.jsonl (v=2 chained line)"
+
+  -- legacy single-object (latest) for verify.rail backward compat.
+  let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/spectrum_receipt.json" jrec
+  let _ = print "WROTE data/spectrum_receipt.json"
+
+  -- tail chain_hash pointer (a future spectrum-inference / cross-stream consumer's root).
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/spectrum_fact_chain.txt" chain_hash
+  let _ = print "WROTE data/spectrum_fact_chain.txt"
+  0
