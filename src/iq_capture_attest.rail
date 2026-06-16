@@ -1,0 +1,147 @@
+-- ledaticground: attested raw-IQ CAPTURE receipt (pure Rail) -- RECEIPT_CONTRACT v=2.
+-- Ticket B0-CAPTURE. Binds a raw IQ .bin capture to the receiving node under an Ed25519
+-- signature, REAL hash-chained, beacon-anchored, with round-trip verify + tamper detection.
+--
+-- WHY THIS EXISTS: Wave B (PHYSICS_BINDING) is type=INFERENCE and MUST carry a
+-- derived_from=<fact_chain_hash> resolving to a FACT receipt. Before this signer the only
+-- FACT root for a raw capture was a file-digest fallback. This emits a v=2 type=FACT
+-- CAPTURE_RECEIPT over the raw IQ bytes so Wave B has a REAL FACT derived_from root: "this
+-- node captured exactly these IQ bytes in this window, chained to all prior captures."
+--
+-- This is the FIRST v=2 capture receipt (legacy src/attest.rail is pre-v2 and does NOT
+-- chain / beacon-anchor / carry custody fields). It mirrors the v=2 FACT idiom of
+-- src/ais_attest.rail + src/orbcomm_attest.rail verbatim (field_or, join "|", real prev=,
+-- append_line, legacy single-object), and adds the Wave-A custody fields (contract A.6):
+--   code_sha256  = shasum -a 256 of THIS signer's .rail SOURCE (binds the source text).
+--   input_sha256 = shasum -a 256 of the raw IQ .bin bytes (the input the product is a
+--                  deterministic function of). For a CAPTURE the product IS the input, so
+--                  product_sha256 commits to the very same IQ bytes -- an honest identity,
+--                  not a contrivance.
+--
+-- v=2 CAPTURE_RECEIPT receipt string -- field order is LOAD-BEARING (the signature is over
+-- this EXACT pipe string). CAPTURE_RECEIPT carries NO per-batch decode honesty bit (there is
+-- no CRC/RS check on a raw capture -- it is bytes off the SDR, not a decoded frame), so the
+-- A.3 honesty slot is omitted, exactly as AIS_RECEIPT omits it. The custody fields sit
+-- between n= and product_sha256= per contract A.6:
+--   CAPTURE_RECEIPT|v=2|type=FACT|node=..|station=..|band=..|geo=..|pulse_id=..|pulse_hex=..|
+--     batch_start=..|batch_end=..|n=..|code_sha256=..|input_sha256=..|product_sha256=..|
+--     prev=..|signer=..
+--
+-- HONESTY (operator standing rules):
+--   * geo stays PENDING_needs_GPS_PPS until a surveyed GPS-PPS fix lands. NEVER fabricated.
+--   * pulse fetch failure -> pulse_id=PENDING_beacon_unreachable (NEVER 0, NEVER wall-clock).
+--   * pulse_hex / all digests travel as HEX STRINGS (char_from_int(0)=="" NUL-drop trap).
+--   * custody fields FAIL CLOSED to PENDING_no_code_hash / PENDING_no_input_hash if the
+--     rollup driver did not stage them -- never a fabricated or zero hash.
+--   * batch_start/batch_end are capture-window BOUNDS (provenance), NOT the attestation clock.
+--   * REAL hash-chaining: prev = chain_hash of the prior ledger line, GENESIS only on line 1.
+--
+-- DEV signing key: the distinct, clearly-labeled IQ_CAPTURE DEV seed from contract E.3
+-- (c0de..0000). NOT a production attestation authority (production keys are a future V100 rung).
+--
+-- Idempotent on the same IQ: the rollup driver re-signs the SAME bytes -> identical
+-- product_sha256/input_sha256, and skips re-appending if the tail line already covers them.
+--
+-- Run via the flock-serialized wrapper so stdlib crypto's nested relative imports resolve:
+--   bash scripts/railrun.sh <ledaticground>/src/iq_capture_attest.rail
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+
+-- field_or: read a /tmp (or data/) staging file, strip trailing newline; if absent/empty
+-- fall back to the honest default. Verbatim idiom from ais_attest.rail / orbcomm_attest.rail.
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+main =
+  -- DEV signing key -- the distinct, clearly-labeled IQ_CAPTURE DEV seed (64-hex) from the
+  -- contract dev-seed table (E.3): the 0xc0de "code" byte pattern, distinct from every other
+  -- stream (AIS a15a.., ACARS ac3a.., beacon 9012.., ORBCOMM 0cb0..). NOT a production key.
+  let seed = hex_to_bytes "c0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0de0000"
+  let pk = ed25519_pk_from_sk seed
+  let pk_hex = bytes_to_hex pk 32
+
+  -- product_sha256: the sha256 of the raw IQ bytes, STAGED AS HEX by the rollup driver
+  -- (shasum -a 256 of the .bin). The signer does NOT read the .bin itself -- the driver
+  -- shasums it and stages the hex, so we never pull raw NUL-bearing binary through a Rail
+  -- string (char_from_int(0)=="" NUL-drop trap). FAIL CLOSED to a PENDING marker if absent.
+  let product_hash = field_or "/tmp/iq_capture_product_sha256.txt" "PENDING_no_product_hash"
+
+  -- custody fields (contract A.6, Wave A rung 3), all staged as hex by the driver:
+  --   code_sha256  = shasum -a 256 of THIS signer's .rail source (binds the source text).
+  --   input_sha256 = shasum -a 256 of the raw IQ .bin (the input the product is derived from).
+  -- For a CAPTURE the product IS the input, so product_sha256 == input_sha256 -- honest.
+  let code_hash = field_or "/tmp/iq_capture_code_sha256.txt" "PENDING_no_code_hash"
+  let input_hash = field_or "/tmp/iq_capture_input_sha256.txt" "PENDING_no_input_hash"
+
+  -- beacon pulse (SHARED staging, by the shell wrapper, per contract C). HONEST PENDING
+  -- fallback on any fetch failure -- the receipt is STILL signed + chained.
+  let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
+  let pulse_hex = field_or "/tmp/lg_pulse_hex.txt" "PENDING_beacon_unreachable"
+
+  -- REAL hash-chaining: prev = chain_hash of the prior ledger line (GENESIS only on line 1).
+  -- Staged by the driver from tail -1 of data/iq_capture_receipts.jsonl.
+  let prev = field_or "/tmp/iq_capture_prev_sha.txt" "GENESIS"
+
+  -- capture-window BOUNDS + count -- staged by the driver. Provenance, NOT the attestation
+  -- clock. n = number of IQ files committed by this batch (1 for a single .bin).
+  let batch_start = field_or "/tmp/iq_capture_batch_start.txt" "PENDING"
+  let batch_end = field_or "/tmp/iq_capture_batch_end.txt" "PENDING"
+  let nstr = field_or "/tmp/iq_capture_batch_n.txt" "0"
+
+  -- node identity is file-driven (sanitized: region only, no street address). Precise lat/lon
+  -- is PENDING until GPS-PPS -- receiver geolocation is not asserted, only node identity + band.
+  let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+  let node = sta
+  -- band: the capture's RF band, staged by the driver from the IQ schedule; honest PENDING
+  -- if the driver could not determine it (never a fabricated frequency).
+  let band = field_or "/tmp/iq_capture_band.txt" "IQ-capture-band-PENDING"
+  let geo = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+  -- v=2 FACT CAPTURE_RECEIPT -- field order LOAD-BEARING (sig is over this EXACT string).
+  -- Custody fields (code_sha256, input_sha256) sit between n= and product_sha256= (A.6).
+  let receipt = join "|" ["CAPTURE_RECEIPT", "v=2", "type=FACT", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["code_sha256=", code_hash], cat ["input_sha256=", input_hash], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let msg = string_to_bytes receipt
+  let mlen = string_length_bytes receipt
+  let sig = ed25519_sign seed msg mlen
+  let sig_hex = bytes_to_hex sig 64
+
+  let verify_ok = ed25519_verify pk msg mlen sig
+  let tstr = cat [receipt, "X"]
+  let tmsg = string_to_bytes tstr
+  let tlen = string_length_bytes tstr
+  let tamper_ok = ed25519_verify pk tmsg tlen sig
+  let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+  let _ = print (cat ["RECEIPT  ", receipt])
+  let _ = print (cat ["CODE     ", code_hash])
+  let _ = print (cat ["INPUT    ", input_hash])
+  let _ = print (cat ["PRODUCT  ", product_hash])
+  let _ = print (cat ["SIG      ", sig_hex])
+  let _ = print (cat ["CHAIN    ", chain_hash])
+  let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+  let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+  -- v=2 chained JSONL ledger line. Space-after-colon on every string field verify.rail reads
+  -- (receipt/sig/signer/chain_hash) -- the cold verifier's field_val matches `"key": "`.
+  let jsonline = cat ["{\"v\":2,\"type\":\"FACT\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/iq_capture_receipts.jsonl" jsonline
+  let _ = print "APPENDED data/iq_capture_receipts.jsonl (v=2 chained CAPTURE_RECEIPT line)"
+
+  -- legacy single-object data/iq_capture_receipt.json (latest) for verify.rail backward compat.
+  let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/iq_capture_receipt.json" jrec
+  let _ = print "WROTE data/iq_capture_receipt.json"
+
+  -- the latest IQ-capture fact chain_hash -> data/iq_capture_fact_chain.txt. This is the
+  -- derived_from ROOT Wave B's PHYSICS_BINDING_RECEIPT will name (a REAL FACT chain_hash,
+  -- not a file-digest fallback). Mirrors ais_attest.rail's data/ais_fact_chain.txt.
+  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/iq_capture_fact_chain.txt" chain_hash
+  let _ = print "WROTE data/iq_capture_fact_chain.txt"
+  0

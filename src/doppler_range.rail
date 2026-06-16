@@ -1,0 +1,395 @@
+-- ledaticground: PARAMETERIZED SGP4-ish range/Doppler predictor (pure Rail).
+--
+-- Extracted from src/doppler_predict.rail (compute_elaz / solve_kepler / gmst_rad
+-- + the do_sat TLE->element setup), refactored to predict range (km) and range-rate
+-- -> Doppler (Hz) for an ARBITRARY (observer_geo, TLE, time t). doppler_predict.rail
+-- itself stays UNTOUCHED — its main keeps the planning defaults; this file is the
+-- reusable core for Waves B (binding), C (verifier re-run), and D (tdoa_pred_s).
+--
+-- Simplified SGP4: two-body Kepler + J2 secular drift on RAAN/argp/M. Same physics
+-- (and therefore the same numbers) as doppler_predict.rail — NOT full SGP4 (no drag,
+-- no short-period terms). Honest model label travels with every binding receipt.
+--
+-- The element/observer state lives in one float array `e` (26 slots), laid out
+-- IDENTICALLY to doppler_predict.rail so the two share compute_elaz byte-for-byte:
+--   e[0]  a (semi-major axis km)     e[13] observer geodetic lat phi (rad)
+--   e[1]  ecc                        e[14] observer geodetic lon lam (rad)
+--   e[2]  incl (rad)                 e[15] d2r
+--   e[3]  raan0 (rad)                e[16] dt (s)  [unused by range path]
+--   e[4]  argp0 (rad)                e[17] t0 (s since epoch at jd_now)
+--   e[5]  m0 (rad)                   e[18] min_el deg [planning only]
+--   e[6]  raandot (rad/s)            e[19] now_unix (float)
+--   e[7]  argpdot (rad/s)            e[20] jd_now
+--   e[8]  mdot (rad/s)               e[21] mu (398600.4418)
+--   e[9]  jd_epoch                   e[22] re (6378.137)
+--   e[10] observer ECEF x (km)       e[23] j2
+--   e[11] observer ECEF y (km)       e[24] twopi
+--   e[12] observer ECEF z (km)       e[25] fc (carrier Hz)
+--
+-- compute_elaz writes el->o[0], az->o[1], RANGE(km)->o[2]. The range path reads o[2].
+--
+-- Self-test main: rebuilds the EXACT doppler_predict.rail planning config (NOAA-19
+-- from observer (0,0,0.18km), now_unix from data/now_unix.txt, dt=30 n=2880,
+-- fc=137.1 MHz, el>5deg gate) and prints the IDENTICAL "DOPPLER <min> <el> <dop>"
+-- lines as a parity check.  Run from the ledaticground dir so data/ resolves:
+--   ~/projects/rail/rail_native run src/doppler_range.rail
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign pow x y -> float
+foreign atan2 y x -> float
+foreign floor x -> float
+
+asin_ x = atan2 x (sqrt (1.0 - x * x))
+fmod_ a b = a - (floor (a / b)) * b
+
+-- Kepler equation: solve M = E - e sin E for E (Newton, fixed iters) — verbatim.
+kepler_iter e m ecur k =
+  if k == 0 then ecur
+  else
+    let f = ecur - e * (sin ecur) - m
+    let fp = 1.0 - e * (cos ecur)
+    let enext = ecur - f / fp
+    kepler_iter e m enext (k - 1)
+
+solve_kepler e m = kepler_iter e m m 8
+
+-- Greenwich Mean Sidereal Time (radians) at a given Julian Date — verbatim.
+gmst_rad jd d2r =
+  let d = jd - 2451545.0
+  let t = d / 36525.0
+  let g = 280.46061837 + 360.98564736629 * d + 0.000387933 * t * t - (t * t * t) / 38710000.0
+  let gm = fmod_ g 360.0
+  let gpos = if gm < 0.0 then gm + 360.0 else gm
+  gpos * d2r
+
+-- Topocentric elevation/azimuth (deg) + range (km) of sat at time t (s since epoch).
+-- Writes el -> o[0], az -> o[1], range_km -> o[2].  VERBATIM from doppler_predict.rail
+-- (already parameterized on the observer in e[10..14]) so parity is byte-for-byte.
+compute_elaz e t o =
+  let a = float_arr_get e 0
+  let ecc = float_arr_get e 1
+  let incl = float_arr_get e 2
+  let raan0 = float_arr_get e 3
+  let argp0 = float_arr_get e 4
+  let m0 = float_arr_get e 5
+  let raandot = float_arr_get e 6
+  let argpdot = float_arr_get e 7
+  let mdot = float_arr_get e 8
+  let jde = float_arr_get e 9
+  let ox = float_arr_get e 10
+  let oy = float_arr_get e 11
+  let oz = float_arr_get e 12
+  let ophi = float_arr_get e 13
+  let olam = float_arr_get e 14
+  let d2r = float_arr_get e 15
+  let mm = m0 + mdot * t
+  let raan = raan0 + raandot * t
+  let argp = argp0 + argpdot * t
+  let ea = solve_kepler ecc mm
+  let r = a * (1.0 - ecc * (cos ea))
+  let nu = atan2 ((sqrt (1.0 + ecc)) * (sin (ea / 2.0))) ((sqrt (1.0 - ecc)) * (cos (ea / 2.0)))
+  let nu2 = nu * 2.0
+  let xo = r * (cos nu2)
+  let yo = r * (sin nu2)
+  let cosO = cos raan
+  let sinO = sin raan
+  let cosw = cos argp
+  let sinw = sin argp
+  let cosi = cos incl
+  let sini = sin incl
+  let xeci = xo * ((cosO * cosw) - (sinO * sinw * cosi)) - yo * ((cosO * sinw) + (sinO * cosw * cosi))
+  let yeci = xo * ((sinO * cosw) + (cosO * sinw * cosi)) - yo * ((sinO * sinw) - (cosO * cosw * cosi))
+  let zeci = xo * (sinw * sini) + yo * (cosw * sini)
+  let jd_obs = jde + t / 86400.0
+  let g = gmst_rad jd_obs d2r
+  let cg = cos g
+  let sg = sin g
+  let xe = xeci * cg + yeci * sg
+  let ye = (0.0 - xeci) * sg + yeci * cg
+  let ze = zeci
+  let rx = xe - ox
+  let ry = ye - oy
+  let rz = ze - oz
+  let slat = sin ophi
+  let clat = cos ophi
+  let slon = sin olam
+  let clon = cos olam
+  let east = (0.0 - slon) * rx + clon * ry
+  let north = (0.0 - slat) * clon * rx - slat * slon * ry + clat * rz
+  let up = clat * clon * rx + clat * slon * ry + slat * rz
+  let rng = sqrt (rx * rx + ry * ry + rz * rz)
+  let elr = asin_ (up / rng)
+  let azr = atan2 east north
+  let eldeg = elr / d2r
+  let azd = azr / d2r
+  let azpos = if azd < 0.0 then azd + 360.0 else azd
+  let _ = float_arr_set o 0 eldeg
+  let _ = float_arr_set o 1 azpos
+  let _ = float_arr_set o 2 rng
+  0
+
+-- ====================================================================
+-- PARAMETERIZED SETUP
+-- ====================================================================
+
+-- Fill the observer ECEF + geodetic + physical-constant slots of `e` from an
+-- observer geo (lat_deg, lon_deg, alt_km).  d2r/twopi/mu/re/j2/fc are arguments so a
+-- caller can vary the carrier or re-use the same constants.  Returns 0 (mutates e).
+-- WGS84 ellipsoid, identical to doppler_predict.rail main.
+set_observer e lat_deg lon_deg alt_km d2r twopi mu re j2 fc =
+  let phi = lat_deg * d2r
+  let lam = lon_deg * d2r
+  let sphi = sin phi
+  let cphi = cos phi
+  let ae = 6378.137
+  let ff = 1.0 / 298.257223563
+  let e2 = ff * (2.0 - ff)
+  let nlat = ae / (sqrt (1.0 - e2 * sphi * sphi))
+  let ox = (nlat + alt_km) * cphi * (cos lam)
+  let oy = (nlat + alt_km) * cphi * (sin lam)
+  let oz = (nlat * (1.0 - e2) + alt_km) * sphi
+  let _ = float_arr_set e 10 ox
+  let _ = float_arr_set e 11 oy
+  let _ = float_arr_set e 12 oz
+  let _ = float_arr_set e 13 phi
+  let _ = float_arr_set e 14 lam
+  let _ = float_arr_set e 15 d2r
+  let _ = float_arr_set e 21 mu
+  let _ = float_arr_set e 22 re
+  let _ = float_arr_set e 23 j2
+  let _ = float_arr_set e 24 twopi
+  let _ = float_arr_set e 25 fc
+  0
+
+-- Parse TLE line 1 + line 2 into orbital elements, derive J2 secular rates, and write
+-- the element slots e[0..9] + t0 e[17].  `e` MUST already carry constants (set_observer
+-- first) + e[20]=jd_now.  Returns 0 (mutates e).  VERBATIM math from do_sat.
+set_elements_from_tle e l1 l2 =
+  let incd = parse_float (str_sub l2 8 8)
+  let raand = parse_float (str_sub l2 17 8)
+  let ecc = parse_float (cat ["0.", str_sub l2 26 7])
+  let argpd = parse_float (str_sub l2 34 8)
+  let mad = parse_float (str_sub l2 43 8)
+  let mmd = parse_float (str_sub l2 52 11)
+  let yy = parse_int (str_sub l1 18 2)
+  let year = 2000 + yy
+  let ddf = parse_float (str_sub l1 20 12)
+  let jd_jan1 = int_to_float (367 * year - 7 * year / 4) + 1721044.5
+  let jd_epoch = jd_jan1 + (ddf - 1.0)
+  let d2r = float_arr_get e 15
+  let twopi = float_arr_get e 24
+  let mu = float_arr_get e 21
+  let re = float_arr_get e 22
+  let j2 = float_arr_get e 23
+  let jd_now = float_arr_get e 20
+  let n0 = mmd * twopi / 86400.0
+  let a = pow (mu / (n0 * n0)) (1.0 / 3.0)
+  let incl = incd * d2r
+  let p = a * (1.0 - ecc * ecc)
+  let rp = re / p
+  let factor = 1.5 * j2 * rp * rp
+  let cosi = cos incl
+  let sini = sin incl
+  let raandot = (0.0 - n0) * factor * cosi
+  let argpdot = n0 * factor * (2.0 - 2.5 * sini * sini)
+  let mdot = n0 * (1.0 + factor * (sqrt (1.0 - ecc * ecc)) * (1.0 - 1.5 * sini * sini))
+  let t0 = (jd_now - jd_epoch) * 86400.0
+  let _ = float_arr_set e 0 a
+  let _ = float_arr_set e 1 ecc
+  let _ = float_arr_set e 2 incl
+  let _ = float_arr_set e 3 (raand * d2r)
+  let _ = float_arr_set e 4 (argpd * d2r)
+  let _ = float_arr_set e 5 (mad * d2r)
+  let _ = float_arr_set e 6 raandot
+  let _ = float_arr_set e 7 argpdot
+  let _ = float_arr_set e 8 mdot
+  let _ = float_arr_set e 9 jd_epoch
+  let _ = float_arr_set e 17 t0
+  0
+
+-- jd_now from a unix timestamp (float).  Stages e[19]=now_unix, e[20]=jd_now too.
+set_now_unix e now_unix_f =
+  let jd_now = now_unix_f / 86400.0 + 2440587.5
+  let _ = float_arr_set e 19 now_unix_f
+  let _ = float_arr_set e 20 jd_now
+  jd_now
+
+-- ====================================================================
+-- THE PARAMETERIZED RANGE / DOPPLER PRIMITIVES (the load-bearing exports)
+-- ====================================================================
+
+-- Slant range (km) from the configured observer to the sat at time t (s since epoch).
+-- `o` is a caller-owned scratch float array (>= 3 slots).
+range_at e t o =
+  let _ = compute_elaz e t o
+  float_arr_get o 2
+
+-- Elevation (deg) at time t — convenience for an above-horizon gate.
+elev_at e t o =
+  let _ = compute_elaz e t o
+  float_arr_get o 0
+
+-- Doppler (Hz) at time t via a 1-second forward range difference, IDENTICAL to
+-- doppler_predict.rail dscan:  dop = (range(t) - range(t+1s)) * fc / 299792.458 km/s.
+-- A satellite approaching (range shrinking) gives positive Doppler. fc read from e[25].
+doppler_at e t o =
+  let r1 = range_at e t o
+  let r2 = range_at e (t + 1.0) o
+  let fc = float_arr_get e 25
+  (r1 - r2) * fc / 299792.458
+
+-- Doppler (Hz) at a given UNIX time (seconds) — converts to "since epoch" via t0 + dt.
+-- t0 = e[17] is (jd_now - jd_epoch)*86400 i.e. seconds-since-epoch at now_unix; so a
+-- query at unix u maps to (t0 + (u - now_unix)).  Lets Waves B/C bind a capture's
+-- absolute timestamps without the caller juggling epoch offsets.
+doppler_at_unix e unix_f o =
+  let now_unix = float_arr_get e 19
+  let t0 = float_arr_get e 17
+  let t = t0 + (unix_f - now_unix)
+  doppler_at e t o
+
+-- ====================================================================
+-- QUERY MODE: predict Doppler at arbitrary UNIX times for a staged TLE+geo
+-- ====================================================================
+--
+-- The reusable export for Waves B/C/D (binding / verifier re-run / tdoa_pred_s) AND
+-- for scripts/gen_tle_doppler.py (which needs THIS file's SGP4 Doppler curve to build a
+-- physics-true synthetic IQ). Driven entirely by /tmp staging files (the shell()-no-env
+-- discipline) so no caller juggles the epoch-offset math:
+--
+--   /tmp/dr_geo_lat.txt    observer geodetic latitude  (deg, float)
+--   /tmp/dr_geo_lon.txt    observer geodetic longitude (deg, float)
+--   /tmp/dr_geo_alt.txt    observer altitude           (km,  float)
+--   /tmp/dr_now_unix.txt   predictor "now" (unix s) — the epoch-offset anchor
+--   /tmp/dr_fc.txt         carrier frequency (Hz, float)
+--   /tmp/dr_tle_l1.txt     TLE line 1 (verbatim, columns load-bearing)
+--   /tmp/dr_tle_l2.txt     TLE line 2 (verbatim, columns load-bearing)
+--   /tmp/dr_query_unix.txt newline-separated UNIX times to evaluate
+--
+-- Emits one "DOPQ <unix> <el_deg> <range_km> <dop_hz>" line per query time (el lets a
+-- caller gate on above-horizon snapshots). If /tmp/dr_query_unix.txt is absent/empty,
+-- main runs the parity self-test instead (so a bare `rail_native run` stays a
+-- regression check).
+
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+-- walk newline-separated query unix times; for each, predict + print a DOPQ line.
+query_walk e o lines =
+  if lines == [] then 0
+  else
+    let raw = head lines
+    let u = str_replace "\n" "" raw
+    let _ = if u == "" then 0
+            else
+              let unix_f = parse_float u
+              let t0 = float_arr_get e 17
+              let now_unix = float_arr_get e 19
+              let t = t0 + (unix_f - now_unix)
+              let el = elev_at e t o
+              let rng = range_at e t o
+              let dop = doppler_at_unix e unix_f o
+              let _ = print (cat ["DOPQ ", u, " ", show_float el, " ", show_float rng, " ", show_float dop])
+              0
+    query_walk e o (tail lines)
+
+run_query o =
+  let lat = parse_float (field_or "/tmp/dr_geo_lat.txt" "0.0")
+  let lon = parse_float (field_or "/tmp/dr_geo_lon.txt" "0.0")
+  let alt = parse_float (field_or "/tmp/dr_geo_alt.txt" "0.0")
+  let fc = parse_float (field_or "/tmp/dr_fc.txt" "137100000.0")
+  let now_unix = parse_float (field_or "/tmp/dr_now_unix.txt" "0.0")
+  let l1 = str_replace "\n" "" (read_file "/tmp/dr_tle_l1.txt")
+  let l2 = str_replace "\n" "" (read_file "/tmp/dr_tle_l2.txt")
+  let pi = atan2 0.0 (0.0 - 1.0)
+  let twopi = pi * 2.0
+  let d2r = pi / 180.0
+  let mu = 398600.4418
+  let re = 6378.137
+  let j2 = 0.0010826267
+  let e = float_arr_new 26 0.0
+  let _ = set_observer e lat lon alt d2r twopi mu re j2 fc
+  let _ = set_now_unix e now_unix
+  let _ = set_elements_from_tle e l1 l2
+  let qcontent = read_file "/tmp/dr_query_unix.txt"
+  let qlines = split "\n" qcontent
+  let _ = print (cat ["# DOPQ query: lat=", show_float lat, " lon=", show_float lon, " alt_km=", show_float alt, " fc_hz=", show_float fc, " now_unix=", show_float now_unix])
+  query_walk e o qlines
+
+-- ====================================================================
+-- SELF-TEST: reproduce doppler_predict.rail's NOAA-19-from-(0,0) numbers
+-- ====================================================================
+
+-- predicted Doppler over the planning window: walk i in [0,n), gate el>5deg, print
+-- "DOPPLER <min_from_now> <el_deg> <doppler_hz>" — IDENTICAL format + math + gate as
+-- doppler_predict.rail dscan, so the two outputs match line-for-line.
+selftest_scan e o i n =
+  if i >= n then 0
+  else
+    let dt = float_arr_get e 16
+    let t0 = float_arr_get e 17
+    let t = t0 + (int_to_float i) * dt
+    let el = elev_at e t o
+    let _ = if el > 5.0 then
+              let dop = doppler_at e t o
+              let mins = (t - t0) / 60.0
+              let _ = print (cat ["DOPPLER ", show_float mins, " ", show_float el, " ", show_float dop])
+              0
+            else 0
+    selftest_scan e o (i + 1) n
+
+is_target name =
+  if str_contains "NOAA 19" name then 1 else 0
+
+selftest_process lines e o n =
+  if lines == [] then 0
+  else
+    let name = head lines
+    let r1 = tail lines
+    if r1 == [] then 0
+    else
+      let l1 = head r1
+      let r2 = tail r1
+      if r2 == [] then 0
+      else
+        let l2 = head r2
+        let r3 = tail r2
+        let _ = if is_target name > 0 then
+                  let _ = set_elements_from_tle e l1 l2
+                  selftest_scan e o 0 n
+                else 0
+        selftest_process r3 e o n
+
+main =
+  let o = float_arr_new 3 0.0
+  -- DISPATCH: if a query list is staged, run query mode (Waves B/C/D + gen_tle_doppler.py);
+  -- otherwise run the parity self-test (a bare `run` stays a regression check).
+  let qprobe = str_replace "\n" "" (read_file "/tmp/dr_query_unix.txt")
+  if qprobe == "" then
+    let pi = atan2 0.0 (0.0 - 1.0)
+    let twopi = pi * 2.0
+    let d2r = pi / 180.0
+    let mu = 398600.4418
+    let re = 6378.137
+    let j2 = 0.0010826267
+    let fc = 137100000.0
+    let dt = 30.0
+    let n = 2880
+    let e = float_arr_new 26 0.0
+    -- observer (0,0,0.18km) — same planning default as doppler_predict.rail main
+    let _ = set_observer e 0.0 (0.0 - 0.0) 0.18 d2r twopi mu re j2 fc
+    let _ = float_arr_set e 16 dt
+    let _ = float_arr_set e 18 10.0
+    let now_unix = parse_int (read_file "data/now_unix.txt")
+    let _ = set_now_unix e (int_to_float now_unix)
+    let content = read_file "data/tle_weather.txt"
+    let lines = split "\n" content
+    let _ = print "# parity self-test: NOAA-19 Doppler (137.1 MHz) over (0,0) — must match doppler_predict.rail"
+    let _ = selftest_process lines e o n
+    0
+  else
+    let _ = run_query o
+    0

@@ -130,6 +130,67 @@ carries `derived_from`): `VESSEL_INFERENCE_RECEIPT`, `RS41_INFERENCE_RECEIPT`, a
 > geodetic transform / ETA / track / sat-id = **INFERENCE** in a separate ledger, bound
 > to the FACT it rests on by `derived_from`.
 
+### A.6 Custody fields (Wave A, rung 3)
+
+Two new signed pipe fields appear in **EVERY FACT receipt**, inserted **between** `n=<count>`
+(and **after** the per-kind honesty bit when one is present) and `product_sha256=`:
+
+```
+...|n=<c>|[<honesty_bit>|]code_sha256=<64hex|PENDING_no_code_hash>|input_sha256=<64hex|PENDING_no_input_hash>|product_sha256=<64hex>|prev=<prev_chain_hash>|signer=<pk_hex>
+```
+
+- `code_sha256` = `shasum -a 256` of the signer's `.rail` **SOURCE** — it binds the source,
+  **NOT** the compiled bytes. (Reproducible-build follow-up: a future rung must bind the
+  compiled binary's hash to the source hash so "attested code" means attested *bytes*, not
+  just attested text. Named here as the explicit follow-up.)
+- `input_sha256` = `shasum -a 256` of the raw source bytes (the input the product is the
+  deterministic function of).
+- **Honest defaults** are `PENDING_no_code_hash` / `PENDING_no_input_hash` — **never `0`,
+  never fabricated.** Both are 64-hex strings when present.
+- **INFERENCE receipts inherit custody transitively** via `derived_from` (the parent FACT
+  carries the custody fields; the INFERENCE binds to that parent's `chain_hash`).
+- **No version bump** — `v=2` stays. `v=2` now has **two FACT shapes** (with and without
+  custody fields), both backward-walkable because `verify.rail`'s `pipe_field` is
+  position-agnostic (it scans for the `<key>=` token, not a fixed offset).
+
+### A.7 `PHYSICS_BINDING_RECEIPT` (Wave B emits / Wave C re-runs)
+
+One merged, load-bearing field list (`type=INFERENCE`):
+
+```
+PHYSICS_BINDING_RECEIPT|v=2|type=INFERENCE|node=<id>|station=<sta>|band=Doppler-binding-137.1MHz|geo=<geo>|pulse_id=<pid>|pulse_hex=<vh16>|batch_start=<unix>|batch_end=<unix>|n=<windows>|derived_from=<fact_chain_hash>|physics_ok=<0|1>|estimator=<centroid|peak>|residual_hz=<int>|tol_hz=<int>|repro_tol_hz=<int>|sat=<NOAA-19>|fc_hz=<int>|orbit=<norad@epoch>|tle_sha256=<64hex>|meas_sha256=<64hex>|t_shift_s=<float>|const_off_hz=<float>|claimed_geo=<lat_lon|..._SYNTH>|note=binding_mechanism_validated_location_unattested|product_sha256=<64hex>|prev=<prev_chain_hash>|signer=<pk_hex>
+```
+
+- `derived_from` is the **first post-`n` field** (matches the A.2 INFERENCE walk).
+- The tolerance key is **`tol_hz`** (NOT `tolerance_hz`). `repro_tol_hz` is a **distinct** key:
+  the verifier's reproduction band (the slack allowed when Wave C recomputes the residual).
+- `residual_hz` / `tol_hz` / `repro_tol_hz` are **INTEGER Hz**.
+- `t_shift_s` + `const_off_hz` are **MANDATORY**: the emitter **COMMITS** the chosen Doppler
+  alignment so the verifier does a **SINGLE-point residual recompute**, not a 240-step
+  re-search. (Without the committed alignment the verifier would have to re-search the whole
+  curve; committing it makes Wave C cheap and deterministic.)
+- `geo` stays the literal `PENDING_needs_GPS_PPS`. `claimed_geo` carries the `_SYNTH` suffix
+  when the observer is the placeholder (synthetic) location. **Numeric `geo_lat` / `geo_lon`
+  are staged in `/tmp` ONLY, never committed.**
+- `physics_ok=1` means "**consistent within `tol_hz`**", **NEVER "verified true."**
+- Register `PHYSICS_BINDING_RECEIPT` in the A.5 INFERENCE kind set.
+
+### A.8 `MESH_WITNESS_RECEIPT` (Wave D)
+
+```
+MESH_WITNESS_RECEIPT|v=2|type=INFERENCE|node=<aggregator>|station=<sta>|band=<emission_band>|geo=<aggregator_geo>|pulse_id=|pulse_hex=|batch_start=|batch_end=|n=2|mesh_peer=<REAL|SIMULATED>|clock_disc=<PPS|SAMPLE_SYNC_ASSUMED>|nodeA=<id>|geoA=<PENDING_needs_GPS_PPS>|nodeB=<id>|geoB=<SIMULATED_PENDING_needs_GPS_PPS>|emission_product_sha256=<64hex>|tdoa_s=<float|PENDING>|tdoa_pred_s=<float|PENDING>|tdoa_resid_s=<float|PENDING>|tdoa_tol_s=<float>|baseline_km=<float|PENDING>|mesh_ok=<0|1>|sigA=<128hex>|sigB=<128hex>|signerA=<64hex>|signerB=<64hex>|derived_from=<factA_chain_hash>;<factB_chain_hash>|product_sha256=<64hex>|prev=<prev_chain_hash>|signer=<aggregator_pk_hex>
+```
+
+- `derived_from` is a **`;`-joined TWO-parent value**. `verify.rail` is extended to
+  `str_split ";"` the `derived_from` value and resolve **EACH** parent against the
+  corresponding FACT ledger, **failing loud if either is unresolvable** (same "unresolved
+  inference parent" rejection as A.2, applied per parent).
+- `mesh_peer` + `clock_disc` are **NEVER-droppable honesty bits**. A `SIMULATED` /
+  `SAMPLE_SYNC_ASSUMED` `mesh_ok=1` is a **MECHANISM verdict** — it asserts the TDOA is
+  geometrically self-consistent, **NEVER "correspondence" / "witnessed."** Real
+  correspondence needs `mesh_peer=REAL` + `clock_disc=PPS` (Wave F).
+- Register `MESH_WITNESS_RECEIPT` in the A.5 INFERENCE kind set.
+
 ---
 
 ## (B) THE JSON LEDGER LINE — shape, space-after-colon rule, chain_hash, filenames
@@ -189,6 +250,22 @@ data/orbcomm_por_receipt.json
 
 The fact ledgers stay pure decoded truth; inference ledgers carry derived products. The
 two families never mix in the same file.
+
+**Wave B/C/D ledger families** (each follows the same chained-jsonl + legacy-single-object
+pattern as B.5/B.7):
+
+- **Physics-binding** (Wave B/C, INFERENCE):
+  - `data/physics_binding_receipts.jsonl` — chained v=2 ledger
+  - `data/binding_receipt.json` — legacy single-object
+  - `data/chain/binding_prev.txt` — `prev` staging (last `chain_hash`)
+- **Mesh-witness** (Wave D, INFERENCE):
+  - `data/mesh_witness_receipts.jsonl` — chained v=2 ledger
+  - `data/mesh_witness_receipt.json` — legacy single-object
+  - `data/chain/mesh_witness_prev.txt` — `prev` staging
+- **IQ-capture** (Wave B0, NEW v=2 FACT capture stream):
+  - `data/iq_capture_receipts.jsonl` — chained v=2 ledger
+  - `data/iq_capture_receipt.json` — legacy single-object
+  - `data/iq_capture_fact_chain.txt` — fact-chain `prev` staging
 
 ### B.7 Legacy single-object backward-compat
 
@@ -317,6 +394,21 @@ production attestation authorities — production authority keys are a separate 
 > seed in the existing source; that is preserved for backward compat (the `model=` /
 > `band=` / KIND fields disambiguate the receipts).
 
+**Wave A/B/C/D DEV seeds (register both — all clearly-labeled DEV seeds, NOT production
+authorities):**
+
+| Stream / signer | DEV seed (64-hex) |
+|---|---|
+| PHYSICS_BINDING (`binding_attest.rail`) | `b14d14b14d14b14d14b14d14b14d14b14d14b14d14b14d14b14d14b14d140000` |
+| MESH aggregator (`mesh_witness_attest.rail`) | `e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e540000` |
+| IQ_CAPTURE (`iq_capture_attest.rail`) | `c0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0de0000` |
+
+> The IQ_CAPTURE seed is a distinct, clearly-labeled DEV seed (`c0de…0000`) — not shared
+> with any other stream. **`nodeA` / `nodeB` simulation** in the Wave D mesh validator
+> **reuses `coattest`'s seeds for validation only** (the two-node cross-witness needs two
+> distinct signers; coattest already owns a stable pair), never for any committed
+> production receipt.
+
 ### E.4 Future multi-node co-sign
 
 The `v=2` receipt carries `node=` precisely so a future multi-node fleet can co-sign a
@@ -379,6 +471,22 @@ let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/<stream>_r
 - `split` is **single-char only** → use `str_split` for multi-char delimiters. Newline-split
   (char 10) is the one legal single-char `split` use (e.g. walking a ledger file).
 - `filter` with a lambda can **segfault** → use a **named predicate** function.
+
+### F.5 `/tmp` staging namespace — keep the new waves OFF the live doppler pipeline
+
+The Wave B/C/D roll-ups stage their working files under **distinct `/tmp` prefixes** so they
+never collide with the live decode pipeline's staging files:
+
+- **Wave B (binding rollup):** `/tmp/binding_*` — explicitly **NOT** `/tmp/dop_real.iq` or
+  `/tmp/dop_meas_real.out`, which belong to the **live doppler pipeline** and must not be
+  read, written, or clobbered.
+- **Wave C (verifier):** `/tmp/lg_verify_*`.
+- **Wave D (mesh):** `/tmp/mesh_*`.
+
+> Numeric `geo_lat` / `geo_lon` (A.7) are staged in `/tmp` ONLY and never committed —
+> consistent with the `geo=PENDING_needs_GPS_PPS` policy (D.2): a synthetic numeric location
+> may exist transiently in `/tmp` for the binding *mechanism*, but no precise coordinate is
+> ever written to a committed ledger line.
 
 ---
 

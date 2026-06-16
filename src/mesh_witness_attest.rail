@@ -1,0 +1,254 @@
+-- ledaticground WAVE D (rung 5 mechanism): MESH co-attestation (pure Rail) -- RECEIPT_CONTRACT v=2 sec A.8.
+-- Emits ONE MESH_WITNESS_RECEIPT binding two nodes that (claim to have) witnessed the SAME
+-- emission. Each node co-signs its OWN FACT receipt string (the inner sigA / sigB, produced with
+-- coattest.rail's REAL co-sign primitive); the aggregator then signs the WHOLE witness string with
+-- the MESH DEV seed (the outer signature, signer=<aggregator_pk_hex>).
+--
+-- THE HONESTY CEILING (CORRESPONDENCE_ROADMAP Wave D): this is a MECHANISM verdict, NEVER a
+-- correspondence claim. mesh_peer=SIMULATED + clock_disc=SAMPLE_SYNC_ASSUMED are NEVER-droppable
+-- honesty bits. mesh_ok=1 asserts ONLY that the two signatures verify AND the measured TDOA is
+-- geometrically self-consistent within tdoa_tol_s -- it does NOT assert "witnessed" / "true".
+-- Real correspondence needs mesh_peer=REAL + clock_disc=PPS (Wave F: a 2nd physical GPS-PPS node).
+-- geoA stays PENDING_needs_GPS_PPS (this node, location unattested); geoB carries the explicit
+-- SIMULATED_PENDING_needs_GPS_PPS marker (the 2nd node is faked). NEVER fabricate coords.
+--
+-- mesh_ok composition is NESTED if/then/else -- Rail has NO &&/|| short-circuit (both sides always
+-- evaluate). mesh_ok = (sigA valid) AND (sigB valid) AND (tdoa_resid_s <= tdoa_tol_s).
+--
+-- THE TWO-PARENT WALL (sec A.8 / A.2 extended): derived_from = factA_chain_hash;factB_chain_hash --
+-- a ";"-joined TWO-parent value. verify.rail str_splits ";" and resolves EACH parent against the
+-- named FACT ledgers, failing loud if EITHER is unresolvable (and re-verifies the inner sigA/sigB
+-- against the resolved FACT receipt strings). If EITHER fact chain_hash is missing here we ABORT
+-- before signing (fail-loud at the attestation boundary, paos-deep-audit rule).
+--
+-- SEPARATE INFERENCE LEDGER FAMILY (sec B.6): appends data/mesh_witness_receipts.jsonl (chained v=2),
+-- writes legacy single-object data/mesh_witness_receipt.json, advances data/chain/mesh_witness_prev.txt.
+-- Pulse: A MESH_WITNESS_RECEIPT carries pulse_id= / pulse_hex= EMPTY per the A.8 wire shape (the
+-- two FACT parents already carry their own pulse anchors; the witness binds those chain_hashes).
+--
+-- Run via the flock-serialized wrapper:  bash scripts/railrun.sh <abs>/src/mesh_witness_attest.rail
+-- The two-node FACT pair + true TDOA are staged by scripts/gen_mesh_witness.py + the rollup driver.
+
+import "stdlib/sha256.rail"
+import "stdlib/sha512.rail"
+import "stdlib/x25519.rail"
+import "stdlib/ed25519.rail"
+import "stdlib/ed25519_scalar.rail"
+import "stdlib/ed25519_sign.rail"
+import "stdlib/file.rail"
+
+-- field_or: read a staging/identity file, strip trailing newline; honest default if absent/empty.
+-- Same idiom every ledaticground signer uses (ais_attest.rail line 34 / vessel_inference_attest.rail).
+field_or path def =
+  let v = str_replace "\n" "" (read_file path)
+  if v == "" then def else v
+
+-- co-sign a string with a seed -> hex sig (coattest.rail's REAL sign_receipt primitive, inlined so
+-- this signer does not depend on coattest's main; the crypto is byte-identical).
+cosign seed r =
+  let msg = string_to_bytes r
+  let mlen = string_length_bytes r
+  bytes_to_hex (ed25519_sign seed msg mlen) 64
+
+-- verify a string against a pubkey + hex sig -> 1/0 (coattest.rail's verify_receipt primitive).
+coverify pk r sighex =
+  let msg = string_to_bytes r
+  let mlen = string_length_bytes r
+  let sig = hex_to_bytes sighex
+  ed25519_verify pk msg mlen sig
+
+-- chain_hash of a FACT receipt string + its hex sig (RECEIPT_CONTRACT B.3 -- the canonical formula,
+-- byte-identical to every existing signer and to what verify.rail re-derives).
+chain_of receipt sighex = sha256_hex (cat [receipt, "|sig=", sighex])
+
+-- |a - b|  (float abs via if/then -- the bundle.rail `within` idiom; no fabs dependency).
+fdiff a b = if a > b then a - b else b - a
+
+main =
+  -- ===== KEYS =====
+  -- The two SIMULATED node signers reuse coattest.rail's stable DEV pair (RECEIPT_CONTRACT sec E.3:
+  -- "nodeA/nodeB simulation reuses coattest's seeds for validation only" -- two distinct signers, a
+  -- co-witness needs two keys; coattest already owns a stable pair). Clearly labeled DEV seeds, NOT
+  -- production authorities.
+  let seedA = hex_to_bytes "a11ce0000000000000000000000000000000000000000000000000000000ab01"
+  let seedB = hex_to_bytes "b0b1e0000000000000000000000000000000000000000000000000000000cd02"
+  let pkA = ed25519_pk_from_sk seedA
+  let pkB = ed25519_pk_from_sk seedB
+  let signerA = bytes_to_hex pkA 32
+  let signerB = bytes_to_hex pkB 32
+
+  -- The MESH AGGREGATOR DEV seed -- distinct, clearly labeled (sec E.3 Wave-D row e54e...0000). The
+  -- aggregator signs the WHOLE witness string (the OUTER signature). NOT a production authority.
+  let seedAgg = hex_to_bytes "e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e54e540000"
+  let pkAgg = ed25519_pk_from_sk seedAgg
+  let signerAgg = bytes_to_hex pkAgg 32
+
+  -- ===== THE TWO FACT-NODE RECEIPT STRINGS (the parents) =====
+  -- Each node's FACT receipt STRING is staged by the harness; its chain_hash (sha256 over
+  -- receipt|sig=...) is the parent the witness derives from. We read the receipt STRINGS so the
+  -- inner co-signatures are over the EXACT bytes a verifier will re-derive from the FACT ledgers.
+  -- Honest placeholder -> abort below if absent.
+  let factA = field_or "/tmp/mesh_factA_receipt.txt" "PENDING_no_factA"
+  let factB = field_or "/tmp/mesh_factB_receipt.txt" "PENDING_no_factB"
+
+  -- inner co-signatures: each node co-signs its OWN FACT receipt string (coattest semantics).
+  -- FORGERY-TEST HOOK (clearly labeled, OFF unless /tmp/mesh_forge_sigB.txt == "1"): models the
+  -- "A signs as B" attack from coattest.rail -- a rogue aggregator who does NOT hold node B's key
+  -- fabricates sigB by co-signing factB with the WRONG seed (seedA). The receipt still CLAIMS
+  -- signerB=<B's pubkey>, the OUTER aggregator signature stays valid, and both parents still
+  -- resolve -- but the inner co-signature sigB will NOT verify against factB under signerB, so the
+  -- verifier's inner_sig_ok re-check REJECTS. This is the whole point of re-verifying the inner sigs.
+  let forge_sigB = field_or "/tmp/mesh_forge_sigB.txt" "0"
+  let sigA = cosign seedA factA
+  let sigB =
+    if forge_sigB == "1" then cosign seedA factB   -- FORGED: wrong key (rogue aggregator, no B key)
+    else cosign seedB factB                         -- honest: B's own key
+
+  -- the two parent chain_hashes. PREFER the harness-staged values (these MUST equal the FACT
+  -- ledger lines' chain_hashes so verify.rail resolves them); fall back to recomputing from the
+  -- receipt string + our just-produced inner sig (identical when the harness used the same seeds).
+  let chainA_staged = field_or "/tmp/mesh_factA_chain.txt" ""
+  let chainB_staged = field_or "/tmp/mesh_factB_chain.txt" ""
+  let chainA = if chainA_staged == "" then chain_of factA sigA else chainA_staged
+  let chainB = if chainB_staged == "" then chain_of factB sigB else chainB_staged
+
+  -- ===== FAIL-LOUD GUARD: never sign a witness with a missing fact parent =====
+  let haveA = if factA == "PENDING_no_factA" then 0 else 1
+  let haveB = if factB == "PENDING_no_factB" then 0 else 1
+  let have_parents = if haveA == 1 then haveB else 0
+  if have_parents == 0 then
+    let _ = print "FATAL  missing FACT parent(s): mesh witness needs BOTH factA + factB receipt strings."
+    let _ = print (cat ["FATAL  haveA=", show haveA, " haveB=", show haveB, " -- refusing to sign (two-parent wall)."])
+    1
+  else
+    -- ===== TDOA CONSISTENCY (the geometric check) =====
+    -- tdoa_s     = MEASURED time-difference-of-arrival (seconds) -- recovered by xcorr (tdoa.rail's
+    --              scan_lag). SAMPLE_SYNC_ASSUMED: a real mesh needs GPS-PPS clock discipline; here
+    --              the two recordings are assumed sample-synchronous (honest, never-droppable bit).
+    -- tdoa_pred_s= the geometry-PREDICTED TDOA (baseline + orbit) the harness commits.
+    -- tdoa_resid_s = |measured - predicted|. tdoa_tol_s = the consistency band.
+    -- Numeric values are staged as strings (Rail shell() has no env; file-based config) and parsed
+    -- with parse_float. mesh_ok requires resid <= tol (geometric self-consistency).
+    let tdoa_s_str = field_or "/tmp/mesh_tdoa_s.txt" "PENDING"
+    let tdoa_pred_s_str = field_or "/tmp/mesh_tdoa_pred_s.txt" "PENDING"
+    let tdoa_tol_s_str = field_or "/tmp/mesh_tdoa_tol_s.txt" "0.00005"
+    let baseline_km_str = field_or "/tmp/mesh_baseline_km.txt" "PENDING"
+    let tdoa_s = parse_float tdoa_s_str
+    let tdoa_pred_s = parse_float tdoa_pred_s_str
+    let tdoa_tol_s = parse_float tdoa_tol_s_str
+    let resid = fdiff tdoa_s tdoa_pred_s
+    let resid_str = show_float resid
+    let tdoa_within = if resid <= tdoa_tol_s then 1 else 0
+
+    -- inner-signature verification (each node's co-signature over its OWN fact string).
+    let vA = coverify pkA factA sigA
+    let vB = coverify pkB factB sigB
+
+    -- ===== mesh_ok composition -- NESTED if/then/else (NO &&/|| short-circuit) =====
+    -- mesh_ok = sigA valid AND sigB valid AND tdoa_resid_s <= tdoa_tol_s.
+    let mesh_ok_honest =
+      if vA == 1 then
+        (if vB == 1 then
+          (if tdoa_within == 1 then 1 else 0)
+         else 0)
+      else 0
+    -- FORGERY-TEST: a lying aggregator writes mesh_ok=1 even though sigB is forged (vB=0). The cold
+    -- verifier's INDEPENDENT inner-sig re-check is what catches the lie -- not this self-reported bit.
+    -- (Off unless the forge flag is set; honest runs use the real composed verdict.)
+    let mesh_ok = if forge_sigB == "1" then 1 else mesh_ok_honest
+
+    -- ===== HONESTY BITS (NEVER dropped, per A.8) =====
+    let mesh_peer = "SIMULATED"
+    let clock_disc = "SAMPLE_SYNC_ASSUMED"
+    let geoA = "PENDING_needs_GPS_PPS"
+    let geoB = "SIMULATED_PENDING_needs_GPS_PPS"
+
+    -- node / station identity is file-driven (sanitized: region only). aggregator geo stays PENDING.
+    let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
+    let nodeAgg = sta
+    let nodeA = field_or "/tmp/mesh_nodeA_id.txt" "regional_MI"
+    let nodeB = field_or "/tmp/mesh_nodeB_id.txt" "SIMULATED_peer"
+    let band = field_or "/tmp/mesh_band.txt" "AIS-161.975MHz"
+    let geoAgg = field_or "/Users/ledaticempire/projects/ledaticground/data/station_geo.txt" "PENDING_needs_GPS_PPS"
+
+    -- emission product the two nodes (claim to have) jointly observed. Commits to the shared product
+    -- digest (NOT raw frames embedded in the line) -- consistent with A.4. Honest placeholder.
+    let emission_product = field_or "/tmp/mesh_emission_product.txt" "PENDING_no_emission_product"
+    let emission_sha = sha256_hex emission_product
+
+    -- two-parent derived_from: ";"-joined. verify.rail str_splits ";" and resolves EACH half.
+    let derived_from = cat [chainA, ";", chainB]
+
+    -- beacon anchor: A.8's witness wire shape carries pulse_id= / pulse_hex= EMPTY (the FACT parents
+    -- own their pulse anchors). Emit the empty fields verbatim to match the load-bearing field order.
+    let pulse_id = ""
+    let pulse_hex = ""
+
+    -- real hash-chain: prev= is the prior mesh-witness chain_hash (advances across runs via
+    -- data/chain/mesh_witness_prev.txt), or GENESIS for line 1.
+    let prev = field_or "/Users/ledaticempire/projects/ledaticground/data/chain/mesh_witness_prev.txt" "GENESIS"
+
+    -- product_sha256 of the witness commits to the joined two inner co-signatures + the emission
+    -- digest + the TDOA tuple (the deterministic witness product). NOT raw frames.
+    let witness_product = join "|" [cat ["sigA=", sigA], cat ["sigB=", sigB], cat ["emission=", emission_sha], cat ["tdoa_s=", tdoa_s_str], cat ["tdoa_pred_s=", tdoa_pred_s_str]]
+    let product_hash = sha256_hex witness_product
+
+    -- batch bounds: n=2 (two co-witnessing nodes). bounds are provenance, NOT the attestation clock.
+    let batch_start = field_or "/tmp/mesh_batch_start.txt" "PENDING"
+    let batch_end = field_or "/tmp/mesh_batch_end.txt" "PENDING"
+
+    -- ===== THE v=2 MESH_WITNESS_RECEIPT -- field order is LOAD-BEARING (sec A.8 verbatim) =====
+    -- The OUTER Ed25519 signature (aggregator) is computed over this EXACT pipe string.
+    let receipt = join "|" ["MESH_WITNESS_RECEIPT", "v=2", "type=INFERENCE", cat ["node=", nodeAgg], cat ["station=", sta], cat ["band=", band], cat ["geo=", geoAgg], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], "n=2", cat ["mesh_peer=", mesh_peer], cat ["clock_disc=", clock_disc], cat ["nodeA=", nodeA], cat ["geoA=", geoA], cat ["nodeB=", nodeB], cat ["geoB=", geoB], cat ["emission_product_sha256=", emission_sha], cat ["tdoa_s=", tdoa_s_str], cat ["tdoa_pred_s=", tdoa_pred_s_str], cat ["tdoa_resid_s=", resid_str], cat ["tdoa_tol_s=", tdoa_tol_s_str], cat ["baseline_km=", baseline_km_str], cat ["mesh_ok=", show mesh_ok], cat ["sigA=", sigA], cat ["sigB=", sigB], cat ["signerA=", signerA], cat ["signerB=", signerB], cat ["derived_from=", derived_from], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", signerAgg]]
+    let msg = string_to_bytes receipt
+    let mlen = string_length_bytes receipt
+    let sig = ed25519_sign seedAgg msg mlen
+    let sig_hex = bytes_to_hex sig 64
+
+    let verify_ok = ed25519_verify pkAgg msg mlen sig
+    let tstr = cat [receipt, "X"]
+    let tmsg = string_to_bytes tstr
+    let tlen = string_length_bytes tstr
+    let tamper_ok = ed25519_verify pkAgg tmsg tlen sig
+    let chain_hash = sha256_hex (cat [receipt, "|sig=", sig_hex])
+
+    let _ = print (cat ["INNER    sigA verify = ", show vA, "  sigB verify = ", show vB, "  (want 1 1)"])
+    let _ = print (cat ["TDOA     measured=", tdoa_s_str, " predicted=", tdoa_pred_s_str, " resid=", resid_str, " tol=", tdoa_tol_s_str, " within=", show tdoa_within])
+    let _ = print (cat ["MESH_OK  ", show mesh_ok, "  (1 only if both inner sigs verify AND TDOA within tol)"])
+    let _ = print (cat ["HONESTY  mesh_peer=", mesh_peer, " clock_disc=", clock_disc, " geoA=", geoA, " geoB=", geoB])
+    let _ = print (cat ["DERIVED  derived_from=", derived_from])
+    let _ = print (cat ["RECEIPT  ", receipt])
+    let _ = print (cat ["SIG      ", sig_hex])
+    let _ = print (cat ["CHAIN    ", chain_hash])
+    let _ = print (cat ["VERIFY   own-sig accepted = ", show verify_ok, " (want 1)"])
+    let _ = print (cat ["TAMPER   modified-msg accepted = ", show tamper_ok, " (want 0)"])
+
+    -- v=2 chained JSONL line into the SEPARATE inference ledger family (sec B.6 -- never mixed with
+    -- FACT ledgers). SPACE-AFTER-COLON on every string field verify.rail reads is LOAD-BEARING.
+    -- Append via append_line (NEVER append_file -- not a runtime symbol).
+    let jline = cat ["{\"v\":2,\"type\":\"INFERENCE\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", signerAgg, "\",\"chain_hash\": \"", chain_hash, "\"}"]
+    let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/mesh_witness_receipts.jsonl" jline
+    let _ = print "APPENDED data/mesh_witness_receipts.jsonl (v=2 INFERENCE, separate family)"
+
+    -- legacy single-object data/mesh_witness_receipt.json (latest) for verify.rail backward compat.
+    let jrec = join "\n" ["{", "  \"type\": \"INFERENCE\",", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"derived_from\": \"", derived_from, "\","], cat ["  \"mesh_ok\": \"", show mesh_ok, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", signerAgg, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
+    let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/mesh_witness_receipt.json" jrec
+    let _ = print "WROTE data/mesh_witness_receipt.json"
+
+    -- advance the chain: this receipt's chain_hash becomes the next run's prev=.
+    let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/chain/mesh_witness_prev.txt" chain_hash
+    let _ = print "WROTE data/chain/mesh_witness_prev.txt (chain advanced)"
+
+    -- STAGE-OUT the inner co-signatures + the two parent chain_hashes so the rollup driver can
+    -- assemble BYTE-IDENTICAL FACT ledger lines (data/mesh_factA_receipts.jsonl /
+    -- data/mesh_factB_receipts.jsonl) that verify.rail resolves the two parents against and
+    -- re-verifies the inner sigs over. Ed25519 is deterministic: these sigs are reproducible from
+    -- (seed, factA/factB string) so the FACT-ledger sig the rollup writes matches what verify re-derives.
+    let _ = write_file "/tmp/mesh_out_sigA.txt" sigA
+    let _ = write_file "/tmp/mesh_out_sigB.txt" sigB
+    let _ = write_file "/tmp/mesh_out_signerA.txt" signerA
+    let _ = write_file "/tmp/mesh_out_signerB.txt" signerB
+    let _ = write_file "/tmp/mesh_out_chainA.txt" chainA
+    let _ = write_file "/tmp/mesh_out_chainB.txt" chainB
+    let _ = print "WROTE /tmp/mesh_out_{sigA,sigB,signerA,signerB,chainA,chainB}.txt (FACT-ledger staging)"
+    0

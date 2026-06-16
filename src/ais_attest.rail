@@ -7,7 +7,8 @@
 -- v=2 changes from v=1 (per docs/RECEIPT_CONTRACT.md sections A/B/C/D):
 --   * receipt string: AIS_RECEIPT|v=2|type=FACT|node=..|station=..|band=..|geo=..|
 --     pulse_id=..|pulse_hex=..|batch_start=..|batch_end=..|n=..|
---     product_sha256=..|prev=..|signer=..   (field order is LOAD-BEARING; AIS has no honesty bit)
+--     code_sha256=..|input_sha256=..|product_sha256=..|prev=..|signer=..
+--     (field order is LOAD-BEARING; AIS has no honesty bit; code/input = A.6 custody, rung 3)
 --   * real hash-chaining: prev= read from /tmp/ais_prev_sha.txt (the tail chain_hash, or GENESIS).
 --   * beacon anchor: pulse_id/pulse_hex read from the unified /tmp/lg_pulse_id.txt + /tmp/lg_pulse_hex.txt
 --     staged by scripts/fetch_beacon_pulse.sh. On fetch failure -> PENDING_beacon_unreachable (still signed+chained).
@@ -60,6 +61,14 @@ main =
   let batch_end = field_or "/tmp/ais_batch_end.txt" "PENDING"
   let nstr = field_or "/tmp/ais_batch_n.txt" "0"
 
+  -- A.6 custody (rung 3): commit to the attested CODE (this signer's .rail SOURCE) + the raw
+  -- INPUT bytes this batch decoded from, staged as hex by the roll-up driver. Honest PENDING
+  -- defaults (never 0, never fabricated). Binds WHICH bytes produced the product, not that the
+  -- bytes are off-air-real -- provenance, not correspondence. code_sha256 binds SOURCE text, not
+  -- the compiled binary (reproducible-build is a future rung).
+  let code_sha = field_or "/tmp/ais_code_sha256.txt" "PENDING_no_code_hash"
+  let input_sha = field_or "/tmp/ais_input_sha256.txt" "PENDING_no_input_hash"
+
   -- node identity is file-driven (sanitized: region only, no street address). Precise lat/lon
   -- is PENDING until GPS-PPS -- receiver geolocation is not asserted, only node identity + band.
   let sta = field_or "/Users/ledaticempire/projects/ledaticground/data/station_name.txt" "ledaticground-roof"
@@ -68,7 +77,7 @@ main =
 
   -- v=2 receipt string -- field order LOAD-BEARING (sig is over this exact string).
   -- AIS_RECEIPT carries NO per-batch honesty bit (contract A.3: AIS slot omitted).
-  let receipt = join "|" ["AIS_RECEIPT", "v=2", "type=FACT", cat ["node=", sta], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let receipt = join "|" ["AIS_RECEIPT", "v=2", "type=FACT", cat ["node=", sta], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["code_sha256=", code_sha], cat ["input_sha256=", input_sha], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
   let msg = string_to_bytes receipt
   let mlen = string_length_bytes receipt
   let sig = ed25519_sign seed msg mlen

@@ -137,18 +137,118 @@ build_fact_blob paths =
 resolve_derived_from fact_blob h =
   if str_contains (chain_marker h) fact_blob then 1 else 0
 
+-- ===== WAVE D: two-parent derived_from + inner co-signature re-verification =====
+-- A MESH_WITNESS_RECEIPT (sec A.8) carries derived_from = <factA_chain_hash>;<factB_chain_hash>
+-- (a ";"-joined TWO-parent value) and the inner co-signatures sigA/sigB + signerA/signerB. The
+-- verifier MUST: (1) str_split ";" and resolve EACH parent against the FACT ledgers (fail loud if
+-- EITHER is unresolvable), and (2) re-verify each inner co-signature over the resolved FACT receipt
+-- STRING under its stated signer. Single-parent derived_from (no ";") falls through unchanged.
+
+-- A FACT-line lookup blob keyed by chain_hash. Each FACT line is wrapped as:
+--   <<<LINE[<chain_hash>] <json_line> >>>END\n
+-- so fact_line_for can find the marker [<chain_hash>] and extract the FULL json line that follows
+-- (up to the >>>END sentinel). Distinct from build_fact_blob (markers-only, existence checks) so
+-- the single-parent path stays byte-identical. Newline-free sentinels avoid split collisions.
+fact_open = "<<<LINE"
+fact_close = ">>>END"
+
+ledger_lines_for lines =
+  if lines == [] then ""
+  else
+    let ln = head lines
+    let rest = ledger_lines_for (tail lines)
+    if is_ledger_line ln then
+      let ch = field_val ln "chain_hash"
+      cat [fact_open, chain_marker ch, " ", ln, " ", fact_close, "\n", rest]
+    else rest
+
+build_fact_lines_blob paths =
+  if paths == [] then ""
+  else
+    let p = head paths
+    let rest_blob = build_fact_lines_blob (tail paths)
+    if p == "" then rest_blob
+    else
+      let content = read_file p
+      let lines = split "\n" content
+      cat [ledger_lines_for lines, rest_blob]
+
+-- find the FACT json line whose chain_hash == h (or "" if absent). Locates the marker
+-- fact_open ++ [<h>] ++ " ", then returns everything up to the next " >>>END".
+fact_line_for lines_blob h =
+  let pat = cat [fact_open, chain_marker h, " "]
+  let i = str_find pat lines_blob
+  if i < 0 then ""
+  else
+    let start = i + (string_length_bytes pat)
+    let rest = str_sub lines_blob start (string_length_bytes lines_blob - start)
+    let e = str_find (cat [" ", fact_close]) rest
+    if e < 0 then "" else str_sub rest 0 e
+
+-- re-verify an inner co-signature over the FACT receipt STRING that a parent chain_hash resolves to.
+--   lines_blob = the FACT-line lookup blob
+--   parent_h   = the parent chain_hash (factA or factB)
+--   sighex     = the inner sig (sigA or sigB) carried in the MESH receipt
+--   signerhex  = the inner signer pubkey (signerA or signerB)
+-- returns 1 if the parent resolves AND the inner sig verifies over its FACT receipt string, else 0.
+inner_sig_ok lines_blob parent_h sighex signerhex =
+  let factline = fact_line_for lines_blob parent_h
+  if factline == "" then 0
+  else
+    let fact_receipt = field_val factline "receipt"
+    if fact_receipt == "" then 0
+    else check_sig fact_receipt sighex signerhex
+
+-- resolve a (possibly two-parent) derived_from value. existence-only (per parent), 1/0.
+-- single-parent (no ";") -> identical to resolve_derived_from. two-parent -> BOTH must resolve.
+resolve_derived_multi fact_blob dfrom =
+  let parts = str_split ";" dfrom
+  if (length parts) <= 1 then resolve_derived_from fact_blob dfrom
+  else
+    let h0 = head parts
+    let h1 = head (tail parts)
+    let r0 = resolve_derived_from fact_blob h0
+    let r1 = resolve_derived_from fact_blob h1
+    if r0 == 1 then (if r1 == 1 then 1 else 0) else 0
+
+-- mesh inner-sig re-verification for a MESH_WITNESS_RECEIPT line. Extracts the two parents from
+-- the ";"-joined derived_from, plus sigA/sigB/signerA/signerB from the receipt, and re-verifies
+-- EACH inner co-signature over the FACT receipt string the corresponding parent resolves to.
+-- returns 1 only if BOTH inner sigs verify (and both parents resolve to a real FACT receipt).
+-- Non-mesh INFERENCE lines (single parent, no sigA) skip this -> 1 (handled by the caller).
+mesh_inner_ok lines_blob receipt =
+  let dfrom = pipe_field receipt "derived_from"
+  let parts = str_split ";" dfrom
+  let is_mesh = str_contains "MESH_WITNESS_RECEIPT" receipt
+  -- inner co-sig re-verification applies ONLY to a MESH_WITNESS_RECEIPT (the kind that carries
+  -- sigA/sigB + a two-parent derived_from). A single-parent INFERENCE, or any other kind, -> 1.
+  if is_mesh == 0 then 1
+  else if (length parts) <= 1 then 1
+  else
+    let hA = head parts
+    let hB = head (tail parts)
+    let sigA = pipe_field receipt "sigA"
+    let sigB = pipe_field receipt "sigB"
+    let signerA = pipe_field receipt "signerA"
+    let signerB = pipe_field receipt "signerB"
+    let okA = inner_sig_ok lines_blob hA sigA signerA
+    let okB = inner_sig_ok lines_blob hB sigB signerB
+    if okA == 1 then (if okB == 1 then 1 else 0) else 0
+
 -- walk the ledger line list, threading the expected prev pointer.
 --   idx        = 0-based index of head lines (for error reporting)
 --   expect_prev= the chain_hash the current line's prev= MUST equal ("GENESIS" for line 0)
---   fact_blob  = FACT chain-hash lookup blob for INFERENCE derived_from resolution
+--   fact_blob  = FACT chain-hash MARKER blob (existence checks; single-parent stays byte-identical)
+--   lines_blob = FACT-line lookup blob (resolves a parent chain_hash -> its full FACT line for
+--                inner co-signature re-verification on MESH_WITNESS lines)
 -- returns 1 if the whole remaining chain verifies, 0 (with a printed FAIL line) otherwise.
-walk_lines lines idx expect_prev fact_blob =
+walk_lines lines idx expect_prev fact_blob lines_blob =
   if lines == [] then 1
   else
     let ln = head lines
     if not (is_ledger_line ln) then
       -- non-receipt line (e.g. trailing blank): skip without advancing idx semantics
-      walk_lines (tail lines) idx expect_prev fact_blob
+      walk_lines (tail lines) idx expect_prev fact_blob lines_blob
     else
       let receipt = field_val ln "receipt"
       let sighex = field_val ln "sig"
@@ -163,16 +263,25 @@ walk_lines lines idx expect_prev fact_blob =
       -- (c) prev pointer links to the previous line's chain_hash
       let prev = pipe_field receipt "prev"
       let linkok = if prev == expect_prev then 1 else 0
-      -- (d) INFERENCE derived_from resolution (FACT lines skip this check -> 1)
+      -- (d) INFERENCE derived_from resolution (FACT lines skip this check -> 1). resolve_derived_multi
+      --     str_splits ";" so a two-parent (mesh) value requires BOTH parents to resolve; a
+      --     single-parent value is identical to the old resolve_derived_from.
       let rtype = pipe_field receipt "type"
       let dfrom = pipe_field receipt "derived_from"
       let dfok =
         if rtype == "INFERENCE" then
           if dfrom == "" then 0
-          else resolve_derived_from fact_blob dfrom
+          else resolve_derived_multi fact_blob dfrom
         else 1
+      -- (e) MESH inner co-signature re-verification (two-parent INFERENCE only; others -> 1).
+      let innerok =
+        if rtype == "INFERENCE" then
+          if dfok == 1 then mesh_inner_ok lines_blob receipt
+          else 1
+        else 1
+      let is_mesh = str_contains "MESH_WITNESS_RECEIPT" receipt
 
-      let _ = print (cat ["line ", show idx, "  type=", rtype, "  sig=", show sigok, " chain=", show chainok, " link=", show linkok, " derived_from=", (if rtype == "INFERENCE" then show dfok else "n/a")])
+      let _ = print (cat ["line ", show idx, "  type=", rtype, "  sig=", show sigok, " chain=", show chainok, " link=", show linkok, " derived_from=", (if rtype == "INFERENCE" then show dfok else "n/a"), " inner_sigs=", (if is_mesh then show innerok else "n/a")])
 
       if sigok == 0 then
         let _ = print (cat ["==> FAIL at line ", show idx, ": bad signature"])
@@ -186,9 +295,12 @@ walk_lines lines idx expect_prev fact_blob =
       else if dfok == 0 then
         let _ = print (cat ["==> FAIL at line ", show idx, ": unresolved inference parent (derived_from=", dfrom, ")"])
         0
+      else if innerok == 0 then
+        let _ = print (cat ["==> FAIL at line ", show idx, ": mesh inner co-signature failed (sigA/sigB over resolved FACT receipt)"])
+        0
       else
         -- this line is good; next line's prev must equal THIS line's (verified) chain_hash
-        walk_lines (tail lines) (idx + 1) chaincalc fact_blob
+        walk_lines (tail lines) (idx + 1) chaincalc fact_blob lines_blob
 
 verify_jsonl target =
   let _ = print (cat ["LEDGER WALK  ", target])
@@ -199,11 +311,15 @@ verify_jsonl target =
   -- pure-INFERENCE ledger with no listed FACT source would then reject every line, which
   -- is the honest outcome — name the FACT ledgers).
   let facts_list = read_file "/tmp/lg_verify_facts.txt"
-  let fact_blob =
-    if facts_list == "" then build_fact_blob [target]
-    else build_fact_blob (split "\n" facts_list)
-  let verdict = walk_lines lines 0 "GENESIS" fact_blob
-  let _ = print (cat ["==> LEDGER ", if verdict == 1 then "VALID (chain intact, all sigs + links + derived_from check out)" else "INVALID"])
+  let fact_paths =
+    if facts_list == "" then [target]
+    else (split "\n" facts_list)
+  -- fact_blob  = markers-only (existence checks; single-parent path byte-identical to before).
+  -- lines_blob = full FACT lines keyed by chain_hash (Wave D inner co-signature re-verification).
+  let fact_blob = build_fact_blob fact_paths
+  let lines_blob = build_fact_lines_blob fact_paths
+  let verdict = walk_lines lines 0 "GENESIS" fact_blob lines_blob
+  let _ = print (cat ["==> LEDGER ", if verdict == 1 then "VALID (chain intact, all sigs + links + derived_from + inner co-sigs check out)" else "INVALID"])
   verdict
 
 main =

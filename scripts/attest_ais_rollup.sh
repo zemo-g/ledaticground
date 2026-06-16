@@ -191,6 +191,18 @@ printf '%s\n' "$PREV" > "$PREV_FILE"
 # fetch_beacon_pulse.sh owns the single curl; it stages /tmp/lg_pulse_id.txt + /tmp/lg_pulse_hex.txt.
 source "$REPO/scripts/fetch_beacon_pulse.sh"
 
+# --- A.6 custody (rung 3): stage the code + input digests the signer commits to --------------
+# code_sha256 = sha256 of the signer SOURCE (binds WHICH code produced the product; source text,
+# not the compiled binary -- reproducible-build is a future rung). input_sha256 = sha256 of the
+# raw AIS source bytes this batch decoded from (matches transit_log.py src_ais_sha256). Hex or an
+# honest PENDING_* -- NEVER 0, NEVER fabricated. Same hex-or-PENDING discipline as the pulse fetch.
+CODE_SHA="$(shasum -a 256 "$REPO/src/ais_attest.rail" 2>/dev/null | awk '{print $1}')"
+case "$CODE_SHA" in ''|*[!0-9a-fA-F]*) CODE_SHA="PENDING_no_code_hash" ;; esac
+printf '%s\n' "$CODE_SHA" > /tmp/ais_code_sha256.txt
+INPUT_SHA="$(shasum -a 256 "$AIS_SRC" 2>/dev/null | awk '{print $1}')"
+case "$INPUT_SHA" in ''|*[!0-9a-fA-F]*) INPUT_SHA="PENDING_no_input_hash" ;; esac
+printf '%s\n' "$INPUT_SHA" > /tmp/ais_input_sha256.txt
+
 # --- Invoke the pure-Rail signer via the flock-serialized wrapper ----------------------------
 # The signer reads all the /tmp staging files, signs, self-verifies, appends the v=2 line to the
 # ledger, rewrites the legacy single-object, and writes data/ais_fact_chain.txt.
