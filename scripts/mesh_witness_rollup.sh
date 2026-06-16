@@ -170,6 +170,37 @@ CHAINA="$(cat /tmp/mesh_out_chainA.txt 2>/dev/null)"
 CHAINB="$(cat /tmp/mesh_out_chainB.txt 2>/dev/null)"
 log "derived_from parents: A=${CHAINA:0:12}.. B=${CHAINB:0:12}.."
 
+# ---------- DESYNC GUARD: the committed mesh line's parents MUST resolve in the FACT ledgers ----------
+# verify.rail walks the mesh line and resolves derived_from = factA_chain_hash;factB_chain_hash by
+# looking each parent up as a chain_hash in the two FACT ledgers (an unresolvable parent => REJECT).
+# The PASS-0/regen/PASS-1 two-pass dance + the per-run FACT-ledger overwrite are exactly where an
+# "output present but stale/empty" desync can hide: a FACT ledger left empty, or a committed mesh
+# line whose derived_from drifted from the FACT lines actually written, wedges every verify silently.
+# Mirror the iq_capture re-runnability fix: do NOT declare the roll-up complete unless the consumed
+# outputs are present, non-empty, AND internally consistent. Fail LOUD otherwise (audit 2026-06-16).
+if [ -z "$CHAINA" ] || [ -z "$CHAINB" ]; then
+  log "ERR mesh parent chain_hash missing (A='${CHAINA}' B='${CHAINB}') -- cannot verify FACT resolution; FAIL LOUD"; exit 1
+fi
+# (a) both FACT ledgers must be present + non-empty.
+if [ ! -s "$FACTA_LEDGER" ] || [ ! -s "$FACTB_LEDGER" ]; then
+  log "ERR a FACT ledger is missing/empty (A=$FACTA_LEDGER B=$FACTB_LEDGER) -- verify would orphan the mesh line; FAIL LOUD"; exit 1
+fi
+# (b) each FACT ledger must actually contain its parent chain_hash (the value verify.rail resolves).
+if ! grep -Fq "\"chain_hash\": \"$CHAINA\"" "$FACTA_LEDGER"; then
+  log "ERR factA parent $CHAINA NOT present in $FACTA_LEDGER -- derived_from would be unresolvable; FAIL LOUD"; exit 1
+fi
+if ! grep -Fq "\"chain_hash\": \"$CHAINB\"" "$FACTB_LEDGER"; then
+  log "ERR factB parent $CHAINB NOT present in $FACTB_LEDGER -- derived_from would be unresolvable; FAIL LOUD"; exit 1
+fi
+# (c) the COMMITTED mesh line's derived_from must equal CHAINA;CHAINB (PASS 1 signed the SAME parents
+#     the FACT ledgers carry; a drift here = emit-vs-verify disagreement). Read the committed receipt
+#     string's pipe-delimited derived_from= field from the one mesh ledger line.
+MESH_DFROM="$(sed -n 's/.*|derived_from=\([^|"]*\).*/\1/p' "$MESH_LEDGER" 2>/dev/null | head -1)"
+if [ "$MESH_DFROM" != "${CHAINA};${CHAINB}" ]; then
+  log "ERR committed mesh derived_from ('$MESH_DFROM') != staged parents ('${CHAINA};${CHAINB}') -- emit/verify would disagree; FAIL LOUD"; exit 1
+fi
+log "DESYNC GUARD ok: both FACT ledgers present + contain their parents; mesh derived_from matches"
+
 log "mesh roll-up complete -- run verify.rail to cold-check the witness:"
 log "  bash scripts/railrun.sh $GD/src/verify.rail"
 exit 0

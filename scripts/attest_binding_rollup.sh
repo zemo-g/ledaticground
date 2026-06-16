@@ -9,8 +9,8 @@
 # ORCHESTRATION (the ticket's 4 steps):
 #   (1) run scripts/attest_iq_capture_rollup.sh on the IQ  -> the FACT root (iq_capture chain_hash
 #       in data/iq_capture_fact_chain.txt). The PHYSICS_BINDING receipt's derived_from names it.
-#   (2) run doppler_real.rail (measured carrier-centroid track) + scripts/doppler_fit.py (the numpy
-#       240-step best_align SEARCH) to find t_shift_s / const_off_hz; stage them + the TLE
+#   (2) run doppler_real.rail (measured carrier-centroid track) + an inline numpy 240-step
+#       best_align SEARCH to find t_shift_s / const_off_hz; stage them + the TLE
 #       (tle_sha256) + claimed geo + measured track (meas_sha256) under /tmp/binding_*.
 #   (3) source scripts/fetch_beacon_pulse.sh (the single live beacon fetch; honest PENDING fallback).
 #   (4) drive src/binding_attest.rail via scripts/railrun.sh. THAT signer does the SINGLE-point
@@ -146,23 +146,13 @@ fi
 echo "BIND: FACT root chain_hash=$FACT_CHAIN"
 
 # =============================================================================================
-# STEP 2 -- measured centroid (doppler_real.rail) + best_align SEARCH (doppler_fit.py).
+# STEP 2 -- measured centroid (doppler_real.rail) + inline best_align SEARCH.
 # =============================================================================================
-# doppler_real.rail reads /tmp/dop_real.iq HARD-CODED. To keep OFF the live pipeline file we run it
-# against the binding IQ by atomically swapping: we do NOT clobber a live capture because the binding
-# rollup is the only writer of a fixture; but to honor F.5 we copy the binding IQ to the path the
-# tracker reads ONLY for the duration of this measure step, then restore any prior content.
-# Safer: doppler_real reads a fixed path, so we point a SYMLINK-free copy. We measure from a private
-# copy by temporarily setting the tracker's input via a tiny wrapper that reads /tmp/binding_iq.iq.
-# doppler_real.rail's main hard-codes /tmp/dop_real.iq; the contract forbids us writing that path.
-# Resolution: run the measure through a one-shot Rail file that imports nothing new -- we instead
-# stage the binding IQ and let doppler_real read it by overriding via the BIND_MEAS_SRC convention.
-#
-# doppler_real.rail reads "/tmp/dop_real.iq" literally. We must NOT write that file. So we measure
-# with a private tracker invocation: copy binding IQ to a fresh /tmp/binding_dopin.iq and run a
-# measure that reads it. Since doppler_real.rail's path is fixed, we use python's FFT-free path? No
-# -- the measured centroid MUST come from doppler_real.rail (pure Rail). So we honor F.5 by NOT
-# touching /tmp/dop_real.iq if it already exists: snapshot+restore it around our measure.
+# doppler_real.rail reads "/tmp/dop_real.iq" HARD-CODED, and F.5 forbids us from clobbering that
+# live-pipeline path. The measured centroid MUST come from doppler_real.rail (pure Rail), so we
+# honor F.5 by snapshot+restore: if a live capture already sits at /tmp/dop_real.iq we back it up,
+# stage our fixture there ONLY for the duration of the measure, then restore the original bytes
+# (or remove our staged copy if there was none) -- leaving the live staging byte-identical.
 DOP_REAL_LIVE="/tmp/dop_real.iq"
 RESTORE_LIVE=0
 LIVE_BAK="/tmp/binding_dopreal_live.bak"
@@ -189,7 +179,7 @@ fi
 NMEAS="$(grep -c '^DOP ' "$BIND_MEAS")"
 echo "BIND: measured $NMEAS windows"
 
-# --- build a predicted-DOPPLER curve file + times file for doppler_fit.py's --predict real mode.
+# --- build a predicted-DOPPLER curve file + times file the inline best_align below consumes.
 # The SGP4-true predicted dop at each measured snapshot lives in the gen_tle_doppler truth file.
 # For a REAL capture (no truth), we run doppler_range.rail QUERY at the snapshot times. Either way
 # the prediction is THE orbit's curve over THE claimed geo (positive) or a WRONG orbit (negative).
@@ -241,7 +231,7 @@ if not dopq:
     sys.stderr.write("=== doppler_range stdout ===\n" + proc.stdout + "\n=== stderr ===\n" + proc.stderr + "\n")
     sys.exit(2)
 first = snap_unix[0]
-# write a DOPPLER-curve file (doppler_fit.py --predict expects "DOPPLER <min_from_now> <el> <dop>";
+# write a DOPPLER-curve file (the inline best_align parses "DOPPLER <min_from_now> <el> <dop>";
 # min_from_now is t_snap/60 so pm=t_snap seconds after *60 in the fitter). and a times file (unix).
 with open(pred_out, 'w') as pf, open(times_out, 'w') as tf:
     for u in snap_unix:
@@ -263,13 +253,10 @@ fi
 FIRST_SNAP_UNIX="$(printf '%s\n' "$FIT_PARSE" | sed -n 's/^FIRST_SNAP_UNIX=//p' | head -1)"
 case "$FIRST_SNAP_UNIX" in ''|*[!0-9]*) echo "BIND_ERR: bad FIRST_SNAP_UNIX" >&2; exit 2 ;; esac
 
-# --- run the committed best_align SEARCH (doppler_fit.py real mode) for the diagnostic alignment.
-echo "BIND: best_align search (doppler_fit.py)"
-"$PY" "$REPO/scripts/doppler_fit.py" "$BIND_MEAS" --predict "$BIND_PRED" --times "$BIND_TIMES" 2>&1 \
-    | sed 's/^/BIND_FIT  /'
-
 # --- compute the COMMITTED alignment + the single eval point (parses the same curve/times/measured).
-#     This is the rollup's own staging step -- doppler_fit.py did the SEARCH; we pin one point.
+#     The inline best_align below is the ONE load-bearing search whose result is staged + signed.
+#     (A separate scripts/doppler_fit.py diagnostic pass used to run here; it was identical 240-step
+#     best_align math whose output was only echoed, never captured -- redundant, removed.)
 FIT_OUT="$("$PY" - "$BIND_MEAS" "$BIND_PRED" "$BIND_TIMES" "$FIRST_SNAP_UNIX" <<'PYEOF'
 import sys, numpy as np
 meas_file, pred_file, times_file, first_snap = sys.argv[1:5]
@@ -396,6 +383,68 @@ source "$REPO/scripts/fetch_beacon_pulse.sh"
 
 echo "BIND: staged alignment t_shift=$T_SHIFT_S const_off=$CONST_OFF_HZ est=$ESTIMATOR t_eval_unix=$T_EVAL_UNIX meas=$MEAS_CENTROID_HZ tol=$TOL_HZ"
 echo "BIND: tle_sha256=$TLE_SHA256  meas_sha256=$MEAS_SHA256  fact=$FACT_CHAIN"
+
+# =============================================================================================
+# STEP 3.5 -- RECONCILE the chain-prev pointer against the binding ledger BEFORE signing.
+# =============================================================================================
+# The binding chain is a REAL append-and-chain-across-runs chain: binding_attest.rail reads
+# data/chain/binding_prev.txt as prev= and verify.rail requires line[0].prev=GENESIS, then each
+# line[k].prev = line[k-1].chain_hash. If the prev POINTER and the physics_binding_receipts.jsonl
+# LEDGER desync -- prev names a hash whose receipt line is NOT actually in the ledger (e.g. the
+# ledger was cleared/lost but the prev pointer was left behind) -- the signer would chain off a
+# PHANTOM predecessor, and every subsequent verify REJECTS (orphaned prev). Mirror the iq_capture
+# re-runnability fix (audit 2026-06-16): honor the "already advanced" prev state ONLY if the
+# dependent output (the ledger line it points at) is actually present. Reconcile:
+#   - ledger empty/absent  + prev=GENESIS         -> consistent fresh chain, proceed.
+#   - ledger empty/absent  + prev=<hash>          -> PHANTOM prev (ledger lost). Self-heal: reset
+#                                                    prev to GENESIS so this run starts a clean line[0]
+#                                                    (regenerate, never chain off a phantom).
+#   - ledger non-empty     + prev==ledger tail    -> consistent, proceed.
+#   - ledger non-empty     + prev!=ledger tail    -> AMBIGUOUS corruption (prev points at a hash that
+#                                                    is not the live ledger tail). NOT a fresh start;
+#                                                    fail LOUD rather than fork the chain off a phantom.
+BIND_LEDGER="$REPO/data/physics_binding_receipts.jsonl"
+BIND_PREV_FILE="$REPO/data/chain/binding_prev.txt"
+PREV_PTR="GENESIS"
+if [ -f "$BIND_PREV_FILE" ]; then
+    PREV_PTR="$(cat "$BIND_PREV_FILE" 2>/dev/null | tr -d '[:space:]')"
+    [ -z "$PREV_PTR" ] && PREV_PTR="GENESIS"
+fi
+LEDGER_TAIL=""
+if [ -s "$BIND_LEDGER" ]; then
+    if [ -x "$PY" ]; then
+        LEDGER_TAIL="$(tail -1 "$BIND_LEDGER" 2>/dev/null | "$PY" -c "
+import sys,json
+line=sys.stdin.read().strip()
+if line:
+    try: print(json.loads(line).get('chain_hash',''))
+    except Exception: pass
+" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    # python-free fallback: sed-extract the last line's chain_hash JSON field.
+    if [ -z "$LEDGER_TAIL" ]; then
+        LEDGER_TAIL="$(tail -1 "$BIND_LEDGER" 2>/dev/null | sed -n 's/.*"chain_hash": "\([0-9a-fA-F]*\)".*/\1/p' | tr -d '[:space:]')"
+    fi
+fi
+mkdir -p "$REPO/data/chain" 2>/dev/null
+if [ -z "$LEDGER_TAIL" ]; then
+    # ledger empty/absent. prev MUST be GENESIS; self-heal a phantom pointer.
+    if [ "$PREV_PTR" != "GENESIS" ]; then
+        echo "BIND: WARN prev pointer ($PREV_PTR) is a PHANTOM -- binding ledger is empty/absent." >&2
+        echo "BIND: self-healing data/chain/binding_prev.txt -> GENESIS (start a clean line[0]; never chain off a phantom)." >&2
+        printf '%s\n' "GENESIS" > "$BIND_PREV_FILE"
+        PREV_PTR="GENESIS"
+    fi
+else
+    # ledger non-empty. prev MUST equal the live tail, else the pointer is corrupt -- fail LOUD.
+    if [ "$PREV_PTR" != "$LEDGER_TAIL" ]; then
+        echo "BIND_ERR: chain-prev DESYNC -- data/chain/binding_prev.txt=$PREV_PTR but ledger tail=$LEDGER_TAIL." >&2
+        echo "BIND_ERR: refusing to chain off a phantom/forked predecessor (would wedge every verify)." >&2
+        echo "BIND_ERR: reconcile manually: set binding_prev.txt to the ledger tail chain_hash, or rebuild the ledger." >&2
+        exit 2
+    fi
+fi
+echo "BIND: chain-prev reconciled (prev=$PREV_PTR ledger_tail=${LEDGER_TAIL:-<empty>})"
 
 # =============================================================================================
 # STEP 4 -- drive the pure-Rail signer (single-point SGP4 recompute IN RAIL at the committed alignment).
