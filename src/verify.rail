@@ -37,6 +37,31 @@ import "stdlib/ed25519.rail"
 import "stdlib/ed25519_scalar.rail"
 import "stdlib/ed25519_sign.rail"
 
+-- ===== WAVE C: PHYSICS RE-RUN (physicify with teeth) =====
+-- For a PHYSICS_BINDING_RECEIPT (A.7) the verifier, AFTER the sig+chain+prev+derived_from
+-- checks pass, RE-RUNS the physics: it recomputes the SINGLE-point residual from the cited
+-- tle_sha256 (TLE staged at /tmp/lg_verify_tle.txt), the claimed_geo, the committed
+-- t_shift_s/const_off_hz, and the committed measured track (meas_sha256, staged at
+-- /tmp/lg_verify_meas.txt + its snapshot times at /tmp/lg_verify_times.txt) -- using THE SAME
+-- SGP4 query path (doppler_range.rail, inlined verbatim below) the emitter committed. If
+-- |recomputed - residual_hz| > repro_tol_hz it REJECTS with "physics residual unreproducible",
+-- EVEN WHEN the Ed25519 signature is perfectly valid. A valid signature over a FABRICATED
+-- residual MUST fail: the signature proves "the signer wrote this number", the physics re-run
+-- proves "this number is what the cited orbit+geo+track actually yields". The claim is ALWAYS
+-- "the cost of an undetected lie scales with the conspiracy required" -- to forge a passing
+-- binding the liar must also forge a TLE+track whose SGP4 single-point residual matches the
+-- fabricated number AND whose digests match the cited tle_sha256/meas_sha256. physics_ok is
+-- NEVER re-interpreted as "verified true"; this only re-checks the RECORDED mechanism number.
+-- The math is byte-identical to src/doppler_range.rail / src/binding_attest.rail so the
+-- recomputed Doppler equals the emitter's single-point eval for the same staged inputs.
+
+foreign sin x -> float
+foreign cos x -> float
+foreign sqrt x -> float
+foreign pow x y -> float
+foreign atan2 y x -> float
+foreign floor x -> float
+
 -- field_or: read a /tmp staging file, strip trailing newline; absent/empty -> default.
 field_or path def =
   let v = str_replace "\n" "" (read_file path)
@@ -235,6 +260,365 @@ mesh_inner_ok lines_blob receipt =
     let okB = inner_sig_ok lines_blob hB sigB signerB
     if okA == 1 then (if okB == 1 then 1 else 0) else 0
 
+-- ===================================================================================
+-- WAVE C: SGP4 single-point Doppler re-run -- VERBATIM math from src/doppler_range.rail
+-- (== src/binding_attest.rail's inlined copy), so the recomputed Doppler at t_eval equals
+-- the emitter's committed single-point eval for the same TLE+geo+fc. Element/observer state
+-- lives in one 26-slot float array `e` (same layout doppler_range.rail documents).
+-- ===================================================================================
+asin_ x = atan2 x (sqrt (1.0 - x * x))
+fmod_ a b = a - (floor (a / b)) * b
+fdiff a b = if a > b then a - b else b - a
+
+kepler_iter e m ecur k =
+  if k == 0 then ecur
+  else
+    let f = ecur - e * (sin ecur) - m
+    let fp = 1.0 - e * (cos ecur)
+    let enext = ecur - f / fp
+    kepler_iter e m enext (k - 1)
+
+solve_kepler e m = kepler_iter e m m 8
+
+gmst_rad jd d2r =
+  let d = jd - 2451545.0
+  let t = d / 36525.0
+  let g = 280.46061837 + 360.98564736629 * d + 0.000387933 * t * t - (t * t * t) / 38710000.0
+  let gm = fmod_ g 360.0
+  let gpos = if gm < 0.0 then gm + 360.0 else gm
+  gpos * d2r
+
+compute_elaz e t o =
+  let a = float_arr_get e 0
+  let ecc = float_arr_get e 1
+  let incl = float_arr_get e 2
+  let raan0 = float_arr_get e 3
+  let argp0 = float_arr_get e 4
+  let m0 = float_arr_get e 5
+  let raandot = float_arr_get e 6
+  let argpdot = float_arr_get e 7
+  let mdot = float_arr_get e 8
+  let jde = float_arr_get e 9
+  let ox = float_arr_get e 10
+  let oy = float_arr_get e 11
+  let oz = float_arr_get e 12
+  let ophi = float_arr_get e 13
+  let olam = float_arr_get e 14
+  let d2r = float_arr_get e 15
+  let mm = m0 + mdot * t
+  let raan = raan0 + raandot * t
+  let argp = argp0 + argpdot * t
+  let ea = solve_kepler ecc mm
+  let r = a * (1.0 - ecc * (cos ea))
+  let nu = atan2 ((sqrt (1.0 + ecc)) * (sin (ea / 2.0))) ((sqrt (1.0 - ecc)) * (cos (ea / 2.0)))
+  let nu2 = nu * 2.0
+  let xo = r * (cos nu2)
+  let yo = r * (sin nu2)
+  let cosO = cos raan
+  let sinO = sin raan
+  let cosw = cos argp
+  let sinw = sin argp
+  let cosi = cos incl
+  let sini = sin incl
+  let xeci = xo * ((cosO * cosw) - (sinO * sinw * cosi)) - yo * ((cosO * sinw) + (sinO * cosw * cosi))
+  let yeci = xo * ((sinO * cosw) + (cosO * sinw * cosi)) - yo * ((sinO * sinw) - (cosO * cosw * cosi))
+  let zeci = xo * (sinw * sini) + yo * (cosw * sini)
+  let jd_obs = jde + t / 86400.0
+  let g = gmst_rad jd_obs d2r
+  let cg = cos g
+  let sg = sin g
+  let xe = xeci * cg + yeci * sg
+  let ye = (0.0 - xeci) * sg + yeci * cg
+  let ze = zeci
+  let rx = xe - ox
+  let ry = ye - oy
+  let rz = ze - oz
+  let slat = sin ophi
+  let clat = cos ophi
+  let slon = sin olam
+  let clon = cos olam
+  let east = (0.0 - slon) * rx + clon * ry
+  let north = (0.0 - slat) * clon * rx - slat * slon * ry + clat * rz
+  let up = clat * clon * rx + clat * slon * ry + slat * rz
+  let rng = sqrt (rx * rx + ry * ry + rz * rz)
+  let elr = asin_ (up / rng)
+  let azr = atan2 east north
+  let eldeg = elr / d2r
+  let azd = azr / d2r
+  let azpos = if azd < 0.0 then azd + 360.0 else azd
+  let _ = float_arr_set o 0 eldeg
+  let _ = float_arr_set o 1 azpos
+  let _ = float_arr_set o 2 rng
+  0
+
+set_observer e lat_deg lon_deg alt_km d2r twopi mu re j2 fc =
+  let phi = lat_deg * d2r
+  let lam = lon_deg * d2r
+  let sphi = sin phi
+  let cphi = cos phi
+  let ae = 6378.137
+  let ff = 1.0 / 298.257223563
+  let e2 = ff * (2.0 - ff)
+  let nlat = ae / (sqrt (1.0 - e2 * sphi * sphi))
+  let ox = (nlat + alt_km) * cphi * (cos lam)
+  let oy = (nlat + alt_km) * cphi * (sin lam)
+  let oz = (nlat * (1.0 - e2) + alt_km) * sphi
+  let _ = float_arr_set e 10 ox
+  let _ = float_arr_set e 11 oy
+  let _ = float_arr_set e 12 oz
+  let _ = float_arr_set e 13 phi
+  let _ = float_arr_set e 14 lam
+  let _ = float_arr_set e 15 d2r
+  let _ = float_arr_set e 21 mu
+  let _ = float_arr_set e 22 re
+  let _ = float_arr_set e 23 j2
+  let _ = float_arr_set e 24 twopi
+  let _ = float_arr_set e 25 fc
+  0
+
+set_elements_from_tle e l1 l2 =
+  let incd = parse_float (str_sub l2 8 8)
+  let raand = parse_float (str_sub l2 17 8)
+  let ecc = parse_float (cat ["0.", str_sub l2 26 7])
+  let argpd = parse_float (str_sub l2 34 8)
+  let mad = parse_float (str_sub l2 43 8)
+  let mmd = parse_float (str_sub l2 52 11)
+  let yy = parse_int (str_sub l1 18 2)
+  let year = 2000 + yy
+  let ddf = parse_float (str_sub l1 20 12)
+  let jd_jan1 = int_to_float (367 * year - 7 * year / 4) + 1721044.5
+  let jd_epoch = jd_jan1 + (ddf - 1.0)
+  let d2r = float_arr_get e 15
+  let twopi = float_arr_get e 24
+  let mu = float_arr_get e 21
+  let re = float_arr_get e 22
+  let j2 = float_arr_get e 23
+  let jd_now = float_arr_get e 20
+  let n0 = mmd * twopi / 86400.0
+  let a = pow (mu / (n0 * n0)) (1.0 / 3.0)
+  let incl = incd * d2r
+  let p = a * (1.0 - ecc * ecc)
+  let rp = re / p
+  let factor = 1.5 * j2 * rp * rp
+  let cosi = cos incl
+  let sini = sin incl
+  let raandot = (0.0 - n0) * factor * cosi
+  let argpdot = n0 * factor * (2.0 - 2.5 * sini * sini)
+  let mdot = n0 * (1.0 + factor * (sqrt (1.0 - ecc * ecc)) * (1.0 - 1.5 * sini * sini))
+  let t0 = (jd_now - jd_epoch) * 86400.0
+  let _ = float_arr_set e 0 a
+  let _ = float_arr_set e 1 ecc
+  let _ = float_arr_set e 2 incl
+  let _ = float_arr_set e 3 (raand * d2r)
+  let _ = float_arr_set e 4 (argpd * d2r)
+  let _ = float_arr_set e 5 (mad * d2r)
+  let _ = float_arr_set e 6 raandot
+  let _ = float_arr_set e 7 argpdot
+  let _ = float_arr_set e 8 mdot
+  let _ = float_arr_set e 9 jd_epoch
+  let _ = float_arr_set e 17 t0
+  0
+
+set_now_unix e now_unix_f =
+  let jd_now = now_unix_f / 86400.0 + 2440587.5
+  let _ = float_arr_set e 19 now_unix_f
+  let _ = float_arr_set e 20 jd_now
+  jd_now
+
+range_at e t o =
+  let _ = compute_elaz e t o
+  float_arr_get o 2
+
+doppler_at e t o =
+  let r1 = range_at e t o
+  let r2 = range_at e (t + 1.0) o
+  let fc = float_arr_get e 25
+  (r1 - r2) * fc / 299792.458
+
+doppler_at_unix e unix_f o =
+  let now_unix = float_arr_get e 19
+  let t0 = float_arr_get e 17
+  let t = t0 + (unix_f - now_unix)
+  doppler_at e t o
+
+-- ===================================================================================
+-- WAVE C helpers: parse claimed_geo, the measured track + times, reproduce the eval point.
+-- ===================================================================================
+
+-- round-to-nearest via floor(x+0.5) -- matches the rollup's int(round(...)) for the eval time.
+round_ x = floor (x + 0.5)
+
+-- parse claimed_geo "lat,lon,altkm_SYNTH" -> field i (0=lat,1=lon). Strips the _SYNTH suffix and
+-- any trailing "km" on the alt; lat/lon are plain floats. Returns "" if the field is absent.
+geo_field claimed i =
+  let core = str_replace "_SYNTH" "" claimed
+  let parts = str_split "," core
+  if (length parts) <= i then ""
+  else nth_str parts i
+
+-- nth element of a string list (named, not a lambda; filter-with-lambda can segfault).
+nth_str xs i =
+  if i <= 0 then head xs
+  else nth_str (tail xs) (i - 1)
+
+-- count real DOP lines in the measured track ("DOP <w> <peak> <centroid>"); used for nw.
+is_dop_line s = str_contains "DOP " s
+
+-- the j-th token (space-separated) of a line, 0-based. token 0 = "DOP", 2=peak, 3=centroid.
+line_tok line j =
+  let parts = str_split " " line
+  if (length parts) <= j then "" else nth_str parts j
+
+-- count DOP lines
+count_dop lines acc =
+  if lines == [] then acc
+  else
+    let ln = head lines
+    let na = if is_dop_line ln then acc + 1 else acc
+    count_dop (tail lines) na
+
+-- the centroid (or peak) Doppler of the k-th DOP line (0-based over DOP lines only).
+-- estimator "peak" -> token 2 ; anything else (centroid) -> token 3. Matches the rollup's
+-- arr = peak_w/cent_w selection. Returns 0.0 if k is out of range.
+dop_at_k lines k want_peak cur =
+  if lines == [] then 0.0
+  else
+    let ln = head lines
+    if is_dop_line ln then
+      if cur == k then
+        let tk = if want_peak == 1 then line_tok ln 2 else line_tok ln 3
+        parse_float tk
+      else dop_at_k (tail lines) k want_peak (cur + 1)
+    else dop_at_k (tail lines) k want_peak cur
+
+-- the k-th snapshot unix time (0-based) from /tmp/lg_verify_times.txt lines. The times file
+-- mirrors the rollup's BIND_TIMES: "snap <unix>" rows (one per measured window, in order).
+-- token 1 of a "snap <unix>" line is the unix time. Parsed as an INTEGER (parse_int, not
+-- parse_float): the snapshot unix times are integers, and integer subtraction (se - first_snap)
+-- DODGES the self-loop float miscompile that segfaults when two parse_float results flowing out
+-- of a recursive fn are subtracted (tdoa.rail:50-58 float-accumulator discipline). Returns 0 if absent.
+is_snap_line s = str_contains "snap " s
+snap_int_at_k lines k cur =
+  if lines == [] then 0
+  else
+    let ln = head lines
+    if is_snap_line ln then
+      if cur == k then parse_int (line_tok ln 1)
+      else snap_int_at_k (tail lines) k (cur + 1)
+    else snap_int_at_k (tail lines) k (cur + 1)
+count_snap lines acc =
+  if lines == [] then acc
+  else
+    let ln = head lines
+    let na = if is_snap_line ln then acc + 1 else acc
+    count_snap (tail lines) na
+
+-- ===================================================================================
+-- THE WAVE C PHYSICS RE-RUN: recompute the single-point residual for a binding receipt and
+-- compare to the COMMITTED residual_hz within repro_tol_hz. Returns 1 (reproduces) / 0 (FAIL).
+-- Staging (verify_binding.sh writes these):
+--   /tmp/lg_verify_tle.txt    cited TLE (l1\nl2)  -- its sha256 MUST equal receipt tle_sha256
+--   /tmp/lg_verify_meas.txt   cited measured track (doppler_real DOP lines) -- sha256 == meas_sha256
+--   /tmp/lg_verify_times.txt  "snap <unix>" rows for the measured windows (eval-index -> t_eval)
+-- A digest mismatch on the staged TLE/track means the verifier is being fed a DIFFERENT artifact
+-- than the receipt cited -> can't honestly re-run -> FAIL (treat as unreproducible).
+-- ===================================================================================
+physics_recompute receipt idx =
+  let residual_hz = parse_int (pipe_field receipt "residual_hz")
+  let repro_tol_hz = parse_int (pipe_field receipt "repro_tol_hz")
+  let t_shift_s = parse_float (pipe_field receipt "t_shift_s")
+  let const_off_hz = parse_float (pipe_field receipt "const_off_hz")
+  let estimator = pipe_field receipt "estimator"
+  let want_peak = if estimator == "peak" then 1 else 0
+  let tle_sha_cited = pipe_field receipt "tle_sha256"
+  let meas_sha_cited = pipe_field receipt "meas_sha256"
+  let claimed_geo = pipe_field receipt "claimed_geo"
+  let fc = parse_float (pipe_field receipt "fc_hz")
+
+  -- (1) BIND the staged artifacts to what the receipt cited (digest equality).
+  let tle_raw = read_file "/tmp/lg_verify_tle.txt"
+  let meas_raw = read_file "/tmp/lg_verify_meas.txt"
+  -- TLE digest: shasum -a 256 of "l1\nl2\n" (rollup: printf '%s\n%s\n' L1 L2). Reproduce by
+  -- stripping any trailing newline noise and re-joining the two TLE lines with a trailing \n each.
+  let tlines = split "\n" tle_raw
+  let l1 = head tlines
+  let l2 = if (tail tlines) == [] then "" else head (tail tlines)
+  let tle_canon = cat [l1, "\n", l2, "\n"]
+  let tle_sha_calc = sha256_hex tle_canon
+  -- measured-track digest: shasum -a 256 of the WHOLE file bytes (the BIND_MEAS file verbatim).
+  let meas_sha_calc = sha256_hex meas_raw
+
+  let tle_ok = if tle_sha_calc == tle_sha_cited then 1 else 0
+  let meas_ok = if meas_sha_calc == meas_sha_cited then 1 else 0
+
+  -- (2) reproduce the eval point from the measured track + times + committed t_shift (eval_idx=nw//2).
+  -- Snapshot times are parsed as INTEGERS and subtracted in integer space (snap_int_at_k); only the
+  -- final t_eval is a float (so it carries t_shift_s). This dodges the float self-loop miscompile.
+  let meas_lines = split "\n" meas_raw
+  let times_raw = read_file "/tmp/lg_verify_times.txt"
+  let time_lines = split "\n" times_raw
+  let ndop = count_dop meas_lines 0
+  let nsnap = count_snap time_lines 0
+  let nw = if ndop < nsnap then ndop else nsnap
+  let eval_idx = nw / 2
+  let meas_val = dop_at_k meas_lines eval_idx want_peak 0
+  let first_snap = snap_int_at_k time_lines 0 0
+  let snap_eval = snap_int_at_k time_lines eval_idx 0
+  let t_snap_eval_i = snap_eval - first_snap
+  let t_eval_unix = round_ ((int_to_float first_snap) + (int_to_float t_snap_eval_i) + t_shift_s)
+
+  -- (3) parse the CLAIMED observer geo (lat,lon,alt) -- the PREDICTION's observer (synthetic).
+  let lat = parse_float (geo_field claimed_geo 0)
+  let lon = parse_float (geo_field claimed_geo 1)
+  -- alt: 3rd csv field with any trailing "km" stripped (e.g. "0.18km" -> "0.18").
+  let alt_raw = geo_field claimed_geo 2
+  let alt = parse_float (str_replace "km" "" alt_raw)
+
+  -- (4) THE single SGP4 Doppler eval at t_eval_unix (now_unix anchor cancels analytically; we use
+  -- t_eval_unix itself as the anchor so t0 maps exactly). predicted_total = predicted + const_off.
+  -- Floats are routed THROUGH a scratch float array (acc) before the residual arithmetic -- the
+  -- tdoa.rail:50-58 discipline: a float flowing straight out of doppler_at_unix into a subtraction
+  -- can trip the self-loop miscompile, so we land it in acc[*] first.
+  let pi = atan2 0.0 (0.0 - 1.0)
+  let twopi = pi * 2.0
+  let d2r = pi / 180.0
+  let mu = 398600.4418
+  let re = 6378.137
+  let j2 = 0.0010826267
+  let e = float_arr_new 26 0.0
+  let o = float_arr_new 3 0.0
+  let acc = float_arr_new 4 0.0
+  let _ = set_observer e lat lon alt d2r twopi mu re j2 fc
+  let _ = set_now_unix e t_eval_unix
+  let _ = set_elements_from_tle e l1 l2
+  let _ = float_arr_set acc 0 (doppler_at_unix e t_eval_unix o)
+  let _ = float_arr_set acc 1 (const_off_hz)
+  let _ = float_arr_set acc 2 (meas_val)
+  let predicted_dop = float_arr_get acc 0
+  let _ = float_arr_set acc 3 ((float_arr_get acc 0) + (float_arr_get acc 1))
+  let predicted_total = float_arr_get acc 3
+  let recomputed_f = fdiff (float_arr_get acc 3) (float_arr_get acc 2)
+  let recomputed_hz = float_to_int recomputed_f
+
+  -- (5) the verdict: |recomputed - committed residual_hz| <= repro_tol_hz, AND both digests bind.
+  let drift = if recomputed_hz > residual_hz then recomputed_hz - residual_hz else residual_hz - recomputed_hz
+  let within = if drift <= repro_tol_hz then 1 else 0
+
+  let _ = print (cat ["  physics  line ", show idx, ": tle_digest=", show tle_ok, " meas_digest=", show meas_ok, " est=", estimator, " t_eval_unix=", show_float t_eval_unix])
+  let _ = print (cat ["  physics  predicted_dop=", show_float predicted_dop, " + const_off=", show_float const_off_hz, " = ", show_float predicted_total, " Hz ; measured=", show_float meas_val, " Hz"])
+  let _ = print (cat ["  physics  recomputed_residual=", show recomputed_hz, " Hz  committed residual_hz=", show residual_hz, " Hz  drift=", show drift, " repro_tol=", show repro_tol_hz, " Hz"])
+
+  if tle_ok == 0 then
+    let _ = print (cat ["==> FAIL at line ", show idx, ": physics residual unreproducible (staged TLE sha256 ", tle_sha_calc, " != cited ", tle_sha_cited, ")"])
+    0
+  else if meas_ok == 0 then
+    let _ = print (cat ["==> FAIL at line ", show idx, ": physics residual unreproducible (staged measured-track sha256 ", meas_sha_calc, " != cited ", meas_sha_cited, ")"])
+    0
+  else if within == 0 then
+    let _ = print (cat ["==> FAIL at line ", show idx, ": physics residual unreproducible (recomputed ", show recomputed_hz, " Hz vs committed ", show residual_hz, " Hz, drift ", show drift, " > repro_tol ", show repro_tol_hz, " Hz)"])
+    0
+  else 1
+
 -- walk the ledger line list, threading the expected prev pointer.
 --   idx        = 0-based index of head lines (for error reporting)
 --   expect_prev= the chain_hash the current line's prev= MUST equal ("GENESIS" for line 0)
@@ -280,8 +664,21 @@ walk_lines lines idx expect_prev fact_blob lines_blob =
           else 1
         else 1
       let is_mesh = str_contains "MESH_WITNESS_RECEIPT" receipt
+      -- (f) WAVE C PHYSICS RE-RUN: a PHYSICS_BINDING_RECEIPT (A.7) gets its single-point residual
+      --     RECOMPUTED from the cited TLE+claimed_geo+committed alignment+measured track, and the
+      --     result compared to the committed residual_hz within repro_tol_hz. Run ONLY after the
+      --     sig/chain/prev/derived_from gates already pass (so a structurally broken line fails on
+      --     the cheaper check first) -- physics_recompute is the EXPENSIVE check, gated last.
+      --     A valid signature over a FABRICATED residual still FAILS here. Non-binding lines -> 1.
+      let is_binding = str_contains "PHYSICS_BINDING_RECEIPT" receipt
+      let gates_ok = if sigok == 1 then (if chainok == 1 then (if linkok == 1 then (if dfok == 1 then (if innerok == 1 then 1 else 0) else 0) else 0) else 0) else 0
+      let physok =
+        if is_binding == 1 then
+          if gates_ok == 1 then physics_recompute receipt idx
+          else 1
+        else 1
 
-      let _ = print (cat ["line ", show idx, "  type=", rtype, "  sig=", show sigok, " chain=", show chainok, " link=", show linkok, " derived_from=", (if rtype == "INFERENCE" then show dfok else "n/a"), " inner_sigs=", (if is_mesh then show innerok else "n/a")])
+      let _ = print (cat ["line ", show idx, "  type=", rtype, "  sig=", show sigok, " chain=", show chainok, " link=", show linkok, " derived_from=", (if rtype == "INFERENCE" then show dfok else "n/a"), " inner_sigs=", (if is_mesh then show innerok else "n/a"), " physics=", (if is_binding then show physok else "n/a")])
 
       if sigok == 0 then
         let _ = print (cat ["==> FAIL at line ", show idx, ": bad signature"])
@@ -297,6 +694,9 @@ walk_lines lines idx expect_prev fact_blob lines_blob =
         0
       else if innerok == 0 then
         let _ = print (cat ["==> FAIL at line ", show idx, ": mesh inner co-signature failed (sigA/sigB over resolved FACT receipt)"])
+        0
+      else if physok == 0 then
+        let _ = print (cat ["==> FAIL at line ", show idx, ": physics residual unreproducible (binding receipt; a valid signature over a fabricated residual FAILS the physics re-run)"])
         0
       else
         -- this line is good; next line's prev must equal THIS line's (verified) chain_hash
