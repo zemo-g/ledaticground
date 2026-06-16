@@ -120,6 +120,19 @@ def parse(p):
         r["sog"] = gb(p, 46, 10) / 10; r["cog"] = gb(p, 112, 12) / 10
     elif typ == 4:
         r["lat"] = round(sx(gb(p, 107, 27), 27) / 600000, 5); r["lon"] = round(sx(gb(p, 79, 28), 28) / 600000, 5)
+        # Type-4 base-station GPS time-of-day. ADDITIVE: a new key on type-4 ONLY; the attest rollup
+        # hashes mmsi|type|lat|lon|ts, so the custody chain is byte-unaffected. Reads bits 61-77 —
+        # strictly LOWER than the lat read above (107-133), so it cannot throw where the existing
+        # code does not.
+        # *** Observed live 2026-06-16 on station 3669778: the broadcast TIME-OF-DAY (hh:mm:ss) is
+        # GPS-disciplined (matches wall clock to the second) but the DATE field is BOGUS (year 2006)
+        # — a common AIS base-station quirk (date from station config, time from GPS). So we extract
+        # ONLY the verified GPS time-of-day and NEVER assert the station's unreliable date. The
+        # consumer pairs tod_utc with its own (coarse) date to discipline a clock; that is the honest
+        # down-payment on rung E's time dimension. Sentinels (hour 24 / min,sec 60) -> omit. ***
+        hh = gb(p, 61, 5); mm = gb(p, 66, 6); ss = gb(p, 72, 6)
+        if hh < 24 and mm < 60 and ss < 60:
+            r["tod_utc"] = "%02d:%02d:%02dZ" % (hh, mm, ss)
     elif typ == 21:
         r["name"] = name6(p, 43, 20); r["lat"] = round(sx(gb(p, 192, 27), 27) / 600000, 5); r["lon"] = round(sx(gb(p, 164, 28), 28) / 600000, 5)
     elif typ == 5:
