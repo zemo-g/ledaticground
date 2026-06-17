@@ -95,6 +95,15 @@ main =
   -- by the driver. FAIL CLOSED to "0" (no silent pass). A 0-CADU pass is signed with cadu_ok=0.
   let cadu_ok = field_or "/tmp/lrpt_decode_cadu_ok.txt" "0"
 
+  -- DECODED-PAYLOAD PROVENANCE: which satellite + which onboard imager configuration the decode
+  -- recovered, from satdump's telemetry.json/dataset.json. The driver stages these ONLY when
+  -- cadu_ok=1 (a genuine decode); a noise/0-CADU pass reads PENDING_no_decode -- we NEVER assert an
+  -- instrument config recovered from a false-sync. instrument_set distinguishes a satellite flying
+  -- its PRIMARY vs BACKUP MSU-MR -- onboard spacecraft state, attested from our own off-air bytes.
+  let sat = field_or "/tmp/lrpt_decode_sat.txt" "PENDING_no_decode"
+  let instrument_id = field_or "/tmp/lrpt_decode_instrument_id.txt" "PENDING_no_decode"
+  let instrument_set = field_or "/tmp/lrpt_decode_instrument_set.txt" "PENDING_no_decode"
+
   -- beacon pulse (SHARED staging, by the shell wrapper, per contract C). HONEST PENDING
   -- fallback on any fetch failure -- the receipt is STILL signed + chained.
   let pulse_id = field_or "/tmp/lg_pulse_id.txt" "PENDING_beacon_unreachable"
@@ -122,7 +131,7 @@ main =
   -- v=2 FACT LRPT_DECODE_RECEIPT -- field order LOAD-BEARING (sig is over this EXACT string).
   -- A.3 honesty bit cadu_ok sits after n=; A.6 custody (code_sha256, input_sha256) between it
   -- and product_sha256=.
-  let receipt = join "|" ["LRPT_DECODE_RECEIPT", "v=2", "type=FACT", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["cadu_ok=", cadu_ok], cat ["code_sha256=", code_hash], cat ["input_sha256=", input_hash], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
+  let receipt = join "|" ["LRPT_DECODE_RECEIPT", "v=2", "type=FACT", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["cadu_ok=", cadu_ok], cat ["sat=", sat], cat ["instrument_id=", instrument_id], cat ["instrument_set=", instrument_set], cat ["code_sha256=", code_hash], cat ["input_sha256=", input_hash], cat ["product_sha256=", product_hash], cat ["prev=", prev], cat ["signer=", pk_hex]]
   let msg = string_to_bytes receipt
   let mlen = string_length_bytes receipt
   let sig = ed25519_sign seed msg mlen

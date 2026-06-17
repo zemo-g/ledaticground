@@ -97,7 +97,7 @@ the bit=`0`, **never dropped** — "received, check failed" is itself a fact.
 | `ORBCOMM_RECEIPT` | `crc_ok=<0\|1>` | CRC block-decode verdict (orbcomm_frame.rail) |
 | `RFML_RECEIPT` | `health=<ok\|degraded>` **and** `model=<tag>` | classifier health + EXACT model tag from the source row |
 | `RS41_DECODE_RECEIPT` | `rs_ok=<0\|1>` | Reed-Solomon block-decode verdict |
-| `LRPT_DECODE_RECEIPT` | `cadu_ok=<0\|1>` | satdump RS-deframe verdict: `1` iff CADU count>0 (a CADU is an RS-corrected CCSDS VCDU) **and** satdump exit=0; a 0-CADU / no-Viterbi-lock pass is still signed with `cadu_ok=0` |
+| `LRPT_DECODE_RECEIPT` | `cadu_ok=<0\|1>` | satdump RS-deframe verdict: `1` iff CADU count>0 (a CADU is an RS-corrected CCSDS VCDU) **and** satdump exit=0 **and** the independent `.decoded` discriminator did NOT call the pass noise/spur (`FLAT NOISE`/`\| noise \|`) — satdump false-syncs on noise and emits RS-shaped CADUs, so a noise pass is signed `cadu_ok=0` even with count>0. Plus DECODED-PAYLOAD PROVENANCE `sat=<satellite>\|instrument_id=<n>\|instrument_set=<primary\|backup>` from satdump's dataset/telemetry, staged **only** when `cadu_ok=1` and the telemetry is UNANIMOUS (else `PENDING_no_decode` — never an instrument config asserted from a false-sync). `instrument_set` = which onboard MSU-MR imager the spacecraft is flying, attested from our own off-air bytes (e.g. METEOR-M2-4 on its BACKUP imager) |
 | `ORBCOMM_POR_RECEIPT` | `crc_ok=<0\|1>` | proof-of-reception; `payload=NONE_proprietary` (no proprietary payload bytes emitted) |
 
 > `RFML_RECEIPT` carries **two** honesty fields in the honesty slot region:

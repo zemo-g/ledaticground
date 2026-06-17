@@ -158,6 +158,41 @@ if [ "$N_CADUS" -gt 0 ] && [ "$SIGNAL_NOISE" = "1" ]; then
     echo "LRPTDEC: $N_CADUS CADUs present but discriminator verdict=NOISE -> cadu_ok=0 (false-sync, not a decode)"
 fi
 
+# --- DECODED-PAYLOAD PROVENANCE: which satellite + onboard imager config the decode recovered ----
+# satdump writes dataset.json (satellite) + telemetry.json (per-frame onboard MSU-MR id/set). We
+# attest this ONLY on a genuine decode (cadu_ok=1) and only a value the telemetry agrees on
+# UNANIMOUSLY -- so we never assert an instrument config recovered from a noise false-sync, and
+# never a mixed/ambiguous one. A noise/0-CADU pass clears the staging -> the signer reads
+# PENDING_no_decode. instrument_set = PRIMARY vs BACKUP imager: onboard spacecraft state, attested
+# from our own off-air bytes (e.g. METEOR-M2-4 observed flying its BACKUP MSU-MR).
+rm -f /tmp/lrpt_decode_sat.txt /tmp/lrpt_decode_instrument_id.txt /tmp/lrpt_decode_instrument_set.txt
+# NOTE: literal python path (NOT $PY -- that is defined later in this script; under `set -u` a
+# forward-reference would ABORT the rollup before signing). This staging is best-effort: any
+# failure leaves the fields at PENDING_no_decode and never disturbs the core LRPT signing.
+if [ "$CADU_OK" = "1" ]; then
+    /opt/homebrew/bin/python3.11 - "$SATDIR" <<'PYEOF' 2>/dev/null || true
+import sys, json, os, collections
+sd = sys.argv[1]
+def stage(name, val):
+    if val is None or val == "": return
+    with open("/tmp/lrpt_decode_%s.txt" % name, "w") as f: f.write(str(val))
+try:
+    sat = json.load(open(os.path.join(sd, "dataset.json"))).get("satellite")
+    stage("sat", sat)
+except Exception:
+    pass
+try:
+    tm = json.load(open(os.path.join(sd, "telemetry.json")))
+    if isinstance(tm, list) and tm:
+        ids  = collections.Counter(r.get("msu_mr_id")  for r in tm if isinstance(r, dict))
+        sets = collections.Counter(r.get("msu_mr_set") for r in tm if isinstance(r, dict))
+        if len(ids)  == 1 and None not in ids:  stage("instrument_id",  next(iter(ids)))   # unanimous only
+        if len(sets) == 1 and None not in sets: stage("instrument_set", next(iter(sets)))
+except Exception:
+    pass
+PYEOF
+fi
+
 # --- Per-ledger CRITICAL SECTION (concurrency): the global /tmp/railrun.lock only serializes
 # compile+run, NOT our read-tail -> stage-prev -> append. Two drivers racing (e.g. a sweep
 # overlapping the next 5-min cron cycle, or a manual run racing cron) would read the same tail,
