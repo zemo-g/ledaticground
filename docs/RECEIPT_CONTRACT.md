@@ -120,7 +120,20 @@ product_hash = sha256_hex product
 
 The frames themselves are **not embedded** in the receipt (keeps the JSONL line small);
 the **source jsonl is the evidence** the digest commits to. A verifier holding the same
-source rows recomputes the identical digest. The per-kind contract product paths:
+source rows recomputes the identical digest.
+
+> **AIS canonical frame (widened 2026-06-17 — "sign what we receive").** Each AIS per-frame
+> string is now the **full decoded message**: every field as `key=value`, keys **sorted**,
+> `str()` of each json-loaded value exactly as the source emitted it (no float math), then the
+> scrubbed unix `ts` appended — e.g.
+> `cog=45.6|hdg=270|lat=42.1|lon=-83.1|mmsi=316001|navstat=1|sog=12.3|type=1|ts=<unix>`.
+> So `product_sha256` commits **every field the decoder emits** — destination, draught, IMO,
+> nav-status, true-heading, AtoN `off_position`, … — automatically and for any future field,
+> not the old hand-picked `mmsi|type|lat|lon|ts` subset (which signed less than the node
+> received). Still deterministic: sorted keys + verbatim source values → a verifier with the
+> same rows recomputes the identical frame. Forward-only (older receipts used the narrow form).
+
+The per-kind contract product paths:
 
 | KIND | `/tmp` product path |
 |---|---|

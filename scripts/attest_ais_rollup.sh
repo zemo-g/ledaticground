@@ -146,10 +146,12 @@ with open(src, 'r') as f:
         if not isinstance(m, dict):
             m = o
         mmsi = m.get('mmsi', '')
-        typ  = m.get('type', '')
-        lat  = m.get('lat', '')
-        lon  = m.get('lon', '')
-        rows.append((ts, str(mmsi), str(typ), str(lat), str(lon)))
+        # Carry the FULL decoded msg so the canonical frame (below) commits EVERY field the decoder
+        # emits -- "sign what we receive" -- not a hand-picked mmsi|type|lat|lon subset. The decoder
+        # enrichment (Type-5 dest/draught/imo, Type-1 navstat/hdg/rot, Type-21 off_position, ...) is
+        # thereby covered by product_sha256 automatically, now and for any future field, with no
+        # further rollup change.
+        rows.append((ts, str(mmsi), m))
 
 if not rows:
     print('NOROWS')
@@ -158,8 +160,12 @@ if not rows:
 # deterministic order: (ts, mmsi)
 rows.sort(key=lambda r: (r[0], r[1]))
 lines = []
-for ts, mmsi, typ, lat, lon in rows:
-    lines.append('mmsi=%s|type=%s|lat=%s|lon=%s|ts=%s' % (mmsi, typ, lat, lon, ts))
+for ts, mmsi, m in rows:
+    # canonical per-frame string = every decoded field as sorted key=value (deterministic: sorted
+    # keys, str() of each json-loaded value exactly as the source emitted it, no float math), then
+    # the scrubbed unix ts. A verifier with the same source rows recomputes byte-identical frames.
+    frame = '|'.join('%s=%s' % (k, m[k]) for k in sorted(m)) + ('|ts=%s' % ts)
+    lines.append(frame)
 with open(frames_path, 'w') as f:
     f.write('\n'.join(lines))
 bstart = rows[0][0]
