@@ -132,15 +132,30 @@ if [ -f "$MARKER" ]; then
     if [ -n "$E" ]; then SD_EXIT="$E"; fi
 fi
 
+# Anti-false-sync discriminator cross-check: satdump locks onto FLAT NOISE and still emits
+# RS-shaped CADUs (observed: a "1023-CADU" pass whose own waterfall verdict reads FLAT NOISE).
+# The .decoded marker carries an INDEPENDENT waterfall+decode verdict (peak_snr / drift /
+# SYNC_LOCK / lines). If that verdict calls the pass noise, the CADUs are a false-sync artifact,
+# not a weather decode -- signing cadu_ok=1 over it would assert a decode that did not happen
+# (the no-synthetic-evidence line). Detect the discriminator's noise verdict tokens.
+SIGNAL_NOISE=0
+if [ -f "$MARKER" ]; then
+    if grep -qE "FLAT NOISE|\| noise \|" "$MARKER" 2>/dev/null; then SIGNAL_NOISE=1; fi
+fi
+
 # cadu_ok (A.3 honesty bit): 1 iff RS-corrected CADUs were produced (count>0) AND satdump
-# CONFIRMED a clean exit (exit=0). FAIL CLOSED otherwise — including a MISSING marker
-# (SD_EXIT=PENDING): pull_iq.sh writes the .decoded marker LAST, so a crash between satdump and
-# the marker leaves CADUs on disk with no exit proof; per contract A.3 the verdict bit stays 0
-# (the frames are NOT lost — product_sha256 + n>0 still commit them; only the unverified
-# clean-decode verdict is withheld). A present marker with nonzero exit also yields 0.
+# CONFIRMED a clean exit (exit=0) AND the independent discriminator did NOT call the pass noise.
+# FAIL CLOSED otherwise — including a MISSING marker (SD_EXIT=PENDING): pull_iq.sh writes the
+# .decoded marker LAST, so a crash between satdump and the marker leaves CADUs on disk with no
+# exit proof; per contract A.3 the verdict bit stays 0 (the frames are NOT lost — product_sha256
+# + n>0 still commit them; only the unverified clean-decode verdict is withheld). A present
+# marker with nonzero exit, OR a noise verdict over false-synced CADUs, also yields 0.
 CADU_OK=0
-if [ "$N_CADUS" -gt 0 ] && [ "$SD_EXIT" = "0" ]; then
+if [ "$N_CADUS" -gt 0 ] && [ "$SD_EXIT" = "0" ] && [ "$SIGNAL_NOISE" = "0" ]; then
     CADU_OK=1
+fi
+if [ "$N_CADUS" -gt 0 ] && [ "$SIGNAL_NOISE" = "1" ]; then
+    echo "LRPTDEC: $N_CADUS CADUs present but discriminator verdict=NOISE -> cadu_ok=0 (false-sync, not a decode)"
 fi
 
 # --- Per-ledger CRITICAL SECTION (concurrency): the global /tmp/railrun.lock only serializes
