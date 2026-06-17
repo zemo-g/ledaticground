@@ -67,7 +67,7 @@ RAILRUN="$REPO/scripts/railrun.sh"
 # These ranges are asserted below (anchor-line check) so a future edit that shifts the block makes
 # the guard fail loud rather than slice the wrong text.
 DR_FILE="$REPO/src/doppler_range.rail";   DR_LO=44;  DR_HI=251
-BA_FILE="$REPO/src/binding_attest.rail";  BA_LO=80;  BA_HI=257
+BA_FILE="$REPO/src/binding_attest.rail";  BA_LO=81;  BA_HI=258
 VF_FILE="$REPO/src/verify.rail";          VF_LO=269; VF_HI=442
 
 # FIXED FIXTURE -- the rollup --synth defaults, frozen here for determinism.

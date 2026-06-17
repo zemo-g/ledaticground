@@ -56,6 +56,7 @@ ALT_KM="0.18"
 FC_HZ="137100000.0"
 TOL_HZ="50"
 REPRO_TOL_HZ="25"
+RMS_TOL_HZ="100"   # physics_ok gate: fit RMS over the WHOLE pass (right orbit ~few Hz; wrong orbit ~1000+ Hz)
 # A WRONG TLE for the negative test: a DIFFERENT NOAA bird (NOAA-15, NORAD 25338) whose orbit does
 # NOT produce the measured curve. Bundled, clearly labeled -- never fetched.
 WRONG_TLE_L1="1 25338U 98030A   26166.51000000  .00000061  00000+0  44000-4 0  9990"
@@ -78,6 +79,7 @@ while [ $# -gt 0 ]; do
         --fc-hz) FC_HZ="${2:-}"; shift 2 ;;
         --tol-hz) TOL_HZ="${2:-}"; shift 2 ;;
         --repro-tol-hz) REPRO_TOL_HZ="${2:-}"; shift 2 ;;
+        --rms-tol-hz) RMS_TOL_HZ="${2:-}"; shift 2 ;;
         *) echo "BIND_ERR: unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -328,6 +330,15 @@ case "$T_EVAL_UNIX" in ''|*[!0-9]*) echo "BIND_ERR: bad T_EVAL_UNIX=$T_EVAL_UNIX
 [ -z "$ESTIMATOR" ] && ESTIMATOR="centroid"
 [ -z "$MEAS_CENTROID_HZ" ] && MEAS_CENTROID_HZ="0.0"
 
+# RESIDUAL_RMS_HZ (fit RMS over the WHOLE pass) -> integer Hz, the physics_ok gate. FAIL-SAFE:
+# missing/garbage RMS -> 999999 (huge) -> physics_ok=0 (never a false pass when we can't measure it).
+RRMS="$(getv RESIDUAL_RMS_HZ)"
+case "$RRMS" in
+    ''|*[!0-9.]*) RESIDUAL_RMS_INT="999999" ;;
+    *) RESIDUAL_RMS_INT="$(awk "BEGIN{printf \"%d\", $RRMS+0.5}")" ;;
+esac
+case "$RESIDUAL_RMS_INT" in ''|*[!0-9]*) RESIDUAL_RMS_INT="999999" ;; esac
+
 # --- digests: tle_sha256 (the EXACT element set the prediction used) + meas_sha256 (the measured
 #     track product). Both bind precisely what this receipt rests on.
 TLE_SHA256="$(printf '%s\n%s\n' "$PRED_L1" "$PRED_L2" | shasum -a 256 | awk '{print $1}')"
@@ -366,6 +377,8 @@ stagef /tmp/binding_meas_centroid_hz.txt "$MEAS_CENTROID_HZ"
 stagef /tmp/binding_estimator.txt      "$ESTIMATOR"
 stagef /tmp/binding_tol_hz.txt         "$TOL_HZ"
 stagef /tmp/binding_repro_tol_hz.txt   "$REPRO_TOL_HZ"
+stagef /tmp/binding_residual_rms_hz.txt "$RESIDUAL_RMS_INT"
+stagef /tmp/binding_rms_tol_hz.txt     "$RMS_TOL_HZ"
 stagef /tmp/binding_tle_sha256.txt     "$TLE_SHA256"
 stagef /tmp/binding_meas_sha256.txt    "$MEAS_SHA256"
 stagef /tmp/binding_sat.txt            "$PRED_SAT"

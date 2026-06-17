@@ -29,8 +29,9 @@
 -- and compare to the measured centroid at that point. residual_hz = |predicted+off - measured|.
 -- This is what Wave C re-runs (a cheap, deterministic single-point recompute, NOT a re-search).
 --
--- residual_hz / tol_hz / repro_tol_hz are INTEGER Hz (float_to_int). physics_ok=1 iff
--- |residual_hz| <= tol_hz, else 0.
+-- residual_hz / tol_hz / residual_rms_hz / rms_tol_hz / repro_tol_hz are INTEGER Hz (float_to_int).
+-- physics_ok=1 iff residual_rms_hz <= rms_tol_hz (the RMS-over-pass gate -- the single point is
+-- fittable by a wrong orbit, so it is NOT the gate; residual_hz is the verifier repro anchor).
 --
 -- SEPARATE INFERENCE LEDGER FAMILY (sec B.6): appends data/physics_binding_receipts.jsonl
 -- (chained v=2), writes legacy single-object data/binding_receipt.json, advances
@@ -302,6 +303,16 @@ main =
   let tol_hz = parse_float tol_hz_str
   -- repro_tol_hz is the verifier's reproduction band -- echoed verbatim (no Rail math on it here).
 
+  -- RMS-over-pass + its gate (the ROBUST orbit discriminator). The single-point residual at the
+  -- eval point is FITTABLE by a wrong orbit: the 2-param fit (t_shift+const_off) absorbs the error,
+  -- and at TCA the Doppler is ~0 for ANY orbit -- so a wrong orbit can land a small single-point
+  -- residual (grounding finding 2026-06-17). The FIT RMS over the whole pass is the real signal
+  -- (wrong orbit ~1000+ Hz vs right orbit ~few Hz). physics_ok gates on the RMS; the single-point
+  -- residual_hz stays in the receipt as the verifier's reproducibility anchor. (The verifier-side
+  -- RMS recompute is a tracked rung; today verify.rail reproduces the single-point.)
+  let residual_rms_hz = float_to_int (parse_float (field_or "/tmp/binding_residual_rms_hz.txt" "0"))
+  let rms_tol_hz = float_to_int (parse_float (field_or "/tmp/binding_rms_tol_hz.txt" "100"))
+
   -- ===== THE SINGLE-POINT PHYSICS RECOMPUTE (one SGP4 Doppler eval, NOT a 240-step search) =====
   -- Build the element/observer state from the CLAIMED geo + TLE + fc, then evaluate the SGP4
   -- Doppler at t_eval_unix. predicted_total = predicted_dop + const_off_hz (the committed
@@ -323,8 +334,9 @@ main =
   -- INTEGER Hz on the wire.
   let residual_hz = float_to_int residual_f
   let tol_hz_int = float_to_int tol_hz
-  -- physics_ok=1 iff |residual_hz| <= tol_hz (a FAILED bind is RECORDED with 0, never dropped).
-  let physics_ok = if residual_hz <= tol_hz_int then 1 else 0
+  -- physics_ok gates on the RMS-over-pass (robust), NOT the fittable single point: 1 iff
+  -- residual_rms_hz <= rms_tol_hz. A FAILED bind is RECORDED with 0, never dropped.
+  let physics_ok = if residual_rms_hz <= rms_tol_hz then 1 else 0
 
   -- ===== METADATA the rollup staged (echoed verbatim; never fabricated) =====
   -- claimed_geo carries the _SYNTH suffix (the observer is the synthetic placeholder); rollup
@@ -371,7 +383,7 @@ main =
     -- post-`n` field (matches the A.2 INFERENCE walk). tol_hz (NOT tolerance_hz); repro_tol_hz is
     -- a DISTINCT key. residual_hz/tol_hz/repro_tol_hz are INTEGER Hz. t_shift_s + const_off_hz are
     -- the MANDATORY committed alignment (so the verifier does a single-point recompute, not a search).
-    let receipt = join "|" ["PHYSICS_BINDING_RECEIPT", "v=2", "type=INFERENCE", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["derived_from=", derived_from], cat ["physics_ok=", show physics_ok], cat ["estimator=", estimator], cat ["residual_hz=", show residual_hz], cat ["tol_hz=", show tol_hz_int], cat ["repro_tol_hz=", repro_tol_hz_str], cat ["sat=", sat], cat ["fc_hz=", fc_hz_int_str], cat ["orbit=", orbit], cat ["tle_sha256=", tle_sha256], cat ["meas_sha256=", meas_sha256], cat ["t_shift_s=", t_shift_s], cat ["const_off_hz=", const_off_hz_str], cat ["claimed_geo=", claimed_geo], "note=binding_mechanism_validated_location_unattested", cat ["product_sha256=", meas_sha256], cat ["prev=", prev], cat ["signer=", pk_hex]]
+    let receipt = join "|" ["PHYSICS_BINDING_RECEIPT", "v=2", "type=INFERENCE", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["derived_from=", derived_from], cat ["physics_ok=", show physics_ok], cat ["estimator=", estimator], cat ["residual_hz=", show residual_hz], cat ["tol_hz=", show tol_hz_int], cat ["residual_rms_hz=", show residual_rms_hz], cat ["rms_tol_hz=", show rms_tol_hz], cat ["repro_tol_hz=", repro_tol_hz_str], cat ["sat=", sat], cat ["fc_hz=", fc_hz_int_str], cat ["orbit=", orbit], cat ["tle_sha256=", tle_sha256], cat ["meas_sha256=", meas_sha256], cat ["t_shift_s=", t_shift_s], cat ["const_off_hz=", const_off_hz_str], cat ["claimed_geo=", claimed_geo], "note=binding_mechanism_validated_location_unattested", cat ["product_sha256=", meas_sha256], cat ["prev=", prev], cat ["signer=", pk_hex]]
     let msg = string_to_bytes receipt
     let mlen = string_length_bytes receipt
     let sig = ed25519_sign seed msg mlen
@@ -386,8 +398,9 @@ main =
 
     let _ = print (cat ["PREDICT  sgp4_dop=", show_float predicted_dop, " + const_off=", const_off_hz_str, " -> predicted_total=", show_float predicted_total, " Hz @ t_eval_unix=", field_or "/tmp/binding_t_eval_unix.txt" "0.0"])
     let _ = print (cat ["MEASURE  centroid=", show_float meas_centroid_hz, " Hz  (estimator=", estimator, ")"])
-    let _ = print (cat ["RESIDUAL ", show residual_hz, " Hz  tol=", show tol_hz_int, " Hz  repro_tol=", repro_tol_hz_str, " Hz"])
-    let _ = print (cat ["PHYSICS  physics_ok=", show physics_ok, "  (1 iff |residual_hz| <= tol_hz; a FAILED bind is RECORDED with 0, never dropped)"])
+    let _ = print (cat ["RESIDUAL ", show residual_hz, " Hz  tol=", show tol_hz_int, " Hz  repro_tol=", repro_tol_hz_str, " Hz  (single-point repro anchor)"])
+    let _ = print (cat ["PHYSOK   residual_rms_hz=", show residual_rms_hz, " Hz  rms_tol=", show rms_tol_hz, " Hz  -> physics_ok=", show physics_ok, " (gates on RMS-over-pass)"])
+    let _ = print (cat ["PHYSICS  physics_ok=", show physics_ok, "  (1 iff residual_rms_hz <= rms_tol_hz, the RMS-over-pass gate; a FAILED bind is RECORDED with 0, never dropped)"])
     let _ = print (cat ["DERIVED  derived_from=", derived_from, "  (iq_capture FACT chain_hash)"])
     let _ = print (cat ["RECEIPT  ", receipt])
     let _ = print (cat ["SIG      ", sig_hex])

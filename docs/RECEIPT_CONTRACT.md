@@ -172,7 +172,7 @@ Two new signed pipe fields appear in **EVERY FACT receipt**, inserted **between*
 One merged, load-bearing field list (`type=INFERENCE`):
 
 ```
-PHYSICS_BINDING_RECEIPT|v=2|type=INFERENCE|node=<id>|station=<sta>|band=Doppler-binding-137.1MHz|geo=<geo>|pulse_id=<pid>|pulse_hex=<vh16>|batch_start=<unix>|batch_end=<unix>|n=<windows>|derived_from=<fact_chain_hash>|physics_ok=<0|1>|estimator=<centroid|peak>|residual_hz=<int>|tol_hz=<int>|repro_tol_hz=<int>|sat=<NOAA-19>|fc_hz=<int>|orbit=<norad@epoch>|tle_sha256=<64hex>|meas_sha256=<64hex>|t_shift_s=<float>|const_off_hz=<float>|claimed_geo=<lat_lon|..._SYNTH>|note=binding_mechanism_validated_location_unattested|product_sha256=<64hex>|prev=<prev_chain_hash>|signer=<pk_hex>
+PHYSICS_BINDING_RECEIPT|v=2|type=INFERENCE|node=<id>|station=<sta>|band=Doppler-binding-137.1MHz|geo=<geo>|pulse_id=<pid>|pulse_hex=<vh16>|batch_start=<unix>|batch_end=<unix>|n=<windows>|derived_from=<fact_chain_hash>|physics_ok=<0|1>|estimator=<centroid|peak>|residual_hz=<int>|tol_hz=<int>|residual_rms_hz=<int>|rms_tol_hz=<int>|repro_tol_hz=<int>|sat=<NOAA-19>|fc_hz=<int>|orbit=<norad@epoch>|tle_sha256=<64hex>|meas_sha256=<64hex>|t_shift_s=<float>|const_off_hz=<float>|claimed_geo=<lat_lon|..._SYNTH>|note=binding_mechanism_validated_location_unattested|product_sha256=<64hex>|prev=<prev_chain_hash>|signer=<pk_hex>
 ```
 
 - `derived_from` is the **first post-`n` field** (matches the A.2 INFERENCE walk).
@@ -186,7 +186,16 @@ PHYSICS_BINDING_RECEIPT|v=2|type=INFERENCE|node=<id>|station=<sta>|band=Doppler-
 - `geo` stays the literal `PENDING_needs_GPS_PPS`. `claimed_geo` carries the `_SYNTH` suffix
   when the observer is the placeholder (synthetic) location. **Numeric `geo_lat` / `geo_lon`
   are staged in `/tmp` ONLY, never committed.**
-- `physics_ok=1` means "**consistent within `tol_hz`**", **NEVER "verified true."**
+- `physics_ok=1` gates on **`residual_rms_hz <= rms_tol_hz`** — the fit RMS over the WHOLE pass
+  (the robust right-vs-wrong-orbit discriminator: right orbit ~few Hz, wrong orbit ~1000+ Hz).
+  It does **NOT** gate on the single-point `residual_hz`: at TCA the Doppler is ~0 for any orbit
+  and the 2-param fit (`t_shift`+`const_off`) absorbs a wrong orbit's error into a small single
+  point — so a single point is FITTABLE and not a discriminator (grounding finding 2026-06-17).
+  `residual_hz` is retained as the **verifier's single-point reproducibility anchor** (verify.rail
+  recomputes it). `physics_ok=1` means "**the measured Doppler fits the claimed orbit over the pass
+  within `rms_tol_hz`**", **NEVER "verified true."** *(Verifier-side independent RMS recompute is a
+  tracked rung; today verify.rail independently reproduces the single point + the emitter gates
+  physics_ok on the RMS.)*
 - Register `PHYSICS_BINDING_RECEIPT` in the A.5 INFERENCE kind set.
 
 ### A.8 `MESH_WITNESS_RECEIPT` (Wave D)
