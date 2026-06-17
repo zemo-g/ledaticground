@@ -3,6 +3,12 @@
 RN=/Users/ledaticempire/projects/rail/rail_native; GD=/Users/ledaticempire/projects/ledaticground
 PY=/opt/homebrew/bin/python3.11; cd "$GD"; pass=0; fail=0
 ck(){ if echo "$2"|grep -q "$3"; then echo "  PASS $1"; pass=$((pass+1)); else echo "  FAIL $1"; fail=$((fail+1)); fi; }
+# Single-flight + coordinate with the live attest cron: refresh.sh's attest section flock-DEFERS on
+# this same lock, so the cron's rollups (attest_ais / attest_lrpt) cannot race the selftest's
+# live-ledger stanzas -- the flaky-different-failure-each-run source the grounded review found.
+# flock auto-releases on exit/death, so a crashed selftest NEVER wedges the live attestation.
+exec 9>/tmp/ledaticground_attest.lock 2>/dev/null
+flock -w 120 9 2>/dev/null || echo "selftest: attest lock held >120s (concurrent run or live attest) -- proceeding without it"
 echo "ledaticground selftest"
 o=$(perl -e 'alarm 40;exec @ARGV' $RN run src/fft.rail 2>/dev/null);                     ck "fft  tone->bin1=4" "$o" "bin 1: 4"
 echo "selftest-product" > /tmp/apt_rail.out
