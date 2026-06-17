@@ -91,7 +91,15 @@ def flag_of(mmsi):
 
 
 def clean_ts(v):
-    """Return an int unix ts if scrubbed-valid, else None (clean_ts discipline)."""
+    """Return an int unix ts if scrubbed-valid, else None (clean_ts discipline). Accepts a unix
+    int (sanitized feed) OR an ISO-8601 'Z' string (the live node emits e.g. 2026-06-17T22:00:10Z)
+    -- so this public copy runs on the live nested feed, not only a pre-transformed one."""
+    if isinstance(v, str):
+        try:
+            import datetime as _dt
+            v = int(_dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            return None
     if not isinstance(v, int):
         return None
     if v < MIN_TS:
@@ -99,10 +107,21 @@ def clean_ts(v):
     return v
 
 
+VOY_KEYS = ("dest", "draught_m", "shiptype", "length_m", "beam_m", "imo", "callsign")
+NAVSTAT = {0: "underway", 1: "anchored", 2: "not-under-command", 3: "restricted-maneuver",
+           4: "constrained-by-draught", 5: "moored", 6: "aground", 7: "fishing", 8: "sailing"}
+
+
 def load_fixes(src):
-    """Read ais.jsonl -> {mmsi: [(ts:int, lat:float, lon:float, sog, cog), ...]} for type 1/2/3.
-    Also return the raw file bytes' sha256 (the fact-chain anchor) and the total frame count."""
+    """Read ais.jsonl -> {mmsi: [(ts:int, lat:float, lon:float, sog, cog), ...]} for type 1/2/3,
+    plus the joins surfaced from the enriched decoder: names (type 5), voyage (type-5
+    dest/draught/ship-type/dims/IMO), and declared nav-status (type 1/2/3). Also return the raw
+    file bytes' sha256 (the fact-chain anchor) and the total frame count. (ts/lat/lon/fields read
+    from the message object whether flat or nested under 'msg'.)"""
     by = {}
+    names = {}
+    voyage = {}
+    navstat = {}
     n_frames = 0
     raw = open(src, "rb").read()
     src_sha = hashlib.sha256(raw).hexdigest()
@@ -115,20 +134,33 @@ def load_fixes(src):
         except Exception:
             continue
         n_frames += 1
-        if o.get("type") not in POS_TYPES:
+        ts = o.get("ts")
+        m = o.get("msg") if isinstance(o.get("msg"), dict) else o   # tolerate flat OR nested
+        typ = m.get("type")
+        if typ == 5:
+            if m.get("name"):
+                names[m.get("mmsi")] = str(m["name"]).strip()
+            v = {k: m[k] for k in VOY_KEYS if m.get(k) is not None}
+            if v:
+                voyage[m.get("mmsi")] = v                            # last type-5 per mmsi wins (most recent voyage)
             continue
-        t = clean_ts(o.get("ts"))
-        lat = o.get("lat")
-        lon = o.get("lon")
+        if typ not in POS_TYPES:
+            continue
+        if m.get("navstat") is not None:
+            navstat[m.get("mmsi")] = m["navstat"]                    # declared state (latest wins)
+        t = clean_ts(ts)
+        lat = m.get("lat")
+        lon = m.get("lon")
         if t is None or lat is None or lon is None:
             continue
-        by.setdefault(o.get("mmsi"), []).append(
-            (t, float(lat), float(lon), o.get("sog"), o.get("cog")))
-    return by, src_sha, n_frames
+        by.setdefault(m.get("mmsi"), []).append(
+            (t, float(lat), float(lon), m.get("sog"), m.get("cog")))
+    return by, names, voyage, navstat, src_sha, n_frames
 
 
-def summarize(mmsi, fixes):
-    """Build the per-vessel summary + the time-ordered track. fixes = list of tuples."""
+def summarize(mmsi, fixes, name=None, voy=None, ns=None):
+    """Build the per-vessel summary + the time-ordered track. fixes = list of tuples.
+    name/voy/ns are the enriched joins (type-5 name + voyage, type-1/3 declared nav-status)."""
     # ts-sorted, deduped on identical (ts) keeping first; pts is the cleaned ordered list.
     pts = sorted(fixes, key=lambda r: r[0])
     if not pts:
@@ -152,7 +184,7 @@ def summarize(mmsi, fixes):
     summary = {
         "mmsi": mmsi,
         "flag": flag_of(mmsi),
-        "name": "",                      # type 1/2/3 carry no name; resolved from type-5/census elsewhere
+        "name": name or "",              # joined from the type-5 static (enriched decoder)
         "fixes": len(pts),
         "net_km": round(net_km, 3),
         "bearing": round(brg, 1) if brg is not None else None,
@@ -160,6 +192,10 @@ def summarize(mmsi, fixes):
         "last": t1,
         "status": status,
     }
+    if voy:
+        summary.update(voy)              # dest, draught_m, shiptype, length_m, beam_m, imo, callsign (when present)
+    if ns is not None:
+        summary["navstatus"] = NAVSTAT.get(ns, "code-%d" % ns)   # the vessel's DECLARED state
     return summary, track, t0, t1
 
 
@@ -167,12 +203,12 @@ def main():
     src = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "ais.jsonl")
     outdir = os.path.dirname(os.path.abspath(src))
 
-    by, src_sha, n_frames = load_fixes(src)
+    by, names, voyage, navstat, src_sha, n_frames = load_fixes(src)
 
     summaries = []   # legacy summary rows (transits.jsonl)
     vessels = []     # canonical product rows (vessels.jsonl) = summary + track
     for mmsi in sorted(by.keys()):
-        r = summarize(mmsi, by[mmsi])
+        r = summarize(mmsi, by[mmsi], names.get(mmsi), voyage.get(mmsi), navstat.get(mmsi))
         if r is None:
             continue
         summary, track, t0, t1 = r
