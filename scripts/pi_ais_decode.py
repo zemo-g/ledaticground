@@ -69,6 +69,12 @@ def gb(p, a, n):
         v = (v << 1) | p[a + i]
     return v
 
+def gb_safe(p, a, n):
+    """gb() that returns None if the field runs past the payload. ADDITIVE-field reads use this so
+    a short frame can NEVER raise an IndexError where the original decode path did not -- the
+    enrichment fields are simply omitted, the validated existing fields always emit."""
+    return gb(p, a, n) if (a + n) <= len(p) else None
+
 def sx(v, n):
     return v - (1 << n) if v & (1 << (n - 1)) else v
 
@@ -115,9 +121,25 @@ def parse(p):
     if typ in (1, 2, 3):
         r["lat"] = round(sx(gb(p, 89, 27), 27) / 600000, 5); r["lon"] = round(sx(gb(p, 61, 28), 28) / 600000, 5)
         r["sog"] = gb(p, 50, 10) / 10; r["cog"] = gb(p, 116, 12) / 10
+        # ADDITIVE (within the 168-bit Type 1/2/3 payload; gb_safe-guarded + try-wrapped so a new
+        # field can never disturb the validated lat/lon/sog/cog above). The vessel's DECLARED state.
+        try:
+            ns = gb_safe(p, 38, 4)
+            if ns is not None and ns != 15: r["navstat"] = ns        # 0 underway,1 anchored,5 moored,6 aground,8 sailing
+            rot = gb_safe(p, 42, 8)
+            if rot is not None and rot != 128: r["rot"] = sx(rot, 8)  # 128 = not available
+            hd = gb_safe(p, 128, 9)
+            if hd is not None and hd != 511: r["hdg"] = hd            # true heading; 511 = not available
+        except Exception:
+            pass
     elif typ in (18, 19):
         r["lat"] = round(sx(gb(p, 85, 27), 27) / 600000, 5); r["lon"] = round(sx(gb(p, 57, 28), 28) / 600000, 5)
         r["sog"] = gb(p, 46, 10) / 10; r["cog"] = gb(p, 112, 12) / 10
+        try:
+            hd = gb_safe(p, 124, 9)
+            if hd is not None and hd != 511: r["hdg"] = hd            # Class B true heading
+        except Exception:
+            pass
     elif typ == 4:
         r["lat"] = round(sx(gb(p, 107, 27), 27) / 600000, 5); r["lon"] = round(sx(gb(p, 79, 28), 28) / 600000, 5)
         # Type-4 base-station GPS time-of-day. ADDITIVE: a new key on type-4 ONLY; the attest rollup
@@ -135,8 +157,54 @@ def parse(p):
             r["tod_utc"] = "%02d:%02d:%02dZ" % (hh, mm, ss)
     elif typ == 21:
         r["name"] = name6(p, 43, 20); r["lat"] = round(sx(gb(p, 192, 27), 27) / 600000, 5); r["lon"] = round(sx(gb(p, 164, 28), 28) / 600000, 5)
+        # ADDITIVE AtoN status (Type 21 >= 272 bits; guarded). off_position=1 means the aid is
+        # reporting itself DRIFTED off its charted spot -- a live navigation-hazard signal, and AtoN
+        # is ~75% of our traffic so this is the highest-volume latent field we own.
+        try:
+            at = gb_safe(p, 38, 5)
+            if at is not None and at != 0: r["aton_type"] = at
+            op = gb_safe(p, 259, 1)
+            if op is not None: r["off_position"] = op
+            va = gb_safe(p, 269, 1)
+            if va is not None: r["virtual"] = va                     # 1 = virtual aid (no physical object on station)
+        except Exception:
+            pass
     elif typ == 5:
         r["name"] = name6(p, 112, 20)
+        # ADDITIVE Type-5 voyage block (424-bit payload; each read gb_safe/name6-guarded + try-wrapped).
+        # The single most commercially valuable AIS content for Great Lakes logistics, decoded-then-
+        # discarded until now. DESTINATION = where the hull is bound; DRAUGHT = laden vs ballast (cargo
+        # state); IMO = stable hull identity across MMSI re-flag (a durable PAOS corpus key). Self-
+        # reported by the vessel -> attesting proves "broadcast + CRC-valid at our node", never truth.
+        try:
+            imo = gb_safe(p, 40, 30)
+            if imo: r["imo"] = imo
+            cs = name6(p, 70, 7)
+            if cs: r["callsign"] = cs
+            st = gb_safe(p, 232, 8)
+            if st: r["shiptype"] = st
+            bo = gb_safe(p, 240, 9); st_ = gb_safe(p, 249, 9); po = gb_safe(p, 258, 6); sb = gb_safe(p, 264, 6)
+            if bo is not None and st_ is not None and po is not None and sb is not None and (bo + st_ + po + sb) > 0:
+                r["length_m"] = bo + st_; r["beam_m"] = po + sb
+            emo = gb_safe(p, 274, 4); eda = gb_safe(p, 278, 5); ehr = gb_safe(p, 283, 5); emi = gb_safe(p, 288, 6)
+            if emo:
+                r["eta"] = "%02d-%02dT%02d:%02dZ" % (emo, eda or 0, ehr or 0, emi or 0)
+            dr = gb_safe(p, 294, 8)
+            if dr: r["draught_m"] = dr / 10.0
+            dest = name6(p, 302, 20)
+            if dest: r["dest"] = dest
+        except Exception:
+            pass
+    elif typ == 8:
+        # ADDITIVE: emit ONLY the application id (DAC/FI) so we can SEE what our base stations
+        # (MID-369/367 US-gov senders) broadcast. We do NOT decode the binary payload content yet --
+        # so NO water-level/met claim is made; content stays honestly unknown until we read a real FI.
+        try:
+            dac = gb_safe(p, 40, 10); fi = gb_safe(p, 50, 6)
+            if dac is not None: r["dac"] = dac
+            if fi is not None: r["fi"] = fi
+        except Exception:
+            pass
     return r
 
 def main():
@@ -145,10 +213,12 @@ def main():
     for lo, hi in roughness_bursts(s):
         for payload in frames_in_window(s, lo, hi):
             seen[tuple(payload)] = payload
-    # emit one JSON per distinct message; dedup repeats of the same source to latest content
+    # emit one JSON per distinct (mmsi, message-type); keying by (mmsi,type) -- not mmsi alone --
+    # so a vessel that sends BOTH a Type-5 static (name/dest/draught) and a Type-1 position in the
+    # same cycle keeps BOTH (the old mmsi-only key dropped one, breaking the static<->track join).
     out = {}
     for payload in seen.values():
-        r = parse(payload); out[r["mmsi"]] = r
+        r = parse(payload); out[(r["mmsi"], r["type"])] = r
     for r in out.values():
         print(json.dumps(r))
 
