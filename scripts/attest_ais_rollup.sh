@@ -57,6 +57,23 @@ if [ ! -f "$AIS_SRC" ]; then
     exit 0
 fi
 
+# --- Serialize the WHOLE rollup (cursor-read -> sign+append -> cursor-advance) ----------------
+# This sequence MUST be atomic against a concurrent rollup. Two overlapping runs would each read
+# the SAME tail chain_hash for prev=, both sign, and both append -> a chain FORK (the live AIS
+# ledger accumulated 16 such fan-breaks before this lock existed, when a slow backlog sign
+# overlapped the next 5-min cron tick). flock auto-releases on exit. NOTE: a BARE `flock` is a
+# silent no-op under launchd's minimal PATH (Homebrew, where flock lives, is off it) -- resolve
+# the absolute path. If flock is genuinely unavailable, proceed UNLOCKED (signing must never be
+# disabled; refresh.sh's estate lock is the outer backstop) rather than skip and sign nothing.
+LEDGER_LOCK="/tmp/ledaticground_ais_ledger.lock"
+FLOCK_BIN="$(command -v flock 2>/dev/null || true)"
+[ -x "$FLOCK_BIN" ] || FLOCK_BIN="/opt/homebrew/bin/flock"
+[ -x "$FLOCK_BIN" ] || FLOCK_BIN=""
+if [ -n "$FLOCK_BIN" ]; then
+    exec 8>"$LEDGER_LOCK"
+    "$FLOCK_BIN" -w 120 8 || { echo "ROLLUP: ledger lock busy >120s -- another signer is advancing it; skip (exit 0)"; exit 0; }
+fi
+
 # --- Determine the cursor (last signed batch_end) -------------------------------------------
 # Prefer the persisted cursor file; if missing, derive it from the ledger tail's batch_end so a
 # fresh checkout that already has a ledger does not re-sign everything. Empty -> 0 (genesis).
@@ -185,6 +202,18 @@ if line:
         PREV="$TAILHASH"
     fi
 fi
+# Segment-boundary genesis (attested close-and-restart): when the ledger has NO tail (a fresh
+# segment) AND a SEG_GENESIS:<archived_segment_sha256> marker is staged, the first receipt of the
+# new chain commits to the closed segment's digest -- the closure is SIGNED into the chain, not
+# merely documented (verify.rail accepts this on line 0 only). The marker is SINGLE-USE: it is
+# deleted only AFTER a successful genesis sign (below), so it can never re-fire. Combined with the
+# ledger lock (which serializes rollups so the second sees the first's tail, not an empty ledger),
+# this closes the empty-ledger genesis-duplication trap. Once a tail exists the marker is ignored.
+USED_MARKER=0
+if [ "$PREV" = "GENESIS" ] && [ -f /tmp/ais_segment_genesis.txt ]; then
+    SEGM="$(cat /tmp/ais_segment_genesis.txt 2>/dev/null)"
+    case "$SEGM" in SEG_GENESIS:*) PREV="$SEGM"; USED_MARKER=1 ;; esac
+fi
 printf '%s\n' "$PREV" > "$PREV_FILE"
 
 # --- Fetch the live beacon pulse (honest PENDING fallback on any failure) --------------------
@@ -203,6 +232,12 @@ INPUT_SHA="$(shasum -a 256 "$AIS_SRC" 2>/dev/null | awk '{print $1}')"
 case "$INPUT_SHA" in ''|*[!0-9a-fA-F]*) INPUT_SHA="PENDING_no_input_hash" ;; esac
 printf '%s\n' "$INPUT_SHA" > /tmp/ais_input_sha256.txt
 
+# The rollup ALWAYS writes the LIVE ledger. Clear any sandbox output override a test may have left
+# staged: the signer reads /tmp/ais_out_{ledger,single,chain}.txt (default = live), so a stale
+# override would silently redirect a production sign to a sandbox path. Belt to the selftest's own
+# cleanup -- production must never depend on a test remembering to tidy up.
+rm -f /tmp/ais_out_ledger.txt /tmp/ais_out_single.txt /tmp/ais_out_chain.txt
+
 # --- Invoke the pure-Rail signer via the flock-serialized wrapper ----------------------------
 # The signer reads all the /tmp staging files, signs, self-verifies, appends the v=2 line to the
 # ledger, rewrites the legacy single-object, and writes data/ais_fact_chain.txt.
@@ -212,6 +247,10 @@ if [ "$RC" -ne 0 ]; then
     echo "ROLLUP_ERR: signer railrun.sh exited $RC -- ledger NOT advanced" >&2
     exit "$RC"
 fi
+
+# Consume the single-use segment-genesis marker ONLY after a successful sign, so it can never
+# re-fire (a second rollup will find no marker and, seeing the now-non-empty ledger, chain normally).
+if [ "$USED_MARKER" = "1" ]; then rm -f /tmp/ais_segment_genesis.txt; fi
 
 # --- Advance the cursor ONLY after a successful sign -----------------------------------------
 printf '%s\n' "$BATCH_END" > "$CURSOR"

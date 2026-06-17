@@ -99,15 +99,24 @@ main =
   -- v=2 chained JSONL ledger line. Space-after-colon on every string field verify.rail reads
   -- (receipt/sig/signer/chain_hash) -- the cold verifier's field_val matches `"key": "`.
   let jsonline = cat ["{\"v\":2,\"type\":\"FACT\",\"receipt\": \"", receipt, "\",\"sig\": \"", sig_hex, "\",\"signer\": \"", pk_hex, "\",\"chain_hash\": \"", chain_hash, "\"}"]
-  let _ = append_line "/Users/ledaticempire/projects/ledaticground/data/ais_receipts.jsonl" jsonline
-  let _ = print "APPENDED data/ais_receipts.jsonl (v=2 chained line)"
+  -- Output paths DEFAULT to the live ledger, but are overridable via /tmp staging so this signer
+  -- can be exercised against a SANDBOX (e.g. the selftest's sign/verify/tamper check) WITHOUT ever
+  -- appending to the live attestation chain. Running the signer used to hard-write the live ledger,
+  -- so the selftest re-signed the cron's leftover staging into live data -> duplicate receipts.
+  -- The rollup driver clears these overrides at start, so the cron always writes live; only a
+  -- deliberate sandbox caller stages them.
+  let out_ledger = field_or "/tmp/ais_out_ledger.txt" "/Users/ledaticempire/projects/ledaticground/data/ais_receipts.jsonl"
+  let out_single = field_or "/tmp/ais_out_single.txt" "/Users/ledaticempire/projects/ledaticground/data/ais_receipt.json"
+  let out_chain  = field_or "/tmp/ais_out_chain.txt"  "/Users/ledaticempire/projects/ledaticground/data/ais_fact_chain.txt"
+  let _ = append_line out_ledger jsonline
+  let _ = print (cat ["APPENDED ", out_ledger, " (v=2 chained line)"])
 
   -- legacy single-object data/ais_receipt.json (latest) for verify.rail backward compat.
   let jrec = join "\n" ["{", cat ["  \"receipt\": \"", receipt, "\","], cat ["  \"sig\": \"", sig_hex, "\","], cat ["  \"signer\": \"", pk_hex, "\","], cat ["  \"chain_hash\": \"", chain_hash, "\""], "}"]
-  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/ais_receipt.json" jrec
-  let _ = print "WROTE data/ais_receipt.json"
+  let _ = write_file out_single jrec
+  let _ = print (cat ["WROTE ", out_single])
 
   -- the latest AIS fact chain_hash -> data/ais_fact_chain.txt (VP-2 / vessel-inference derived_from).
-  let _ = write_file "/Users/ledaticempire/projects/ledaticground/data/ais_fact_chain.txt" chain_hash
-  let _ = print "WROTE data/ais_fact_chain.txt"
+  let _ = write_file out_chain chain_hash
+  let _ = print (cat ["WROTE ", out_chain])
   0

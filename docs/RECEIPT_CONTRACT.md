@@ -52,13 +52,27 @@ Field-by-field (in load-bearing order):
 | `n=<count>` | number of frames/rows committed by `product_sha256` |
 | `<honesty_bit>` | **per-kind** honesty field (see A.3); omitted only for AIS |
 | `product_sha256=<digest>` | sha256_hex of the deterministic batch digest (see A.4) |
-| `prev=<prev_chain_hash>` | `chain_hash` of the previous ledger line, or `GENESIS` for line 1 |
+| `prev=<prev_chain_hash>` | `chain_hash` of the previous ledger line, or `GENESIS` for line 1, or a `SEG_GENESIS:<sha256>` segment boundary (see below) |
 | `signer=<pk_hex>` | 64-hex Ed25519 public key of the (DEV) signing seed |
 
 > **Note on `prev`.** The existing signers literally write the token `prev=` (not
 > `prev_sha=`). v=2 keeps that exact `prev=` token so the chain link is the substring
 > `prev=`+`<prev_chain_hash>`. (Some design prose calls this field `prev_sha`; the
 > wire token is `prev=` — match the existing signers.)
+
+> **A.1.1 Attested segment boundary (`SEG_GENESIS:`).** A per-stream chain may be **closed
+> and restarted** as a fresh segment (e.g. to retire a fork from a historical concurrency
+> bug, or to bound walk time). When it is, the **first receipt of the new segment** carries
+> `prev=SEG_GENESIS:<sha256-of-the-archived-prior-segment-file>` instead of the literal
+> `GENESIS`. Because `prev=` is part of the **signed** receipt string, the new chain
+> *cryptographically commits to the closed segment's digest* — the closure is **signed into
+> the chain, not merely documented**. `verify.rail`'s ledger walk accepts this form **on line 0
+> only** (a mid-chain line with a `SEG_GENESIS:` prev still fails). Structural acceptance today;
+> re-hashing the named archive file to confirm the digest matches is the next rung (cf. the
+> physics RMS recompute). The archived segment + the close reason are recorded in the runtime
+> manifest `data/<stream>_segments.jsonl`. **Hard rule:** restarting a segment must never
+> re-sign or back-date the closed segment's frames — the cursor is preserved across the boundary
+> so only genuinely-new captures are signed into the new segment.
 
 ### A.2 INFERENCE receipt (derived products — a SEPARATE ledger family)
 

@@ -76,10 +76,21 @@ ck "ais hdlc deframe CRC ok" "$o" "CRC_OK=1"
 $RN src/ais_decode.rail >/dev/null 2>&1; cp tests/fixtures/ais_burst_real.s16 /tmp/ais_win.s16
 o=$(perl -e 'alarm 60;exec @ARGV' /tmp/rail_out 2>/dev/null)
 ck "ais real-burst decode (off-air)" "$o" "mmsi=3669778"
-# AIS rung: attested reception receipt (Ed25519 sign + self-verify + tamper)
+# AIS rung: attested reception receipt (Ed25519 sign + self-verify + tamper). HERMETIC: stage
+# SANDBOX output paths so the signer writes to /tmp, NEVER the live ledger. ais_attest.rail's
+# output paths default to the live ledger; running it bare re-signed the cron's leftover /tmp
+# staging straight INTO the live chain -> a byte-identical duplicate receipt on every selftest run
+# (a real source of the historical AIS chain forks). The override + cleanup below make this check
+# touch nothing but /tmp.
 printf 'selftest-ais-product\n' > /tmp/ais_decoded.txt; echo "0" > /tmp/ais_pulse.txt
+rm -f /tmp/st_ais_sb.jsonl /tmp/st_ais_sb.json /tmp/st_ais_sb_chain.txt
+printf '%s\n' /tmp/st_ais_sb.jsonl    > /tmp/ais_out_ledger.txt
+printf '%s\n' /tmp/st_ais_sb.json     > /tmp/ais_out_single.txt
+printf '%s\n' /tmp/st_ais_sb_chain.txt > /tmp/ais_out_chain.txt
 o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 60;exec @ARGV' ./rail_native run $GD/src/ais_attest.rail 2>/dev/null)
 ck "ais attest verify=1" "$o" "own-sig accepted = 1"; ck "ais attest tamper=0" "$o" "modified-msg accepted = 0"
+# tear down the sandbox override IMMEDIATELY so no later step (or the cron) inherits it
+rm -f /tmp/ais_out_ledger.txt /tmp/ais_out_single.txt /tmp/ais_out_chain.txt /tmp/st_ais_sb.jsonl /tmp/st_ais_sb.json /tmp/st_ais_sb_chain.txt
 # SAME rung: decode a synthetic NWR alert burst (AFSK -> preamble sync -> frame -> parse)
 $PY scripts/gen_same.py --snr 25 --out /tmp/st_same.s16 >/dev/null 2>&1
 o=$($PY scripts/same_decode.py /tmp/st_same.s16 2>/dev/null)
@@ -307,4 +318,26 @@ ck "corr LIVE AIS chain untouched (4 inodes stable; stanza never rm'd them)" "$a
 ais_in_reset=$(sed -n '/^corr_reset(){/,/^}/p' "$0" | grep -cE 'ais_receipts\.jsonl|ais_fact_chain\.txt|ais_rollup_cursor\.txt|ais_receipt\.json')
 if [ "$ais_in_reset" = "0" ]; then reset_ok=CLEAN; else reset_ok=NAMES_AIS; fi
 ck "corr reset list names no live-AIS file (static guard)" "$reset_ok" "CLEAN"
+# =================================================================================================
+# LIVE AIS LEDGER WALK (ADD-3, 2026-06-17): walk-verify the ACTUAL production AIS chain end-to-end.
+#
+# WHY: the AIS self-check above (the single-object "verify receipt VALID") re-checks ONE receipt --
+# it never walks the linear prev-linkage of the whole chain. That blind spot hid 16 prev-link
+# fan-breaks an UNLOCKED rollup critical section produced (overlapping cron signings shared a stale
+# tail chain_hash for prev=). This stanza WALKS the live ledger: every sig + chain_hash + prev-link,
+# and asserts LEDGER VALID. A future fork turns this red. READ-ONLY: verify.rail never writes the
+# ledger, and the estate lock held at the top of this selftest keeps the live cron deferred, so the
+# ledger is stable during the walk (the inode guard above independently proves we never recreate it).
+# A segment-boundary genesis (prev=SEG_GENESIS:<archived-segment sha256>) is accepted on line 0.
+# Isolated --out-prefix compile (never the shared /tmp/rail_out) so a concurrent rail process can't
+# swap in a stale signer binary. An EMPTY ledger walks VALID (0 lines, nothing to break). If the open
+# segment ever grows large enough to time out, that is the signal to close+restart it (rotation).
+# =================================================================================================
+echo "  -- live AIS ledger walk --"
+printf '%s\n' "$GD/data/ais_receipts.jsonl" > /tmp/lg_verify_target.txt
+printf '%s\n' "$GD/data/ais_receipts.jsonl" > /tmp/lg_verify_facts.txt
+o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 180;exec @ARGV' \
+      ./rail_native --out-prefix /tmp/st_ais_verify_ run "$GD/src/verify.rail" 2>&1)
+ck "live AIS ledger walk LEDGER VALID" "$o" "==> LEDGER VALID"
+rm -f /tmp/lg_verify_target.txt /tmp/lg_verify_facts.txt /tmp/st_ais_verify_
 echo "  ---- $pass passed, $fail failed ----"; [ $fail -eq 0 ]
