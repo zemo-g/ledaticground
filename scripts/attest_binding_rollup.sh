@@ -195,6 +195,10 @@ else
     [ -n "$T0_UNIX" ] || { echo "BIND_ERR: --iq mode needs --t0-unix <capture-start unix>" >&2; exit 2; }
     echo "BIND: step 2 -- measuring REAL Doppler track (measure_doppler_real_iq.py --track-only, fs=$FS)"
     REAL_TRK="/tmp/binding_real_track.txt"
+    rm -f "$REAL_TRK" "$BIND_MEAS" "$BIND_TRUTH"   # CRITICAL: never reuse a previous pass's track --
+    # a weak pass whose extraction finds <5 high-SNR windows writes NO --out; without this rm, a
+    # stale track from a prior pass would be used -> a FALSE binding (a receipt claiming a pass it
+    # never measured). Clearing first makes the empty-track guard below fail-closed.
     "$PY" "$REPO/scripts/measure_doppler_real_iq.py" "$IQ_BIN" --fs "$FS" --fc "$FC_HZ" \
         --win-s 3.0 --snr-db 5.5 --track-only --out "$REAL_TRK" > /tmp/binding_real_meas.json 2>&1
     if [ ! -s "$REAL_TRK" ]; then
