@@ -57,6 +57,8 @@ FC_HZ="137100000.0"
 TOL_HZ="50"
 REPRO_TOL_HZ="25"
 RMS_TOL_HZ="100"   # physics_ok gate: fit RMS over the WHOLE pass (right orbit ~few Hz; wrong orbit ~1000+ Hz)
+T0_UNIX=""         # --iq mode ONLY: capture start unix (maps the measured t_rel track -> snap unix times)
+FS="250000"        # --iq mode ONLY: cu8 baseband sample rate (real LRPT captures are 250 kHz)
 # A WRONG TLE for the negative test: a DIFFERENT NOAA bird (NOAA-15, NORAD 25338) whose orbit does
 # NOT produce the measured curve. Bundled, clearly labeled -- never fetched.
 WRONG_TLE_L1="1 25338U 98030A   26166.51000000  .00000061  00000+0  44000-4 0  9990"
@@ -80,13 +82,21 @@ while [ $# -gt 0 ]; do
         --tol-hz) TOL_HZ="${2:-}"; shift 2 ;;
         --repro-tol-hz) REPRO_TOL_HZ="${2:-}"; shift 2 ;;
         --rms-tol-hz) RMS_TOL_HZ="${2:-}"; shift 2 ;;
+        --t0-unix) T0_UNIX="${2:-}"; shift 2 ;;
+        --fs) FS="${2:-}"; shift 2 ;;
         *) echo "BIND_ERR: unknown arg: $1" >&2; exit 2 ;;
     esac
 done
 
-# now_unix predictor anchor (the epoch-offset anchor; data/now_unix.txt).
-NOW_UNIX="$(cat "$REPO/data/now_unix.txt" 2>/dev/null | tr -d '[:space:]')"
-case "$NOW_UNIX" in ''|*[!0-9]*) echo "BIND_ERR: bad data/now_unix.txt" >&2; exit 2 ;; esac
+# now_unix predictor anchor (epoch-offset anchor). For a REAL pass (--iq) it is the capture-start
+# unix (T0_UNIX) so the prediction is anchored to WHEN the pass actually happened; for the --synth
+# fixture it is data/now_unix.txt (the fixture's anchor, the curve gen_tle_doppler painted against).
+if [ "$MODE" = "iq" ]; then
+    NOW_UNIX="$T0_UNIX"
+else
+    NOW_UNIX="$(cat "$REPO/data/now_unix.txt" 2>/dev/null | tr -d '[:space:]')"
+fi
+case "$NOW_UNIX" in ''|*[!0-9]*) echo "BIND_ERR: bad now_unix (--iq needs --t0-unix; --synth needs data/now_unix.txt)" >&2; exit 2 ;; esac
 
 # binding /tmp namespace (NEVER /tmp/dop_real.iq or /tmp/dop_meas_real.out).
 BIND_IQ="/tmp/binding_iq.iq"
@@ -150,33 +160,62 @@ echo "BIND: FACT root chain_hash=$FACT_CHAIN"
 # =============================================================================================
 # STEP 2 -- measured centroid (doppler_real.rail) + inline best_align SEARCH.
 # =============================================================================================
-# doppler_real.rail reads "/tmp/dop_real.iq" HARD-CODED, and F.5 forbids us from clobbering that
-# live-pipeline path. The measured centroid MUST come from doppler_real.rail (pure Rail), so we
-# honor F.5 by snapshot+restore: if a live capture already sits at /tmp/dop_real.iq we back it up,
-# stage our fixture there ONLY for the duration of the measure, then restore the original bytes
-# (or remove our staged copy if there was none) -- leaving the live staging byte-identical.
-DOP_REAL_LIVE="/tmp/dop_real.iq"
-RESTORE_LIVE=0
-LIVE_BAK="/tmp/binding_dopreal_live.bak"
-if [ -f "$DOP_REAL_LIVE" ]; then
-    cp "$DOP_REAL_LIVE" "$LIVE_BAK" 2>/dev/null && RESTORE_LIVE=1
-fi
-# stage our fixture as the tracker input, measure, then restore the live file (F.5: leave the live
-# doppler pipeline staging byte-identical to how we found it).
-cp "$BIND_IQ" "$DOP_REAL_LIVE"
-echo "BIND: step 2 -- measuring carrier centroid (doppler_real.rail)"
-bash "$REPO/scripts/railrun.sh" "$REPO/src/doppler_real.rail" > "$BIND_MEAS" 2>/dev/null
-DRC=$?
-if [ "$RESTORE_LIVE" -eq 1 ]; then
-    cp "$LIVE_BAK" "$DOP_REAL_LIVE" 2>/dev/null
-    rm -f "$LIVE_BAK"
+if [ "$MODE" = "synth" ]; then
+    # SYNTH path (UNCHANGED). doppler_real.rail reads "/tmp/dop_real.iq" HARD-CODED, and F.5 forbids
+    # clobbering that live-pipeline path. The measured centroid comes from doppler_real.rail (pure
+    # Rail); we honor F.5 by snapshot+restore: back up any live capture at /tmp/dop_real.iq, stage
+    # our fixture there only for the measure, then restore -- leaving the live staging byte-identical.
+    DOP_REAL_LIVE="/tmp/dop_real.iq"
+    RESTORE_LIVE=0
+    LIVE_BAK="/tmp/binding_dopreal_live.bak"
+    if [ -f "$DOP_REAL_LIVE" ]; then
+        cp "$DOP_REAL_LIVE" "$LIVE_BAK" 2>/dev/null && RESTORE_LIVE=1
+    fi
+    cp "$BIND_IQ" "$DOP_REAL_LIVE"
+    echo "BIND: step 2 -- measuring carrier centroid (doppler_real.rail)"
+    bash "$REPO/scripts/railrun.sh" "$REPO/src/doppler_real.rail" > "$BIND_MEAS" 2>/dev/null
+    DRC=$?
+    if [ "$RESTORE_LIVE" -eq 1 ]; then
+        cp "$LIVE_BAK" "$DOP_REAL_LIVE" 2>/dev/null
+        rm -f "$LIVE_BAK"
+    else
+        rm -f "$DOP_REAL_LIVE"
+    fi
+    if [ "$DRC" -ne 0 ] || ! grep -q '^DOP ' "$BIND_MEAS"; then
+        echo "BIND_ERR: doppler_real.rail produced no DOP lines (rc=$DRC)" >&2
+        sed -n '1,20p' "$BIND_MEAS" >&2
+        exit 2
+    fi
 else
-    rm -f "$DOP_REAL_LIVE"
-fi
-if [ "$DRC" -ne 0 ] || ! grep -q '^DOP ' "$BIND_MEAS"; then
-    echo "BIND_ERR: doppler_real.rail produced no DOP lines (rc=$DRC)" >&2
-    sed -n '1,20p' "$BIND_MEAS" >&2
-    exit 2
+    # REAL capture (--iq): doppler_real.rail can't read the wideband 250 kHz cu8 and there is no synth
+    # truth file. Measure the real Doppler track (noise-gated centroid, measure_doppler_real_iq.py
+    # --track-only), then build BIND_MEAS (DOP peak=cent=measured doppler) + BIND_TRUTH (snap unix =
+    # T0_UNIX + measured t_rel), SAME ORDER -- so the SAME doppler_range.rail prediction + best_align +
+    # binding_attest path below runs UNCHANGED, and the receipt is verify.rail-reproducible (Keplerian).
+    [ -n "$T0_UNIX" ] || { echo "BIND_ERR: --iq mode needs --t0-unix <capture-start unix>" >&2; exit 2; }
+    echo "BIND: step 2 -- measuring REAL Doppler track (measure_doppler_real_iq.py --track-only, fs=$FS)"
+    REAL_TRK="/tmp/binding_real_track.txt"
+    "$PY" "$REPO/scripts/measure_doppler_real_iq.py" "$IQ_BIN" --fs "$FS" --fc "$FC_HZ" \
+        --win-s 3.0 --snr-db 5.5 --track-only --out "$REAL_TRK" > /tmp/binding_real_meas.json 2>&1
+    if [ ! -s "$REAL_TRK" ]; then
+        echo "BIND_ERR: real Doppler extraction produced no track" >&2
+        cat /tmp/binding_real_meas.json >&2; exit 2
+    fi
+    "$PY" - "$REAL_TRK" "$BIND_MEAS" "$BIND_TRUTH" "$T0_UNIX" <<'PYEOF'
+import sys
+trk, meas_out, truth_out, t0 = sys.argv[1:5]; t0 = int(float(t0))
+with open(meas_out, 'w') as m, open(truth_out, 'w') as tr:
+    for ln in open(trk):
+        ln = ln.strip()
+        if not ln:
+            continue
+        t_rel, dop = ln.split()
+        m.write("DOP 0 %s %s\n" % (dop, dop))                          # peak=cent=measured doppler
+        tr.write("snap unix=%d dop=%s\n" % (t0 + int(round(float(t_rel))), dop))
+PYEOF
+    if ! grep -q '^DOP ' "$BIND_MEAS"; then
+        echo "BIND_ERR: real track -> BIND_MEAS produced no DOP lines" >&2; exit 2
+    fi
 fi
 NMEAS="$(grep -c '^DOP ' "$BIND_MEAS")"
 echo "BIND: measured $NMEAS windows"
@@ -353,7 +392,12 @@ case "$FC_HZ_INT" in ''|*[!0-9]*) FC_HZ_INT="137100000" ;; esac
 # claimed_geo carries the _SYNTH suffix (the observer is the synthetic placeholder). Numeric lat/lon
 # live in /tmp ONLY (staged below) -- this committed string is "lat,lon,alt_SYNTH", never a precise
 # committed coordinate beyond the synthetic claim.
-CLAIMED_GEO="${LAT},${LON},${ALT_KM}km_SYNTH"
+# suffix: _SYNTH for the synthetic fixture (placeholder observer); _APPROX_PENDING_GPS_PPS for a REAL
+# capture (the node's ACTUAL but approximate location -- precise geo is PENDING_needs_GPS_PPS, never
+# committed; mislabelling a real geo as _SYNTH would be a no-synthetic-evidence inversion). The coarse
+# numeric lat/lon IS committed (verify.rail needs the observer to re-run the prediction), ~10 km / 0.1deg.
+if [ "$MODE" = "iq" ]; then GEO_SUFFIX="${ALT_KM}km_APPROX_PENDING_GPS_PPS"; else GEO_SUFFIX="${ALT_KM}km_SYNTH"; fi
+CLAIMED_GEO="${LAT},${LON},${GEO_SUFFIX}"
 
 # capture-window bounds: the IQ .bin mtime (provenance), n = measured windows.
 MTIME="$(stat -f %m "$BIND_IQ" 2>/dev/null)"

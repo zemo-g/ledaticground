@@ -334,9 +334,14 @@ ck "corr reset list names no live-AIS file (static guard)" "$reset_ok" "CLEAN"
 # segment ever grows large enough to time out, that is the signal to close+restart it (rotation).
 # =================================================================================================
 echo "  -- live AIS ledger walk --"
+# NOTE: this walk is O(N) -- an Ed25519 + chain re-derive per ledger line, plus the verify.rail
+# compile. It grows with the live segment (~hundreds of receipts/day). The alarm below is generous
+# headroom; the real long-term bound is SEGMENT ROTATION -- periodically close+restart the AIS chain
+# (the SEG_GENESIS mechanism) so the walked segment stays small. A timeout here = "rotate the segment",
+# NOT "chain broken" (a broken chain prints ==> LEDGER INVALID well within the alarm).
 printf '%s\n' "$GD/data/ais_receipts.jsonl" > /tmp/lg_verify_target.txt
 printf '%s\n' "$GD/data/ais_receipts.jsonl" > /tmp/lg_verify_facts.txt
-o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 180;exec @ARGV' \
+o=$(cd /Users/ledaticempire/projects/rail && perl -e 'alarm 420;exec @ARGV' \
       ./rail_native --out-prefix /tmp/st_ais_verify_ run "$GD/src/verify.rail" 2>&1)
 ck "live AIS ledger walk LEDGER VALID" "$o" "==> LEDGER VALID"
 rm -f /tmp/lg_verify_target.txt /tmp/lg_verify_facts.txt /tmp/st_ais_verify_

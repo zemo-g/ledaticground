@@ -87,15 +87,18 @@ def main():
     ap.add_argument("capture")
     ap.add_argument("--fs", type=float, default=250000.0)
     ap.add_argument("--fc", type=float, default=137.9e6)
-    ap.add_argument("--t0", required=True, help="capture start, ISO-8601 Z")
-    ap.add_argument("--lat", type=float, required=True)
-    ap.add_argument("--lon", type=float, required=True)
+    ap.add_argument("--t0", default=None, help="capture start, ISO-8601 Z (required unless --track-only)")
+    ap.add_argument("--lat", type=float, default=None)
+    ap.add_argument("--lon", type=float, default=None)
     ap.add_argument("--alt-m", type=float, default=190.0)
-    ap.add_argument("--tle-l1", required=True)
-    ap.add_argument("--tle-l2", required=True)
+    ap.add_argument("--tle-l1", default=None)
+    ap.add_argument("--tle-l2", default=None)
     ap.add_argument("--win-s", type=float, default=3.0)
     ap.add_argument("--snr-db", type=float, default=5.5)
     ap.add_argument("--out", default=None, help="write the measured track (t_rel_s doppler_hz) here")
+    ap.add_argument("--track-only", action="store_true",
+                    help="emit ONLY the measured Doppler track (no SGP4/skyfield bind) -- the input the "
+                         "verifiable doppler_range.rail receipt path consumes; needs no TLE/geo/t0/skyfield")
     a = ap.parse_args()
 
     track, dur = measure_track(a.capture, a.fs, a.win_s)
@@ -104,6 +107,21 @@ def main():
     hi = track[track[:, 2] > a.snr_db]
     if len(hi) < 5:
         print(json.dumps({"ok": False, "reason": "too few high-SNR windows", "hi": int(len(hi))})); return 1
+
+    # --track-only: just the measured DSP product (t_rel doppler), no orbit prediction. This is what
+    # the attested binding pipeline (doppler_range.rail + binding_attest.rail, verify.rail-reproducible)
+    # consumes -- it does its OWN Keplerian prediction so the receipt is cold-verifiable. The full
+    # mode below (skyfield SGP4) is the accurate standalone PROOF that the curve binds.
+    if a.track_only or not (a.t0 and a.lat is not None and a.lon is not None and a.tle_l1 and a.tle_l2):
+        if a.out:
+            with open(a.out, "w") as f:
+                for t, d, s, _e in hi:
+                    f.write("%.3f %.1f\n" % (t, d))
+        print(json.dumps({"ok": True, "track_only": True, "capture": a.capture,
+                          "duration_s": round(dur, 1), "windows": int(len(track)),
+                          "high_snr_windows": int(len(hi)),
+                          "measured_span_hz": round(float(hi[:, 1].max() - hi[:, 1].min()), 0)}, indent=2))
+        return 0
 
     t0 = datetime.fromisoformat(a.t0.replace("Z", "+00:00")).astimezone(timezone.utc)
     # fit a small timing shift + constant LO offset, minimise residual RMS over high-SNR windows
