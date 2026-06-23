@@ -570,6 +570,16 @@ physics_recompute receipt idx =
   let tle_ok = if tle_sha_calc == tle_sha_cited then 1 else 0
   let meas_ok = if meas_sha_calc == meas_sha_cited then 1 else 0
 
+  -- times-axis digest (Failure E): the RMS recompute below evaluates the prediction at THESE exact
+  -- snapshot times, so bind them too -- else a wrong-orbit forgery could hand the verifier a time axis
+  -- chosen to fit. verify_binding stages the cited times verbatim to /tmp/lg_verify_times.txt. A legacy
+  -- receipt (pre-times_sha256) cites nothing -> times_ok=2 (printed as UNBOUND, NOT failed, so the
+  -- existing chain still verifies; new receipts always bind it).
+  let times_sha_cited = pipe_field receipt "times_sha256"
+  let times_raw = read_file "/tmp/lg_verify_times.txt"
+  let times_sha_calc = sha256_hex times_raw
+  let times_ok = if times_sha_cited == "" then 2 else if times_sha_calc == times_sha_cited then 1 else 0
+
   -- (2) reproduce the eval point from the measured track + times + committed t_shift (eval_idx=nw//2).
   -- Snapshot times are parsed as INTEGERS and subtracted in integer space (snap_int_at_k); only the
   -- final t_eval is a float (so it carries t_shift_s). This dodges the float self-loop miscompile.
@@ -644,12 +654,16 @@ physics_recompute receipt idx =
   let _ = print (cat ["  physics  predicted_dop=", show_float predicted_dop, " + const_off=", show_float const_off_hz, " = ", show_float predicted_total, " Hz ; measured=", show_float meas_val, " Hz"])
   let _ = print (cat ["  physics  recomputed_residual=", show recomputed_hz, " Hz  committed residual_hz=", show residual_hz, " Hz  drift=", show drift, " repro_tol=", show repro_tol_hz, " Hz"])
   let _ = print (cat ["  physics  recomputed_rms=", show recomputed_rms_hz, " Hz  committed residual_rms_hz=", show committed_rms_hz, " Hz  rms_drift=", show rms_drift, " ; rederived physics_ok=", show rederived_physok, " committed=", show committed_physok])
+  let _ = print (cat ["  physics  times_axis: times_ok=", show times_ok, " (1=bound+match, 2=legacy-UNBOUND, 0=MISMATCH)  cited=", times_sha_cited])
 
   if tle_ok == 0 then
     let _ = print (cat ["==> FAIL at line ", show idx, ": physics residual unreproducible (staged TLE sha256 ", tle_sha_calc, " != cited ", tle_sha_cited, ")"])
     0
   else if meas_ok == 0 then
     let _ = print (cat ["==> FAIL at line ", show idx, ": physics residual unreproducible (staged measured-track sha256 ", meas_sha_calc, " != cited ", meas_sha_cited, ")"])
+    0
+  else if times_ok == 0 then
+    let _ = print (cat ["==> FAIL at line ", show idx, ": physics times-axis unreproducible (staged times sha256 ", times_sha_calc, " != cited ", times_sha_cited, ")"])
     0
   else if within == 0 then
     let _ = print (cat ["==> FAIL at line ", show idx, ": physics residual unreproducible (recomputed ", show recomputed_hz, " Hz vs committed ", show residual_hz, " Hz, drift ", show drift, " > repro_tol ", show repro_tol_hz, " Hz)"])

@@ -190,9 +190,9 @@ def stage_tle(l1, l2, path):
     open(path, "w").write(l1 + "\n" + l2 + "\n")
 
 
-def run_verify(ledger_path, tle_file):
+def run_verify(ledger_path, tle_file, times_file=TIMES_FILE):
     p = run(["bash", VERIFY_BINDING, "--ledger", ledger_path, "--line", "1",
-             "--tle-file", tle_file, "--meas-file", MEAS_FILE, "--times-file", TIMES_FILE],
+             "--tle-file", tle_file, "--meas-file", MEAS_FILE, "--times-file", times_file],
             timeout=300)
     return p.stdout + p.stderr
 
@@ -218,10 +218,11 @@ def main():
     tle_pos = "/tmp/iso_tle_pos.txt"; stage_tle(NOAA19_L1, NOAA19_L2, tle_pos)
     out_pos = run_verify(ISO_LEDGER, tle_pos)        # iso_ledger is the honest line, sig already valid
     print(out_pos)
-    if "==> LEDGER VALID" in out_pos and "unreproducible" not in out_pos and "FORGED" not in out_pos:
-        print("POSITIVE: PASS\n")
+    pos_times_bound = "times_ok=1" in out_pos        # the new times_sha256 binding is active + matches
+    if "==> LEDGER VALID" in out_pos and "unreproducible" not in out_pos and "FORGED" not in out_pos and pos_times_bound:
+        print("POSITIVE: PASS (times_ok=1 -> time axis bound + reproduced)\n")
     else:
-        fails.append("POSITIVE did not reach a clean LEDGER VALID")
+        fails.append("POSITIVE did not reach a clean LEDGER VALID with times_ok=1 (times_bound=%s)" % pos_times_bound)
         print("POSITIVE: FAIL\n")
 
     # ============================ NEGATIVE: wrong-orbit RMS/physics_ok forgery ============
@@ -309,6 +310,42 @@ def main():
                      "(physok=%s invalid=%s)" % (physok_caught, invalidB))
         print("NEGATIVE-B: FAIL\n")
 
+    # ============== NEGATIVE-C: time-axis binding (Failure E) ==============
+    # The honest NOAA-19 receipt commits times_sha256. Hand the verifier a DIFFERENT time axis (one
+    # snapshot shoved 7 s) -- the exact attack times_sha256 defends: fit a wrong orbit by choosing the
+    # times the RMS is evaluated at. Expect "physics times-axis unreproducible" -> INVALID, and it
+    # fires BEFORE the RMS/physok checks (digest gate). ISO_LEDGER still holds the honest NEG-B receipt.
+    print("=" * 80)
+    print("NEGATIVE-C: honest NOAA-19 receipt + a TAMPERED time axis (1 snapshot shifted 7s) ->")
+    print("            expect 'physics times-axis unreproducible' -> INVALID (Failure E closed).")
+    print("=" * 80)
+    honest_receipt = receipt_of(open(ISO_LEDGER).read().strip())
+    cited_times_sha = pipe_field(honest_receipt, "times_sha256")
+    tampered, shifted = [], False
+    for ln in open(TIMES_FILE).read().splitlines():
+        parts = ln.split()
+        if not shifted and len(parts) == 2 and parts[0] == "snap" and parts[1].isdigit():
+            tampered.append("snap %d" % (int(parts[1]) + 7)); shifted = True
+        else:
+            tampered.append(ln)
+    tampered_times = "/tmp/iso_times_tampered.txt"
+    open(tampered_times, "w").write("\n".join(tampered) + "\n")
+    print("  honest receipt cites times_sha256=%s... ; verifier handed a 1-snapshot-shifted axis"
+          % cited_times_sha[:16])
+    out_negC = run_verify(ISO_LEDGER, tleB, times_file=tampered_times)
+    print(out_negC)
+    times_caught = "physics times-axis unreproducible" in out_negC
+    invalidC     = "==> LEDGER INVALID" in out_negC
+    was_bound    = cited_times_sha != "" and cited_times_sha != "PENDING_no_times_hash"
+    print("  signals: receipt_bound_times=%s times_caught=%s invalid=%s" % (was_bound, times_caught, invalidC))
+    if was_bound and times_caught and invalidC:
+        print("NEGATIVE-C: PASS -- a swapped time axis is rejected; the RMS recompute can no longer be"
+              " fit by choosing times. Failure E closed.\n")
+    else:
+        fails.append("NEGATIVE-C expected bound-times + 'physics times-axis unreproducible' + INVALID "
+                     "(bound=%s times=%s invalid=%s)" % (was_bound, times_caught, invalidC))
+        print("NEGATIVE-C: FAIL\n")
+
     assert_data_unchanged("final")
     print("=" * 80)
     if fails:
@@ -316,8 +353,9 @@ def main():
         for f in fails:
             print("  - " + f)
         sys.exit(1)
-    print("RESULT: PASS -- the RMS/physics_ok fix accepts an honest bind and rejects a valid-signature")
-    print("        wrong-orbit forgery that the single-point verifier would have passed. data/ untouched.")
+    print("RESULT: PASS -- accepts an honest bind (RMS reproduced, time axis bound) and rejects three")
+    print("        valid-signature forgeries the single-point verifier would have passed: fabricated RMS,")
+    print("        forged physics_ok, and a swapped time axis (Failure E). data/ untouched.")
     sys.exit(0)
 
 

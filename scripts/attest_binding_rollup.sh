@@ -388,6 +388,11 @@ TLE_SHA256="$(printf '%s\n%s\n' "$PRED_L1" "$PRED_L2" | shasum -a 256 | awk '{pr
 MEAS_SHA256="$(shasum -a 256 "$BIND_MEAS" | awk '{print $1}')"
 case "$TLE_SHA256" in [0-9a-fA-F]*) : ;; *) TLE_SHA256="PENDING_no_tle_hash" ;; esac
 case "$MEAS_SHA256" in [0-9a-fA-F]*) : ;; *) MEAS_SHA256="PENDING_no_meas_hash" ;; esac
+# times_sha256: bind the snapshot TIME AXIS too (Failure E). verify.rail recomputes the residual RMS at
+# THESE exact snapshot times; an unbound times file would let a wrong-orbit forgery hand the verifier a
+# time axis chosen to fit. Hash BIND_TIMES -- the file verify_binding stages VERBATIM to lg_verify_times.
+TIMES_SHA256="$(shasum -a 256 "$BIND_TIMES" | awk '{print $1}')"
+case "$TIMES_SHA256" in [0-9a-fA-F]*) : ;; *) TIMES_SHA256="PENDING_no_times_hash" ;; esac
 
 # fc_hz as an integer (the receipt's fc_hz field is integer Hz).
 FC_HZ_INT="$(printf '%s\n' "$FC_HZ" | awk '{printf "%d", $1+0}')"
@@ -429,6 +434,7 @@ stagef /tmp/binding_residual_rms_hz.txt "$RESIDUAL_RMS_INT"
 stagef /tmp/binding_rms_tol_hz.txt     "$RMS_TOL_HZ"
 stagef /tmp/binding_tle_sha256.txt     "$TLE_SHA256"
 stagef /tmp/binding_meas_sha256.txt    "$MEAS_SHA256"
+stagef /tmp/binding_times_sha256.txt   "$TIMES_SHA256"
 stagef /tmp/binding_sat.txt            "$PRED_SAT"
 stagef /tmp/binding_fc_hz_int.txt      "$FC_HZ_INT"
 stagef /tmp/binding_orbit.txt          "$PRED_ORBIT"

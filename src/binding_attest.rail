@@ -348,6 +348,7 @@ main =
   let orbit = field_or "/tmp/binding_orbit.txt" "UNKNOWN@UNKNOWN"
   let tle_sha256 = field_or "/tmp/binding_tle_sha256.txt" "PENDING_no_tle_hash"
   let meas_sha256 = field_or "/tmp/binding_meas_sha256.txt" "PENDING_no_meas_hash"
+  let times_sha256 = field_or "/tmp/binding_times_sha256.txt" "PENDING_no_times_hash"
   let estimator = field_or "/tmp/binding_estimator.txt" "centroid"
 
   -- beacon anchor (sec C): unified staging files. Honest PENDING on fetch failure (still
@@ -383,7 +384,7 @@ main =
     -- post-`n` field (matches the A.2 INFERENCE walk). tol_hz (NOT tolerance_hz); repro_tol_hz is
     -- a DISTINCT key. residual_hz/tol_hz/repro_tol_hz are INTEGER Hz. t_shift_s + const_off_hz are
     -- the MANDATORY committed alignment (so the verifier does a single-point recompute, not a search).
-    let receipt = join "|" ["PHYSICS_BINDING_RECEIPT", "v=2", "type=INFERENCE", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["derived_from=", derived_from], cat ["physics_ok=", show physics_ok], cat ["estimator=", estimator], cat ["residual_hz=", show residual_hz], cat ["tol_hz=", show tol_hz_int], cat ["residual_rms_hz=", show residual_rms_hz], cat ["rms_tol_hz=", show rms_tol_hz], cat ["repro_tol_hz=", repro_tol_hz_str], cat ["sat=", sat], cat ["fc_hz=", fc_hz_int_str], cat ["orbit=", orbit], cat ["tle_sha256=", tle_sha256], cat ["meas_sha256=", meas_sha256], cat ["t_shift_s=", t_shift_s], cat ["const_off_hz=", const_off_hz_str], cat ["claimed_geo=", claimed_geo], "note=binding_mechanism_validated_location_unattested", cat ["product_sha256=", meas_sha256], cat ["prev=", prev], cat ["signer=", pk_hex]]
+    let receipt = join "|" ["PHYSICS_BINDING_RECEIPT", "v=2", "type=INFERENCE", cat ["node=", node], cat ["station=", sta], cat ["band=", band], cat ["geo=", geo], cat ["pulse_id=", pulse_id], cat ["pulse_hex=", pulse_hex], cat ["batch_start=", batch_start], cat ["batch_end=", batch_end], cat ["n=", nstr], cat ["derived_from=", derived_from], cat ["physics_ok=", show physics_ok], cat ["estimator=", estimator], cat ["residual_hz=", show residual_hz], cat ["tol_hz=", show tol_hz_int], cat ["residual_rms_hz=", show residual_rms_hz], cat ["rms_tol_hz=", show rms_tol_hz], cat ["repro_tol_hz=", repro_tol_hz_str], cat ["sat=", sat], cat ["fc_hz=", fc_hz_int_str], cat ["orbit=", orbit], cat ["tle_sha256=", tle_sha256], cat ["meas_sha256=", meas_sha256], cat ["times_sha256=", times_sha256], cat ["t_shift_s=", t_shift_s], cat ["const_off_hz=", const_off_hz_str], cat ["claimed_geo=", claimed_geo], "note=binding_mechanism_validated_location_unattested", cat ["product_sha256=", meas_sha256], cat ["prev=", prev], cat ["signer=", pk_hex]]
     let msg = string_to_bytes receipt
     let mlen = string_length_bytes receipt
     let sig = ed25519_sign seed msg mlen

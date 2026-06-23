@@ -199,7 +199,7 @@ Two new signed pipe fields appear in **EVERY FACT receipt**, inserted **between*
 One merged, load-bearing field list (`type=INFERENCE`):
 
 ```
-PHYSICS_BINDING_RECEIPT|v=2|type=INFERENCE|node=<id>|station=<sta>|band=Doppler-binding-137.1MHz|geo=<geo>|pulse_id=<pid>|pulse_hex=<vh16>|batch_start=<unix>|batch_end=<unix>|n=<windows>|derived_from=<fact_chain_hash>|physics_ok=<0|1>|estimator=<centroid|peak>|residual_hz=<int>|tol_hz=<int>|residual_rms_hz=<int>|rms_tol_hz=<int>|repro_tol_hz=<int>|sat=<NOAA-19>|fc_hz=<int>|orbit=<norad@epoch>|tle_sha256=<64hex>|meas_sha256=<64hex>|t_shift_s=<float>|const_off_hz=<float>|claimed_geo=<lat_lon|..._SYNTH>|note=binding_mechanism_validated_location_unattested|product_sha256=<64hex>|prev=<prev_chain_hash>|signer=<pk_hex>
+PHYSICS_BINDING_RECEIPT|v=2|type=INFERENCE|node=<id>|station=<sta>|band=Doppler-binding-137.1MHz|geo=<geo>|pulse_id=<pid>|pulse_hex=<vh16>|batch_start=<unix>|batch_end=<unix>|n=<windows>|derived_from=<fact_chain_hash>|physics_ok=<0|1>|estimator=<centroid|peak>|residual_hz=<int>|tol_hz=<int>|residual_rms_hz=<int>|rms_tol_hz=<int>|repro_tol_hz=<int>|sat=<NOAA-19>|fc_hz=<int>|orbit=<norad@epoch>|tle_sha256=<64hex>|meas_sha256=<64hex>|times_sha256=<64hex>|t_shift_s=<float>|const_off_hz=<float>|claimed_geo=<lat_lon|..._SYNTH>|note=binding_mechanism_validated_location_unattested|product_sha256=<64hex>|prev=<prev_chain_hash>|signer=<pk_hex>
 ```
 
 - `derived_from` is the **first post-`n` field** (matches the A.2 INFERENCE walk).
@@ -213,6 +213,13 @@ PHYSICS_BINDING_RECEIPT|v=2|type=INFERENCE|node=<id>|station=<sta>|band=Doppler-
 - `geo` stays the literal `PENDING_needs_GPS_PPS`. `claimed_geo` carries the `_SYNTH` suffix
   when the observer is the placeholder (synthetic) location. **Numeric `geo_lat` / `geo_lon`
   are staged in `/tmp` ONLY, never committed.**
+- `tle_sha256` / `meas_sha256` / `times_sha256` are `sha256_hex` of the three artifacts the
+  binding rests on: the cited TLE (`l1\nl2\n`), the measured Doppler track, and the **snapshot
+  time axis** (`snap <unix>` rows). Wave C recomputes the residual **and the RMS at exactly these
+  times**, so binding the time axis closes the gap where a wrong-orbit forgery hands the verifier
+  a time axis chosen to fit (Failure E). **Legacy compat:** a pre-`times_sha256` receipt cites no
+  such field — verify.rail treats that as `times_ok=2` (printed UNBOUND, NOT a failure) so the
+  existing chain still verifies; emitters from 2026-06-23 on always bind it.
 - `physics_ok=1` gates on **`residual_rms_hz <= rms_tol_hz`** — the fit RMS over the WHOLE pass
   (the robust right-vs-wrong-orbit discriminator: right orbit ~few Hz, wrong orbit ~1000+ Hz).
   It does **NOT** gate on the single-point `residual_hz`: at TCA the Doppler is ~0 for any orbit
@@ -220,9 +227,11 @@ PHYSICS_BINDING_RECEIPT|v=2|type=INFERENCE|node=<id>|station=<sta>|band=Doppler-
   point — so a single point is FITTABLE and not a discriminator (grounding finding 2026-06-17).
   `residual_hz` is retained as the **verifier's single-point reproducibility anchor** (verify.rail
   recomputes it). `physics_ok=1` means "**the measured Doppler fits the claimed orbit over the pass
-  within `rms_tol_hz`**", **NEVER "verified true."** *(Verifier-side independent RMS recompute is a
-  tracked rung; today verify.rail independently reproduces the single point + the emitter gates
-  physics_ok on the RMS.)*
+  within `rms_tol_hz`**", **NEVER "verified true."** *(As of 2026-06-23 verify.rail independently
+  recomputes the **RMS over every window** from the cited TLE+geo+track+times and **re-derives**
+  physics_ok — a forged `residual_rms_hz` or `physics_ok` riding an honest single point now FAILS
+  the re-run: "physics RMS unreproducible" / "physics_ok FORGED". The single-point recompute is
+  retained as a second anchor.)*
 - Register `PHYSICS_BINDING_RECEIPT` in the A.5 INFERENCE kind set.
 
 ### A.8 `MESH_WITNESS_RECEIPT` (Wave D)
