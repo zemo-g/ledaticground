@@ -3,20 +3,16 @@
 -- Orbcomm are LEO, period << 225 min -> no SDP4 deep-space). Oracle: python-sgp4 (validates <1e-6 km
 -- on the canonical Vallado TLE 00005).
 --
--- STATUS (2026-06-23): the MATH is fully validated against python-sgp4 (un-kozai, J2/J3/J4 secular
--- rates, BSTAR drag coefs, kepler, short-period periodics all match to ~1e-9; see SGP4_BUILD_LOG.md).
--- OPEN BLOCKER: the final r,v assembly + output-array write in sgp4_orient SIGSEGVs on a Rail
--- float-codegen bug (see #3 below). Compiles clean; runs correctly through sgp4_periodics.
+-- STATUS (2026-06-23): WORKING. r,v match python-sgp4 to ~1e-6 km at t=0 (sub-meter over 12 h) for
+-- the canonical TLE 00005 and the real NOAA/Meteor birds. Validated stage-by-stage (un-kozai,
+-- J2/J3/J4 secular rates, BSTAR drag, kepler, short-period periodics). See SGP4_BUILD_LOG.md.
 --
--- *** Rail codegen constraints, learned here (a register-allocator fragility in float-dense code) ***
---   1. >~40 live float locals in one function -> late values from early ones go garbage. FIX: split
---      the function (sgp4init -> sgp4init + sgp4init2), pass state via `st` (scratch slots 34-43).
---   2. a float local LIVE ACROSS A USER-fn CALL is clobbered (foreign sin/cos/pow/floor +
---      float_arr_get/set are safe). FIX: read array values JUST BEFORE use; kepler keeps every float
---      in `acc`, threading only (acc, int ktr).
---   3. UNRESOLVED: even fully array-staged (<=3 live floats), writing the `out` array from
---      sgp4_orient SIGSEGVs, while the identical pattern writing `scr` in sgp4_periodics works. This
---      is a tools/compile.rail codegen bug; fixing it unblocks this + all numeric Rail.
+-- This port surfaced a real Rail float-codegen bug -- a `global_float * global_float` product (e.g.
+-- `g_re * g_xke`, `g_j3 / g_j2`) took the boxed `_rail_mul` path and dereferenced raw doubles as
+-- pointers -> SIGSEGV. FIXED in tools/compile.rail (is_float now recognizes global float consts;
+-- regression test t165). The function splits below (init/init2, secular/periodics/orient) + the
+-- scratch arrays are NO LONGER REQUIRED for correctness -- they predate the fix and are kept as a
+-- clean phase decomposition; they could be inlined now that the compiler is correct.
 --
 -- st slot map (0-33 = the satrec sgp4() reads; 34-43 = init phase1->phase2 scratch):
 --   0 no 1 ecco 2 inclo 3 nodeo 4 argpo 5 mo 6 bstar 7 cc1 8 cc4 9 cc5 10 t2cof 11 t3cof 12 t4cof
@@ -342,15 +338,13 @@ sgp4_orient scr out w =
   let _ = float_arr_set w 14 ((float_arr_get w 9) * (float_arr_get w 1) - (float_arr_get w 3) * (float_arr_get w 0))
   let _ = float_arr_set w 15 ((float_arr_get w 10) * (float_arr_get w 1) - (float_arr_get w 2) * (float_arr_get w 0))
   let _ = float_arr_set w 16 ((float_arr_get w 4) * (float_arr_get w 1))   -- vz
-  let _ = float_arr_set w 17 (g_re * g_xke / 60.0)                          -- vkmps
-  -- write r,v into scratch w[18..23]; the orchestrator copies them to `out` from a clean reg state
-  -- (writing `out` directly from here trips a float-codegen pointer clobber).
-  let _ = float_arr_set w 18 ((float_arr_get w 6) * (float_arr_get w 11))
-  let _ = float_arr_set w 19 ((float_arr_get w 6) * (float_arr_get w 12))
-  let _ = float_arr_set w 20 ((float_arr_get w 6) * (float_arr_get w 13))
-  let _ = float_arr_set w 21 (((float_arr_get w 7) * (float_arr_get w 11) + (float_arr_get w 8) * (float_arr_get w 14)) * (float_arr_get w 17))
-  let _ = float_arr_set w 22 (((float_arr_get w 7) * (float_arr_get w 12) + (float_arr_get w 8) * (float_arr_get w 15)) * (float_arr_get w 17))
-  let _ = float_arr_set w 23 (((float_arr_get w 7) * (float_arr_get w 13) + (float_arr_get w 8) * (float_arr_get w 16)) * (float_arr_get w 17))
+  let _ = float_arr_set w 17 (g_re * g_xke / 60.0)                          -- vkmps (g_re*g_xke: the global*global product the compiler now handles)
+  let _ = float_arr_set out 0 ((float_arr_get w 6) * (float_arr_get w 11))
+  let _ = float_arr_set out 1 ((float_arr_get w 6) * (float_arr_get w 12))
+  let _ = float_arr_set out 2 ((float_arr_get w 6) * (float_arr_get w 13))
+  let _ = float_arr_set out 3 (((float_arr_get w 7) * (float_arr_get w 11) + (float_arr_get w 8) * (float_arr_get w 14)) * (float_arr_get w 17))
+  let _ = float_arr_set out 4 (((float_arr_get w 7) * (float_arr_get w 12) + (float_arr_get w 8) * (float_arr_get w 15)) * (float_arr_get w 17))
+  let _ = float_arr_set out 5 (((float_arr_get w 7) * (float_arr_get w 13) + (float_arr_get w 8) * (float_arr_get w 16)) * (float_arr_get w 17))
   0
 
 -- ============================================================================================
@@ -381,12 +375,6 @@ sgp4 st tsince out scr acc p w =
   let eo1  = float_arr_get acc 0
   let _ = sgp4_periodics st scr eo1 p
   let _ = sgp4_orient scr out w
-  let _ = float_arr_set out 0 (float_arr_get w 18)
-  let _ = float_arr_set out 1 (float_arr_get w 19)
-  let _ = float_arr_set out 2 (float_arr_get w 20)
-  let _ = float_arr_set out 3 (float_arr_get w 21)
-  let _ = float_arr_set out 4 (float_arr_get w 22)
-  let _ = float_arr_set out 5 (float_arr_get w 23)
   0
 
 -- ============================================================================================
