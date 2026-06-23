@@ -513,6 +513,25 @@ count_snap lines acc =
     let na = if is_snap_line ln then acc + 1 else acc
     count_snap (tail lines) na
 
+-- WAVE C, FULL-PASS RMS: accumulate the sum of squared physics residuals over ALL nw measured
+-- windows into sacc[0]. doppler_at_unix is anchor-free (t = unix - epoch; now_unix cancels), so
+-- one set_observer/set_elements_from_tle suffices and we re-eval the prediction per window k.
+-- resid_k = measured_k - (predicted_k + const_off). Float discipline (tdoa.rail:50-58): route
+-- every float through acc[*] before arithmetic; thread ONLY ints + array refs through the self-call,
+-- never a bare float (which trips the self-loop miscompile). The running sum lives in sacc[0].
+rms_accum e o meas_lines time_lines first_snap t_shift const_off want_peak nw k acc sacc =
+  if k >= nw then 0
+  else
+    let snap_k = snap_int_at_k time_lines k 0
+    let t_eval = round_ ((int_to_float first_snap) + (int_to_float (snap_k - first_snap)) + t_shift)
+    let _ = float_arr_set acc 0 (doppler_at_unix e t_eval o)
+    let _ = float_arr_set acc 1 const_off
+    let _ = float_arr_set acc 2 (dop_at_k meas_lines k want_peak 0)
+    let _ = float_arr_set acc 3 ((float_arr_get acc 0) + (float_arr_get acc 1))
+    let r = fdiff (float_arr_get acc 3) (float_arr_get acc 2)
+    let _ = float_arr_set sacc 0 ((float_arr_get sacc 0) + (r * r))
+    rms_accum e o meas_lines time_lines first_snap t_shift const_off want_peak nw (k + 1) acc sacc
+
 -- ===================================================================================
 -- THE WAVE C PHYSICS RE-RUN: recompute the single-point residual for a binding receipt and
 -- compare to the COMMITTED residual_hz within repro_tol_hz. Returns 1 (reproduces) / 0 (FAIL).
@@ -600,6 +619,23 @@ physics_recompute receipt idx =
   let recomputed_f = fdiff (float_arr_get acc 3) (float_arr_get acc 2)
   let recomputed_hz = float_to_int recomputed_f
 
+  -- (4b) FULL-PASS RMS re-run -- the WAVE C teeth. The SIGNED verdict physics_ok gates on
+  -- residual_rms_hz <= rms_tol_hz (the robust discriminator), but the single point above only
+  -- reproduces residual_hz (which is near-zero-information at TCA / eval_idx=nw/2). Recompute the
+  -- RMS over EVERY window from the SAME cited TLE+geo+track+const_off and RE-DERIVE physics_ok, so a
+  -- forged residual_rms_hz/physics_ok riding an honest single point can no longer pass verification.
+  let sacc = float_arr_new 1 0.0
+  let _ = rms_accum e o meas_lines time_lines first_snap t_shift_s const_off_hz want_peak nw 0 acc sacc
+  let mean_sq = (float_arr_get sacc 0) / (int_to_float nw)
+  let recomputed_rms_hz = float_to_int (sqrt mean_sq)
+  let committed_rms_hz = parse_int (pipe_field receipt "residual_rms_hz")
+  let rms_tol_hz = parse_int (pipe_field receipt "rms_tol_hz")
+  let committed_physok = parse_int (pipe_field receipt "physics_ok")
+  let rms_drift = if recomputed_rms_hz > committed_rms_hz then recomputed_rms_hz - committed_rms_hz else committed_rms_hz - recomputed_rms_hz
+  let rms_within = if rms_drift <= repro_tol_hz then 1 else 0
+  let rederived_physok = if recomputed_rms_hz <= rms_tol_hz then 1 else 0
+  let physok_match = if rederived_physok == committed_physok then 1 else 0
+
   -- (5) the verdict: |recomputed - committed residual_hz| <= repro_tol_hz, AND both digests bind.
   let drift = if recomputed_hz > residual_hz then recomputed_hz - residual_hz else residual_hz - recomputed_hz
   let within = if drift <= repro_tol_hz then 1 else 0
@@ -607,6 +643,7 @@ physics_recompute receipt idx =
   let _ = print (cat ["  physics  line ", show idx, ": tle_digest=", show tle_ok, " meas_digest=", show meas_ok, " est=", estimator, " t_eval_unix=", show_float t_eval_unix])
   let _ = print (cat ["  physics  predicted_dop=", show_float predicted_dop, " + const_off=", show_float const_off_hz, " = ", show_float predicted_total, " Hz ; measured=", show_float meas_val, " Hz"])
   let _ = print (cat ["  physics  recomputed_residual=", show recomputed_hz, " Hz  committed residual_hz=", show residual_hz, " Hz  drift=", show drift, " repro_tol=", show repro_tol_hz, " Hz"])
+  let _ = print (cat ["  physics  recomputed_rms=", show recomputed_rms_hz, " Hz  committed residual_rms_hz=", show committed_rms_hz, " Hz  rms_drift=", show rms_drift, " ; rederived physics_ok=", show rederived_physok, " committed=", show committed_physok])
 
   if tle_ok == 0 then
     let _ = print (cat ["==> FAIL at line ", show idx, ": physics residual unreproducible (staged TLE sha256 ", tle_sha_calc, " != cited ", tle_sha_cited, ")"])
@@ -616,6 +653,12 @@ physics_recompute receipt idx =
     0
   else if within == 0 then
     let _ = print (cat ["==> FAIL at line ", show idx, ": physics residual unreproducible (recomputed ", show recomputed_hz, " Hz vs committed ", show residual_hz, " Hz, drift ", show drift, " > repro_tol ", show repro_tol_hz, " Hz)"])
+    0
+  else if rms_within == 0 then
+    let _ = print (cat ["==> FAIL at line ", show idx, ": physics RMS unreproducible (recomputed residual_rms_hz ", show recomputed_rms_hz, " Hz vs committed ", show committed_rms_hz, " Hz, drift ", show rms_drift, " > repro_tol ", show repro_tol_hz, " Hz)"])
+    0
+  else if physok_match == 0 then
+    let _ = print (cat ["==> FAIL at line ", show idx, ": physics_ok FORGED (committed physics_ok=", show committed_physok, " but recomputed residual_rms_hz=", show recomputed_rms_hz, " Hz vs rms_tol_hz=", show rms_tol_hz, " Hz re-derives physics_ok=", show rederived_physok, ")"])
     0
   else 1
 
