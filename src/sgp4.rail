@@ -1,0 +1,418 @@
+-- ledaticground — real SGP4 (near-earth), pure Rail. WGS-72.
+-- Port of the Vallado-revised SGP4 (Spacetrack Report #3, 2006), near-earth path only (NOAA/Meteor/
+-- Orbcomm are LEO, period << 225 min -> no SDP4 deep-space). Oracle: python-sgp4 (validates <1e-6 km
+-- on the canonical Vallado TLE 00005).
+--
+-- STATUS (2026-06-23): the MATH is fully validated against python-sgp4 (un-kozai, J2/J3/J4 secular
+-- rates, BSTAR drag coefs, kepler, short-period periodics all match to ~1e-9; see SGP4_BUILD_LOG.md).
+-- OPEN BLOCKER: the final r,v assembly + output-array write in sgp4_orient SIGSEGVs on a Rail
+-- float-codegen bug (see #3 below). Compiles clean; runs correctly through sgp4_periodics.
+--
+-- *** Rail codegen constraints, learned here (a register-allocator fragility in float-dense code) ***
+--   1. >~40 live float locals in one function -> late values from early ones go garbage. FIX: split
+--      the function (sgp4init -> sgp4init + sgp4init2), pass state via `st` (scratch slots 34-43).
+--   2. a float local LIVE ACROSS A USER-fn CALL is clobbered (foreign sin/cos/pow/floor +
+--      float_arr_get/set are safe). FIX: read array values JUST BEFORE use; kepler keeps every float
+--      in `acc`, threading only (acc, int ktr).
+--   3. UNRESOLVED: even fully array-staged (<=3 live floats), writing the `out` array from
+--      sgp4_orient SIGSEGVs, while the identical pattern writing `scr` in sgp4_periodics works. This
+--      is a tools/compile.rail codegen bug; fixing it unblocks this + all numeric Rail.
+--
+-- st slot map (0-33 = the satrec sgp4() reads; 34-43 = init phase1->phase2 scratch):
+--   0 no 1 ecco 2 inclo 3 nodeo 4 argpo 5 mo 6 bstar 7 cc1 8 cc4 9 cc5 10 t2cof 11 t3cof 12 t4cof
+--   13 t5cof 14 omgcof 15 xmcof 16 nodecf 17 delmo 18 sinmao 19 mdot 20 argpdot 21 nodedot 22 xlcof
+--   23 aycof 24 x7thm1 25 con41 26 x1mth2 27 cosio 28 sinio 29 d2 30 d3 31 d4 32 isimp 33 eta
+--   34 ao 35 tsi 36 sfour 37 eeta 38 coef 39 cc3 40 xhdot1 41 cosio2 42 omeosq 43 rp
+
+foreign sqrt x -> float
+foreign pow x y -> float
+foreign atan2 y x -> float
+foreign floor x -> float
+foreign sin x -> float
+foreign cos x -> float
+foreign fabs x -> float
+
+g_re  = 6378.135
+g_xke = 0.07436691613317442
+g_j2  = 0.001082616
+g_j3  = 0.0 - 0.00000253881
+g_j4  = 0.0 - 0.00000165597
+g_j3oj2 = (0.0 - 0.00000253881) / 0.001082616
+g_x2o3 = 0.6666666666666666
+twopi_ = 6.283185307179586
+
+-- ============================================================================================
+-- sgp4init (phase 1): un-kozai + geometry + cc1..cc5 + secular rates. Stops at nodedot. Stores the
+-- final-state values it owns + the phase-2 scratch (34-43). <= ~40 live floats -> safe.
+-- ============================================================================================
+sgp4init st no_kozai ecco inclo nodeo argpo mo bstar =
+  let ss     = 78.0 / g_re + 1.0
+  let qzms2t = pow ((120.0 - 78.0) / g_re) 4.0
+  let eccsq  = ecco * ecco
+  let omeosq = 1.0 - eccsq
+  let rteosq = sqrt omeosq
+  let cosio  = cos inclo
+  let cosio2 = cosio * cosio
+  let ak   = pow (g_xke / no_kozai) g_x2o3
+  let d1   = 0.75 * g_j2 * (3.0 * cosio2 - 1.0) / (rteosq * omeosq)
+  let del0 = d1 / (ak * ak)
+  let adel = ak * (1.0 - del0 * del0 - del0 * (0.3333333333333333 + 134.0 * del0 * del0 / 81.0))
+  let del1 = d1 / (adel * adel)
+  let no   = no_kozai / (1.0 + del1)
+  let ao   = pow (g_xke / no) g_x2o3
+  let sinio = sin inclo
+  let po    = ao * omeosq
+  let con42 = 1.0 - 5.0 * cosio2
+  let con41 = 3.0 * cosio2 - 1.0
+  let posq  = po * po
+  let rp    = ao * (1.0 - ecco)
+  let perige = (rp - 1.0) * g_re
+  let sfour0 = if perige < 156.0 then (if perige < 98.0 then 20.0 else perige - 78.0) else 78.0
+  let qzms24 = if perige < 156.0 then pow ((120.0 - sfour0) / g_re) 4.0 else qzms2t
+  let sfour  = if perige < 156.0 then sfour0 / g_re + 1.0 else ss
+  let pinvsq = 1.0 / posq
+  let tsi    = 1.0 / (ao - sfour)
+  let eta    = ao * ecco * tsi
+  let etasq  = eta * eta
+  let eeta   = ecco * eta
+  let psisq  = fabs (1.0 - etasq)
+  let coef   = qzms24 * (pow tsi 4.0)
+  let coef1  = coef / (pow psisq 3.5)
+  let cc2    = coef1 * no * (ao * (1.0 + 1.5 * etasq + eeta * (4.0 + etasq)) + 0.375 * g_j2 * tsi / psisq * con41 * (8.0 + 3.0 * etasq * (8.0 + etasq)))
+  let cc1    = bstar * cc2
+  let cc3    = if ecco > 0.0001 then (0.0 - 2.0) * coef * tsi * g_j3oj2 * no * sinio / ecco else 0.0
+  let x1mth2 = 1.0 - cosio2
+  let cc4    = 2.0 * no * coef1 * ao * omeosq * (eta * (2.0 + 0.5 * etasq) + ecco * (0.5 + 2.0 * etasq) - g_j2 * tsi / (ao * psisq) * ((0.0 - 3.0) * con41 * (1.0 - 2.0 * eeta + etasq * (1.5 - 0.5 * eeta)) + 0.75 * x1mth2 * (2.0 * etasq - eeta * (1.0 + etasq)) * (cos (2.0 * argpo))))
+  let cc5    = 2.0 * coef1 * ao * omeosq * (1.0 + 2.75 * (etasq + eeta) + eeta * etasq)
+  let cosio4 = cosio2 * cosio2
+  let temp1  = 1.5 * g_j2 * pinvsq * no
+  let temp2  = 0.5 * temp1 * g_j2 * pinvsq
+  let temp3  = (0.0 - 0.46875) * g_j4 * pinvsq * pinvsq * no
+  let mdot   = no + 0.5 * temp1 * rteosq * con41 + 0.0625 * temp2 * rteosq * (13.0 - 78.0 * cosio2 + 137.0 * cosio4)
+  let argpdot = (0.0 - 0.5) * temp1 * con42 + 0.0625 * temp2 * (7.0 - 114.0 * cosio2 + 395.0 * cosio4) + temp3 * (3.0 - 36.0 * cosio2 + 49.0 * cosio4)
+  let xhdot1  = (0.0 - temp1) * cosio
+  let nodedot = xhdot1 + (0.5 * temp2 * (4.0 - 19.0 * cosio2) + 2.0 * temp3 * (3.0 - 7.0 * cosio2)) * cosio
+  let _ = float_arr_set st 0 no
+  let _ = float_arr_set st 1 ecco
+  let _ = float_arr_set st 2 inclo
+  let _ = float_arr_set st 3 nodeo
+  let _ = float_arr_set st 4 argpo
+  let _ = float_arr_set st 5 mo
+  let _ = float_arr_set st 6 bstar
+  let _ = float_arr_set st 7 cc1
+  let _ = float_arr_set st 8 cc4
+  let _ = float_arr_set st 9 cc5
+  let _ = float_arr_set st 19 mdot
+  let _ = float_arr_set st 20 argpdot
+  let _ = float_arr_set st 21 nodedot
+  let _ = float_arr_set st 25 con41
+  let _ = float_arr_set st 26 x1mth2
+  let _ = float_arr_set st 27 cosio
+  let _ = float_arr_set st 28 sinio
+  let _ = float_arr_set st 33 eta
+  let _ = float_arr_set st 34 ao
+  let _ = float_arr_set st 35 tsi
+  let _ = float_arr_set st 36 sfour
+  let _ = float_arr_set st 37 eeta
+  let _ = float_arr_set st 38 coef
+  let _ = float_arr_set st 39 cc3
+  let _ = float_arr_set st 40 xhdot1
+  let _ = float_arr_set st 41 cosio2
+  let _ = float_arr_set st 42 omeosq
+  let _ = float_arr_set st 43 rp
+  0
+
+-- ============================================================================================
+-- sgp4init2 (phase 2): the periodic + drag-secular coefficients. Reads scratch (34-43) + final
+-- slots, computes each in a read-use-store burst (few live floats each) -> safe.
+-- ============================================================================================
+sgp4init2 st =
+  let no     = float_arr_get st 0
+  let ecco   = float_arr_get st 1
+  let cc1    = float_arr_get st 7
+  let ao     = float_arr_get st 34
+  let tsi    = float_arr_get st 35
+  let sfour  = float_arr_get st 36
+  -- isimp + x7thm1 + t2cof + delmo + sinmao
+  let rp     = float_arr_get st 43
+  let isimp  = if rp < (220.0 / g_re + 1.0) then 1.0 else 0.0
+  let _ = float_arr_set st 32 isimp
+  let cosio2 = float_arr_get st 41
+  let _ = float_arr_set st 24 (7.0 * cosio2 - 1.0)
+  let _ = float_arr_set st 10 (1.5 * cc1)
+  let mo     = float_arr_get st 5
+  let eta    = float_arr_get st 33
+  let dmtmp  = 1.0 + eta * (cos mo)
+  let _ = float_arr_set st 17 (dmtmp * dmtmp * dmtmp)
+  let _ = float_arr_set st 18 (sin mo)
+  -- cc3 -> omgcof ; xmcof ; nodecf
+  let cc3    = float_arr_get st 39
+  let bstar  = float_arr_get st 6
+  let argpo  = float_arr_get st 4
+  let _ = float_arr_set st 14 (bstar * cc3 * (cos argpo))
+  let coef   = float_arr_get st 38
+  let eeta   = float_arr_get st 37
+  let _ = float_arr_set st 15 (if ecco > 0.0001 then (0.0 - g_x2o3) * coef * bstar / eeta else 0.0)
+  let omeosq = float_arr_get st 42
+  let xhdot1 = float_arr_get st 40
+  let _ = float_arr_set st 16 (3.5 * omeosq * xhdot1 * cc1)
+  -- xlcof + aycof
+  let sinio  = float_arr_get st 28
+  let cosio  = float_arr_get st 27
+  let denom  = if (fabs (1.0 + cosio)) > 0.00000000000150 then (1.0 + cosio) else 0.00000000000150
+  let _ = float_arr_set st 22 ((0.0 - 0.25) * g_j3oj2 * sinio * (3.0 + 5.0 * cosio) / denom)
+  let _ = float_arr_set st 23 ((0.0 - 0.5) * g_j3oj2 * sinio)
+  -- drag-secular: d2,d3,d4,t3cof,t4cof,t5cof (0 when truncated)
+  let cc1sq  = cc1 * cc1
+  let d2     = if isimp < 0.5 then 4.0 * ao * tsi * cc1sq else 0.0
+  let _ = float_arr_set st 29 d2
+  let dt     = d2 * tsi * cc1 / 3.0
+  let d3     = if isimp < 0.5 then (17.0 * ao + sfour) * dt else 0.0
+  let _ = float_arr_set st 30 d3
+  let d4     = if isimp < 0.5 then 0.5 * dt * ao * tsi * (221.0 * ao + 31.0 * sfour) * cc1 else 0.0
+  let _ = float_arr_set st 31 d4
+  let _ = float_arr_set st 11 (if isimp < 0.5 then d2 + 2.0 * cc1sq else 0.0)
+  let _ = float_arr_set st 12 (if isimp < 0.5 then 0.25 * (3.0 * d3 + cc1 * (12.0 * d2 + 10.0 * cc1sq)) else 0.0)
+  let _ = float_arr_set st 13 (if isimp < 0.5 then 0.2 * (3.0 * d4 + 12.0 * cc1 * d3 + 6.0 * d2 * d2 + 15.0 * cc1sq * (2.0 * d3 + cc1sq)) else 0.0)
+  0
+
+-- ============================================================================================
+-- equinoctial Kepler solve — the ONE self-recursive loop. acc[0]=eo1 acc[1]=u acc[2]=axnl acc[3]=aynl.
+-- ============================================================================================
+kepler_eq acc ktr =
+  if ktr > 10 then 0
+  else
+    let eo1  = float_arr_get acc 0
+    let u    = float_arr_get acc 1
+    let axnl = float_arr_get acc 2
+    let aynl = float_arr_get acc 3
+    let sineo1 = sin eo1
+    let coseo1 = cos eo1
+    let den  = 1.0 - coseo1 * axnl - sineo1 * aynl
+    let tem5 = (u - aynl * coseo1 + axnl * sineo1 - eo1) / den
+    let tem5c = if tem5 > 0.95 then 0.95 else if tem5 < (0.0 - 0.95) then (0.0 - 0.95) else tem5
+    let _ = float_arr_set acc 0 (eo1 + tem5c)
+    if (fabs tem5c) < 0.000000000001 then 0 else kepler_eq acc (ktr + 1)
+
+-- ============================================================================================
+-- sgp4_secular: secular gravity + drag + mean-element update -> scr[0..5] = am,nm,em,mm,argpm,nodem.
+-- No user calls; inline 2pi reduction (foreign floor only). Safe under pressure.
+-- ============================================================================================
+sgp4_secular st tsince scr =
+  let no      = float_arr_get st 0
+  let ecco    = float_arr_get st 1
+  let nodeo   = float_arr_get st 3
+  let argpo   = float_arr_get st 4
+  let mo      = float_arr_get st 5
+  let bstar   = float_arr_get st 6
+  let cc1     = float_arr_get st 7
+  let cc4     = float_arr_get st 8
+  let cc5     = float_arr_get st 9
+  let t2cof   = float_arr_get st 10
+  let t3cof   = float_arr_get st 11
+  let t4cof   = float_arr_get st 12
+  let t5cof   = float_arr_get st 13
+  let omgcof  = float_arr_get st 14
+  let xmcof   = float_arr_get st 15
+  let nodecf  = float_arr_get st 16
+  let delmo   = float_arr_get st 17
+  let sinmao  = float_arr_get st 18
+  let mdot    = float_arr_get st 19
+  let argpdot = float_arr_get st 20
+  let nodedot = float_arr_get st 21
+  let d2      = float_arr_get st 29
+  let d3      = float_arr_get st 30
+  let d4      = float_arr_get st 31
+  let isimp   = float_arr_get st 32
+  let eta     = float_arr_get st 33
+  let xmdf   = mo + mdot * tsince
+  let argpdf = argpo + argpdot * tsince
+  let nodedf = nodeo + nodedot * tsince
+  let t2     = tsince * tsince
+  let nodem  = nodedf + nodecf * t2
+  let tempa0 = 1.0 - cc1 * tsince
+  let tempe0 = bstar * cc4 * tsince
+  let templ0 = t2cof * t2
+  let delomg = omgcof * tsince
+  let dmt    = 1.0 + eta * (cos xmdf)
+  let delm   = xmcof * (dmt * dmt * dmt - delmo)
+  let tdrag  = delomg + delm
+  let mm     = if isimp < 0.5 then xmdf + tdrag else xmdf
+  let argpm  = if isimp < 0.5 then argpdf - tdrag else argpdf
+  let t3     = t2 * tsince
+  let t4     = t3 * tsince
+  let tempa  = if isimp < 0.5 then tempa0 - d2 * t2 - d3 * t3 - d4 * t4 else tempa0
+  let tempe  = if isimp < 0.5 then tempe0 + bstar * cc5 * (sin mm - sinmao) else tempe0
+  let templ  = if isimp < 0.5 then templ0 + t3cof * t3 + t4 * (t4cof + tsince * t5cof) else templ0
+  let am  = (pow (g_xke / no) g_x2o3) * tempa * tempa
+  let nm  = g_xke / (pow am 1.5)
+  let em0 = ecco - tempe
+  let em  = if em0 < 0.000001 then 0.000001 else em0
+  let mm2 = mm + no * templ
+  let xlm = mm2 + argpm + nodem
+  let nodemR = nodem - (floor (nodem / twopi_)) * twopi_
+  let argpmR = argpm - (floor (argpm / twopi_)) * twopi_
+  let xlmR   = xlm - (floor (xlm / twopi_)) * twopi_
+  let mmd    = xlmR - argpmR - nodemR
+  let mmR    = mmd - (floor (mmd / twopi_)) * twopi_
+  let _ = float_arr_set scr 0 am
+  let _ = float_arr_set scr 1 nm
+  let _ = float_arr_set scr 2 em
+  let _ = float_arr_set scr 3 mmR
+  let _ = float_arr_set scr 4 argpmR
+  let _ = float_arr_set scr 5 nodemR
+  0
+
+-- ============================================================================================
+-- sgp4_periodics: kepler result eo1 + mean elements (scr 0..7) -> the 6 short-period-corrected
+-- orbital quantities into scr[8..13] = mrt, su, xnode, xinc, mvt, rvdot. Outputs stored as computed
+-- to cap live floats. Fresh function.
+-- ============================================================================================
+-- array-staged (like sgp4init2): every intermediate in `p`, never > ~3 live float locals (the
+-- foreign-call args). p: 0 am 1 nm 2 nodemR 3 axnl 4 aynl 5 sineo1 6 coseo1 7 ecose 8 esine 9 el2
+-- 10 pl 11 rl 12 rdotl 13 rvdotl 14 betal 15 tmp3 16 sinu 17 cosu 18 su0 19 sin2u 20 cos2u 21 tmp1
+-- 22 tmp2 23 con41 24 x1mth2 25 x7thm1 26 cosip 27 sinip 28 inclo
+sgp4_periodics st scr eo1 p =
+  let _ = float_arr_set p 0 (float_arr_get scr 0)
+  let _ = float_arr_set p 1 (float_arr_get scr 1)
+  let _ = float_arr_set p 2 (float_arr_get scr 5)
+  let _ = float_arr_set p 3 (float_arr_get scr 6)
+  let _ = float_arr_set p 4 (float_arr_get scr 7)
+  let _ = float_arr_set p 5 (sin eo1)
+  let _ = float_arr_set p 6 (cos eo1)
+  let _ = float_arr_set p 7 ((float_arr_get p 3) * (float_arr_get p 6) + (float_arr_get p 4) * (float_arr_get p 5))
+  let _ = float_arr_set p 8 ((float_arr_get p 3) * (float_arr_get p 5) - (float_arr_get p 4) * (float_arr_get p 6))
+  let _ = float_arr_set p 9 ((float_arr_get p 3) * (float_arr_get p 3) + (float_arr_get p 4) * (float_arr_get p 4))
+  let _ = float_arr_set p 10 ((float_arr_get p 0) * (1.0 - (float_arr_get p 9)))
+  let _ = float_arr_set p 11 ((float_arr_get p 0) * (1.0 - (float_arr_get p 7)))
+  let amL = float_arr_get p 0
+  let _ = float_arr_set p 12 ((sqrt amL) * (float_arr_get p 8) / (float_arr_get p 11))
+  let plL = float_arr_get p 10
+  let _ = float_arr_set p 13 ((sqrt plL) / (float_arr_get p 11))
+  let beL = 1.0 - (float_arr_get p 9)
+  let _ = float_arr_set p 14 (sqrt beL)
+  let _ = float_arr_set p 15 ((float_arr_get p 8) / (1.0 + (float_arr_get p 14)))
+  let _ = float_arr_set p 16 ((float_arr_get p 0) / (float_arr_get p 11) * ((float_arr_get p 5) - (float_arr_get p 4) - (float_arr_get p 3) * (float_arr_get p 15)))
+  let _ = float_arr_set p 17 ((float_arr_get p 0) / (float_arr_get p 11) * ((float_arr_get p 6) - (float_arr_get p 3) + (float_arr_get p 4) * (float_arr_get p 15)))
+  let sinuL = float_arr_get p 16
+  let cosuL = float_arr_get p 17
+  let _ = float_arr_set p 18 (atan2 sinuL cosuL)
+  let _ = float_arr_set p 19 (((float_arr_get p 17) + (float_arr_get p 17)) * (float_arr_get p 16))
+  let _ = float_arr_set p 20 (1.0 - 2.0 * (float_arr_get p 16) * (float_arr_get p 16))
+  let _ = float_arr_set p 21 (0.5 * g_j2 / (float_arr_get p 10))
+  let _ = float_arr_set p 22 ((float_arr_get p 21) / (float_arr_get p 10))
+  let _ = float_arr_set p 23 (float_arr_get st 25)
+  let _ = float_arr_set p 24 (float_arr_get st 26)
+  let _ = float_arr_set p 25 (float_arr_get st 24)
+  let _ = float_arr_set p 26 (float_arr_get st 27)
+  let _ = float_arr_set p 27 (float_arr_get st 28)
+  let _ = float_arr_set p 28 (float_arr_get st 2)
+  let _ = float_arr_set scr 8 ((float_arr_get p 11) * (1.0 - 1.5 * (float_arr_get p 22) * (float_arr_get p 14) * (float_arr_get p 23)) + 0.5 * (float_arr_get p 21) * (float_arr_get p 24) * (float_arr_get p 20))
+  let _ = float_arr_set scr 9 ((float_arr_get p 18) - 0.25 * (float_arr_get p 22) * (float_arr_get p 25) * (float_arr_get p 19))
+  let _ = float_arr_set scr 10 ((float_arr_get p 2) + 1.5 * (float_arr_get p 22) * (float_arr_get p 26) * (float_arr_get p 19))
+  let _ = float_arr_set scr 11 ((float_arr_get p 28) + 1.5 * (float_arr_get p 22) * (float_arr_get p 26) * (float_arr_get p 27) * (float_arr_get p 20))
+  let _ = float_arr_set scr 12 ((float_arr_get p 12) - (float_arr_get p 1) * (float_arr_get p 21) * (float_arr_get p 24) * (float_arr_get p 19) / g_xke)
+  let _ = float_arr_set scr 13 ((float_arr_get p 13) + (float_arr_get p 1) * (float_arr_get p 21) * ((float_arr_get p 24) * (float_arr_get p 20) + 1.5 * (float_arr_get p 23)) / g_xke)
+  0
+
+-- ============================================================================================
+-- sgp4_orient: scr[8..13] (mrt,su,xnode,xinc,mvt,rvdot) -> r,v vectors in out. Fresh function.
+-- ============================================================================================
+-- array-staged to dodge the float-codegen corruption: all trig + intermediates live in `w`, so
+-- never more than ~3 float locals are live at once (the long-live-range / pointer-clobber bug).
+-- w: 0 sinsu 1 cossu 2 snod 3 cnod 4 sini 5 cosi 6 mr 7 mvt 8 rvdot 9 xmx 10 xmy 11 ux 12 uy 13 uz 14 vx 15 vy
+sgp4_orient scr out w =
+  let su = float_arr_get scr 9
+  let _ = float_arr_set w 0 (sin su)
+  let _ = float_arr_set w 1 (cos su)
+  let xnode = float_arr_get scr 10
+  let _ = float_arr_set w 2 (sin xnode)
+  let _ = float_arr_set w 3 (cos xnode)
+  let xinc = float_arr_get scr 11
+  let _ = float_arr_set w 4 (sin xinc)
+  let _ = float_arr_set w 5 (cos xinc)
+  let _ = float_arr_set w 6 ((float_arr_get scr 8) * g_re)
+  let _ = float_arr_set w 7 (float_arr_get scr 12)
+  let _ = float_arr_set w 8 (float_arr_get scr 13)
+  let _ = float_arr_set w 9 ((0.0 - (float_arr_get w 2)) * (float_arr_get w 5))
+  let _ = float_arr_set w 10 ((float_arr_get w 3) * (float_arr_get w 5))
+  let _ = float_arr_set w 11 ((float_arr_get w 9) * (float_arr_get w 0) + (float_arr_get w 3) * (float_arr_get w 1))
+  let _ = float_arr_set w 12 ((float_arr_get w 10) * (float_arr_get w 0) + (float_arr_get w 2) * (float_arr_get w 1))
+  let _ = float_arr_set w 13 ((float_arr_get w 4) * (float_arr_get w 0))
+  let _ = float_arr_set w 14 ((float_arr_get w 9) * (float_arr_get w 1) - (float_arr_get w 3) * (float_arr_get w 0))
+  let _ = float_arr_set w 15 ((float_arr_get w 10) * (float_arr_get w 1) - (float_arr_get w 2) * (float_arr_get w 0))
+  let _ = float_arr_set w 16 ((float_arr_get w 4) * (float_arr_get w 1))   -- vz
+  let _ = float_arr_set w 17 (g_re * g_xke / 60.0)                          -- vkmps
+  -- write r,v into scratch w[18..23]; the orchestrator copies them to `out` from a clean reg state
+  -- (writing `out` directly from here trips a float-codegen pointer clobber).
+  let _ = float_arr_set w 18 ((float_arr_get w 6) * (float_arr_get w 11))
+  let _ = float_arr_set w 19 ((float_arr_get w 6) * (float_arr_get w 12))
+  let _ = float_arr_set w 20 ((float_arr_get w 6) * (float_arr_get w 13))
+  let _ = float_arr_set w 21 (((float_arr_get w 7) * (float_arr_get w 11) + (float_arr_get w 8) * (float_arr_get w 14)) * (float_arr_get w 17))
+  let _ = float_arr_set w 22 (((float_arr_get w 7) * (float_arr_get w 12) + (float_arr_get w 8) * (float_arr_get w 15)) * (float_arr_get w 17))
+  let _ = float_arr_set w 23 (((float_arr_get w 7) * (float_arr_get w 13) + (float_arr_get w 8) * (float_arr_get w 16)) * (float_arr_get w 17))
+  0
+
+-- ============================================================================================
+-- sgp4: orchestrator. <= ~14 live floats across each user call (secular, kepler, shortperiod).
+-- ============================================================================================
+sgp4 st tsince out scr acc p w =
+  let _ = sgp4_secular st tsince scr
+  let aycof  = float_arr_get st 23
+  let xlcof  = float_arr_get st 22
+  let am     = float_arr_get scr 0
+  let em     = float_arr_get scr 2
+  let mmR    = float_arr_get scr 3
+  let argpmR = float_arr_get scr 4
+  let nodemR = float_arr_get scr 5
+  let axnl = em * (cos argpmR)
+  let tmp  = 1.0 / (am * (1.0 - em * em))
+  let aynl = em * (sin argpmR) + tmp * aycof
+  let xl   = mmR + argpmR + nodemR + tmp * xlcof * axnl
+  let uu   = xl - nodemR
+  let u    = uu - (floor (uu / twopi_)) * twopi_
+  let _ = float_arr_set scr 6 axnl
+  let _ = float_arr_set scr 7 aynl
+  let _ = float_arr_set acc 0 u
+  let _ = float_arr_set acc 1 u
+  let _ = float_arr_set acc 2 axnl
+  let _ = float_arr_set acc 3 aynl
+  let _ = kepler_eq acc 1
+  let eo1  = float_arr_get acc 0
+  let _ = sgp4_periodics st scr eo1 p
+  let _ = sgp4_orient scr out w
+  let _ = float_arr_set out 0 (float_arr_get w 18)
+  let _ = float_arr_set out 1 (float_arr_get w 19)
+  let _ = float_arr_set out 2 (float_arr_get w 20)
+  let _ = float_arr_set out 3 (float_arr_get w 21)
+  let _ = float_arr_set out 4 (float_arr_get w 22)
+  let _ = float_arr_set out 5 (float_arr_get w 23)
+  0
+
+-- ============================================================================================
+-- test main: canonical Vallado TLE 00005 at tsince 0/360/720; print r,v for the oracle diff.
+-- ============================================================================================
+d2r_ = 0.017453292519943295
+main =
+  let no_kozai = 10.82419157413667 * twopi_ / 1440.0
+  let ecco  = 0.1859667
+  let inclo = 34.2682 * d2r_
+  let nodeo = 348.7242 * d2r_
+  let argpo = 331.7664 * d2r_
+  let mo    = 19.3264 * d2r_
+  let bstar = 0.000028098
+  let st = float_arr_new 48 0.0
+  let _  = sgp4init st no_kozai ecco inclo nodeo argpo mo bstar
+  let _  = sgp4init2 st
+  let out = float_arr_new 6 0.0
+  let scr = float_arr_new 16 0.0
+  let acc = float_arr_new 5 0.0
+  let pp  = float_arr_new 32 0.0
+  let ww  = float_arr_new 24 0.0
+  let _  = sgp4 st 0.0 out scr acc pp ww
+  let _  = print (cat ["t=0    r=(", show_float (float_arr_get out 0), ",", show_float (float_arr_get out 1), ",", show_float (float_arr_get out 2), ") v=(", show_float (float_arr_get out 3), ",", show_float (float_arr_get out 4), ",", show_float (float_arr_get out 5), ")"])
+  let _  = sgp4 st 360.0 out scr acc pp ww
+  let _  = print (cat ["t=360  r=(", show_float (float_arr_get out 0), ",", show_float (float_arr_get out 1), ",", show_float (float_arr_get out 2), ") v=(", show_float (float_arr_get out 3), ",", show_float (float_arr_get out 4), ",", show_float (float_arr_get out 5), ")"])
+  let _  = sgp4 st 720.0 out scr acc pp ww
+  let _  = print (cat ["t=720  r=(", show_float (float_arr_get out 0), ",", show_float (float_arr_get out 1), ",", show_float (float_arr_get out 2), ") v=(", show_float (float_arr_get out 3), ",", show_float (float_arr_get out 4), ",", show_float (float_arr_get out 5), ")"])
+  0
