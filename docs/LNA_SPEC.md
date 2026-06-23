@@ -30,7 +30,7 @@ There are now **two separate RF bands in play**, each needing its **own** LNA, a
 | | Band (a): **137 band** | Band (b): **400 band** |
 |---|---|---|
 | Frequency | **137–138 MHz** | **400–406 MHz** |
-| What it serves | NOAA APT / METEOR LRPT, Orbcomm, 137 beacon work; **also helps AIS / vessel margin (CHANNEL_INTELLIGENCE.md Section 0 mobile-vessel gate)** | **RS41 / DFM radiosonde** decode (`src/rs41_*.rail`) |
+| What it serves | NOAA APT / METEOR LRPT, Orbcomm, 137 beacon work. **NOT AIS:** AIS / mobile vessels are **162 MHz**, *outside* this SAW passband — a 137-band LNA **rejects** them (see "Why a SAW" below). The CHANNEL_INTELLIGENCE.md Section 0 mobile-vessel gate needs a **separate 162 MHz front-end**, not this LNA. | **RS41 / DFM radiosonde** decode (`src/rs41_*.rail`) |
 | Antenna | the **existing** 137MLCHD halo (already on the roof, `docs/ANTENNA.md`) | a **SEPARATE 400 MHz antenna — not yet owned, not in this buy unless explicitly approved** |
 | LNA | **Sawbird+ 137 / "NOAA" variant** (SAW passband 137 MHz) | a **different** 400 MHz LNA (Sawbird GOES is 1.6 GHz — wrong; needs a 70 cm / 400 MHz SAW or wideband LNA) |
 | Priority | **PRIMARY BUY** — closes the measured 137 deficit, broad payoff | **deferred** — RS41 stays synthetic-only until the 400 MHz antenna + LNA land |
@@ -42,7 +42,8 @@ synthetic-validated, but its **live reception is gated on a 400 MHz antenna + 40
 that the node does not have. Buying one LNA does not unlock both bands.
 
 > **Recommendation:** buy the **137-band LNA first** (broad payoff: weather imaging margin,
-> Orbcomm, beacon, and AIS/vessel sensitivity). Treat the 400 MHz LNA + antenna as a later,
+> Orbcomm, and 137 beacon sensitivity — **not** AIS, which is 162 MHz and out of this passband).
+> Treat the 400 MHz LNA + antenna as a later,
 > separate purchase tied to whether live RS41 reception is in scope.
 
 ---

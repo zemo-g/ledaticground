@@ -6,7 +6,7 @@
 -- Build:  ~/projects/rail/rail_native run src/passes.rail
 -- Needs:  data/tle_weather.txt + data/now_unix.txt  (run scripts/fetch_tle.sh first)
 --
--- Observer hardcoded to regional, Metro Detroit (0.0 N, 0.0 W).
+-- Observer = synthetic-roof placeholder, regional Metro Detroit (42.5 N, 83.5 W); coarse, _SYNTH.
 
 foreign sin x -> float
 foreign cos x -> float
@@ -253,8 +253,13 @@ main =
   let pi = atan2 0.0 (0.0 - 1.0)
   let twopi = pi * 2.0
   let d2r = pi / 180.0
-  let lat = 0.0
-  let lon = 0.0 - 0.0
+  -- Observer = the synthetic-roof placeholder (42.5 N, 83.5 W, ~Metro Detroit, alt 0.18 km),
+  -- matching the _SYNTH claimed_geo used across the binding pipeline (attest_binding_rollup.sh
+  -- LAT/LON defaults). Coarse (~0.1deg), never a precise home coordinate; GPS-PPS supersedes it.
+  -- WAS 0,0 = null island (Gulf of Guinea) -> a wrong observer geometry that distorts the predicted
+  -- Doppler curve SHAPE (not just a constant offset the fit absorbs). Fixed 2026-06-23 (Fugu review).
+  let lat = 42.5
+  let lon = 0.0 - 83.5
   let alt = 0.18
   let phi = lat * d2r
   let lam = lon * d2r
